@@ -8,6 +8,17 @@ handoff_written_at_context_usage: 0%
 handoff_written_at: 2026-09-21T20:15:00Z
 session_id: 01a0c4e0-21e1-7312-ac5d-48e842962cdf
 ---
+--- handoff probe (auto) ---
+=== handoff probe (imagegen) ===
+--- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
+  (none)
+--- progress diff stat:
+imagegen-handoff.md | 162 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 162 insertions(+)
+--- staleness (last_updated_commit 7443adfcd22374ddaa3e2139287e83a78d431367 .. HEAD):
+f0b85a0 docs(handoff): record the imagegen plan and launch point
+--- end handoff probe ---
+
 
 Handoff + executable plan — imagegen (2026-09-21)
 

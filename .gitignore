@@ -8,6 +8,7 @@ out/
 target/
 # knowledge-graph and index build output
 graphify-rs-out/
+graphify-out/
 .rag-index/
 .callgraph-index.bin
 # logs
