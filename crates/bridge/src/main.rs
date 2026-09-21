@@ -171,8 +171,14 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
         .ok_or_else(|| format!("invalid size '{}', expected WIDTHxHEIGHT", size))?;
     let w: u32 = w.trim().parse().map_err(|_| format!("invalid width in '{}'", size))?;
     let h: u32 = h.trim().parse().map_err(|_| format!("invalid height in '{}'", size))?;
-    if w <= 0 || h <= 0 {
+    if w == 0 || h == 0 {
         return Err(format!("size '{}' must be positive", size));
+    }
+    if w % 32 != 0 || h % 32 != 0 {
+        return Err(format!(
+            "size '{}' is not supported: width and height must be divisible by 32",
+            size
+        ));
     }
     Ok((w, h))
 }
@@ -241,9 +247,12 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
 
 async fn create_generation(
     State(st): State<std::sync::Arc<AppState>>,
-    payload: Json<GenRequest>,
+    body: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let req = payload.0;
+    let req: GenRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid request body: {}", e)),
+    };
 
     if req.prompt.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "prompt is required");
@@ -263,6 +272,12 @@ async fn create_generation(
     };
 
     let n = req.n.unwrap_or(1);
+    if n != 1 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "n must be 1 (multi-image batches are not supported)",
+        );
+    }
     let steps = req.num_inference_steps.unwrap_or(st.cfg.steps);
     let cfg_scale = req.cfg_scale.unwrap_or(st.cfg.cfg_scale);
     // seed < 0 (or omitted) means random, matching sd-server's convention.

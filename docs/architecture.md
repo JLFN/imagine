@@ -82,14 +82,17 @@ Verified invocation: the text-to-image command above with -W 1024 -H 1024,
   POST /v1/images/generations            -> {"data":[{"b64_json": "..."}]}
 - Request fields to support: prompt, size (e.g. "1024x1024"), n (1),
   num_inference_steps (default 40), seed (optional).
-- Process model: no sd-cli running at idle. First POST spawns sd-cli, waits
-  for the file, returns it, and starts an idle timer (default ~5 min). Any
-  request resets the timer; on expiry the child is killed so the ~6-7 GB of
-  model memory is released.
-- Cold start cost: reading ~10 GB of weights + generation; the first request
-  in a while is slower, subsequent ones (warm) are fast. Verify the
-  open-grok image tool timeout tolerates the cold start; if not, either
-  raise the client timeout or warm up a few seconds at session start.
+- Process model (as implemented): the bridge spawns sd-server once at
+  startup (diffusion model, text encoder, VAE; --offload-to-cpu) and keeps
+  it warm: the ~9.3 GB model stack stays resident, so every request after
+  the initial load is warm. The bridge polls the backend until it answers
+  (up to 180 s) before serving, and kills sd-server when the bridge is
+  shut down (SIGINT / ctrl-c). There is no idle reaper; the backend lives
+  as long as the bridge.
+- Cold start cost: one-time at bridge startup (~35 s to load ~10 GB of
+  weights); per-request cost is generation time only (~171 s at 28 steps
+  and 1024 square warm; see Measured behavior). The open-grok image tool
+  timeout (300 s total / 240 s read) tolerates warm requests comfortably.
 - Alternative (zero resident processes): systemd user socket activation.
   The user systemd session is running (systemctl --user is-system-running
   returned running on 2026-09-21). Preferred: the bridge daemon, because it
