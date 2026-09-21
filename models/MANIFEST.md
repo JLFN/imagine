@@ -78,6 +78,15 @@ SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
   size    675509688
   sha256  bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
+- models/qwen-image-2.1-Q6_K.gguf   (higher-quality diffusion option)
+  size    5876556448
+  sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
+  (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
+  The Q6_K diffusion model (~28% larger than Q4_K_M) is the practical
+  higher-fidelity default on the 12 GB GPU: weights stay in system RAM via
+  --offload-to-cpu, GPU compute is ~11.5 s/it, and resolution up to ~1344
+  (or ~1536 on one axis) fits in 12 GB. Q8_0 also exists on disk but is
+  reserved for when VRAM/RAM budget allows; it is not the default.
 
 Note: an initial curl for the diffusion model hit a flaky HTTP/2 stream
 (exit 92) and left a truncated 4,240,669,189-byte file, which FAILED the

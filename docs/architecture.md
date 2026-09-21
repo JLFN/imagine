@@ -54,6 +54,27 @@ Verified invocation: the text-to-image command above with -W 1024 -H 1024,
 - Model load ~12.7 s (encoder), ~10.7 s (diffusion), ~1.2 s (VAE);
   condition forward ~13.9 s.
 
+## Quality and open-grok on-demand (Unit 2 findings)
+
+- Quality on a 12 GB card is bounded by VRAM. Q4_K_M @ 1024 peaks ~11.5 GB.
+  The practical higher-quality point is the Q6_K diffusion model (5.88 GB,
+  near-lossless) with GPU compute and weights RAM-resident
+  (--offload-to-cpu): Q6_K @ 1344x1344, 40 steps fits (peak 11.1 GB) at
+  ~11.5 s/it (~8.3 min) and gives a clear quality step over 1024/Q4.
+- Pure CPU compute is a dead end for on-demand: it frees VRAM (~5 GB peak)
+  but runs the 7B DiT at ~375 s/it, so higher resolution via full CPU is
+  not usable.
+- open-grok's image client (ImageGenClient) sends a specific payload and has
+  a hard 300 s total / 240 s read timeout. For reliable on-demand, the
+  request must finish in well under ~240 s, so the bridge defaults to 28
+  steps (warm ~171 s). Request fields it honors: model, prompt, n,
+  aspect_ratio, resolution, response_format (b64_json), num_inference_steps,
+  seed, cfg_scale. Higher-res/longer generations are available outside
+  open-grok by requesting more steps or a larger size directly.
+- Wiring: [toolset.image_gen] in ~/.opengrok/config.toml -> base_url
+  http://127.0.0.1:8787/v1, api_key "imagegen-local" (secret-free; the
+  bridge ignores auth), model "Qwen-Image-2.1", response_encoding auto.
+
 ## Bridge design
 
 - Endpoints:
