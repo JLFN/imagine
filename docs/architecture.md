@@ -32,6 +32,28 @@ schedule is selected automatically):
 - Image editing (later phase, optional) adds -r <ref.png> for each reference
   image, plus --llm_vision <mmproj GGUF> when the text encoder is GGUF.
 
+## Measured performance (Unit 1, 2026-09-21, this box)
+
+Verified invocation: the text-to-image command above with -W 1024 -H 1024,
+--steps 40, --cfg-scale 6.0, euler, --seed 42, --offload-to-cpu. GPU: RTX
+4070 SUPER (compute 8.9). Runner: sd-cli built from source master-890-74988b2-
+4-g6dcb5bb with -DSD_CUDA=ON (sm_89). CUDA toolkit 13.3.
+
+- Total params 9337.96 MB, all in RAM (VRAM 0.00 MB at load): text encoder
+  4302.33 MB, diffusion 4391.25 MB, VAE 644.38 MB.
+- First real image (40 steps): generate_image completed in 216.61 s, of which
+  sampling 199.49 s (~4.6-4.9 s/it after the first ~16.8 s warm step);
+  process wall 3:38, max RSS ~10.04 GB. Output 1024x1024 RGBA, 1.87 MB.
+- Reproducibility run (12 steps, seed 7): sampling 70.30 s, generate_image
+  83.77 s, output 1.83 MB.
+- Peak VRAM during 1024x1024 generation: 11,536 MiB of 12,282 (~94%).
+  Weights are offloaded to RAM but the compute/attention buffers saturate the
+  card at 1024 sq; higher resolutions or a larger batch would OOM (confirms
+  "native 2K is tight"). Cold start (loading ~9.3 GB weights) is the dominant
+  cost for an idle process; a warm process is ~4.6 s/it.
+- Model load ~12.7 s (encoder), ~10.7 s (diffusion), ~1.2 s (VAE);
+  condition forward ~13.9 s.
+
 ## Bridge design
 
 - Endpoints:
