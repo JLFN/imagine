@@ -1,7 +1,7 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
+last_updated_commit: 6b17eee28922021763223e78c780bd07e3931831
 branch: dev
 remote: none
 handoff_written_at_context_usage: 0%
@@ -51,68 +51,58 @@ signals.json (sessions/<percent-encoded-cwd>/<session-id>/ under
 The final commit of each unit carries the trailer "Unit: <N> complete" as
 its last body line (git log --grep "Unit: .* complete").
 
-2. Current state (2026-09-21 — COMPLETE, verified)
+2. Current state (2026-09-21 — Unit 1 complete, verified)
 
-- Repo scaffolded and committed on dev at 7443adf (README, AGENTS.md,
-  .gitignore, models/MANIFEST.md, docs/architecture.md). No remote, no code.
-- Verified this session (source reads + live probes): ds4 cannot generate
-  images (ds4_server.c: "DS4 doesn't register these tools" for
-  image_generation_call); llama.cpp "diffusion" is text-diffusion only
-  (LLaDA/Dream); the runner is stable-diffusion.cpp (official repo: day-0
-  Qwen-Image-2.1, 2026-09-20).
-- The encoder is fixed: Qwen3-VL-8B-Instruct. Reusing the Spark's Qwen3.8
-  Flash Next as encoder is impossible (embedding-space mismatch; the runner
-  takes local weights, and Qwen3.8 talks HTTP chat only). Use the official
-  Q4_K_M GGUF, 5.03 GB.
-- Structural decision made with the operator: run on THIS workstation, not
-  the Spark. Specs verified: i7-14700F 28 threads, 31 GB RAM (~15 GB free),
-  RTX 4070 SUPER 12 GB VRAM, 411 GB disk free. Model stack: Q4_K_M diff
-  4.6 GiB (VRAM) + Q4_K_M encoder 5.03 GB (RAM, --offload-to-cpu) + VAE
-  0.64 GiB; total ~10.3 GiB on disk, fits. Native 2K is tight; ~1024-1328
-  is the default output.
-- Wiring verified from open-grok source: [toolset.image_gen] activates only
-  with non-empty base_url plus a resolvable api_key (or env_key);
-  response_encoding "auto" accepts b64_json; never the session bearer.
-- On-demand option verified: systemd user session is running; the bridge
-  daemon (spawn sd-cli on demand, reap after idle) is the preferred design.
+- Unit 1 landed on dev at 6b17eee. sd-cli built from source (CUDA 13.3,
+  -DSD_CUDA=ON, sm_89); the three model files are downloaded and sha256-
+  verified (diffusion 833439e9..., encoder 67d1659b..., vae bb21f747...);
+  the first 1024x1024 image generated coherently, exit 0. Measured numbers
+  are in that commit body and docs/architecture.md (Measured performance).
+- Runner installed at bin/sd-cli (gitignored); source build area
+  /data/build-sd (sd-server is also built there). nvcc is NOT on PATH —
+  it is /usr/local/cuda/bin/nvcc; set CUDACXX or CMAKE_CUDA_COMPILER.
+- Machine re-verified: RTX 4070 SUPER 12 GB (peak VRAM 11.5 GB at 1024 sq),
+  31 GB RAM, 411 GB free. Wiring/runner constraints unchanged.
+- Current unit: Unit 2 (Rust bridge), plan in section 3.
 
-3. Next unit plan — Unit 1: runner binary, model files, first real image
+3. Next unit plan — Unit 2: Rust bridge (OpenAI image API)
 
-Status: not yet started. Goal: a verified sd-cli that produces a real
-Qwen-Image-2.1 image on this workstation from the three downloaded model
-files. Ground truth: models/MANIFEST.md (pinned URLs, sizes, checksums) and
-docs/architecture.md (invocation from the sd.cpp doc), plus the live
-workstation (I have a shell here; the Spark is irrelevant for this unit).
+Status: not yet started. Goal: a small Rust HTTP server on 127.0.0.1:8787
+that speaks the OpenAI image API and manages the sd-cli child process, so
+open-grok's [toolset.image_gen] can call it. Ground truth:
+docs/architecture.md (Bridge design), the built bin/sd-cli, and Unit 1's
+measured numbers. Branch: feature/bridge off dev (rule 23); canonical
+builder /data/build (rule 5); osv scan before push (rule 10); qa-model is a
+user parameter, ask before the QA gate (rule 19).
 
-- Phase 1, runner. Check stable-diffusion.cpp releases for a prebuilt Linux
-  x86_64 CUDA binary first: https://github.com/leejet/stable-diffusion.cpp/
-  releases. If a suitable prebuilt exists, download to bin/sd-cli (chmod
-  +x). Else build: check nvcc presence (which nvcc, nvcc --version), then
-  cmake build per the project's docs/build.md with CUDA enabled. Acceptance:
-  bin/sd-cli runs and prints its version/help; --list-methods or the model
-  loader accepts a QwenImage-2.1 architecture file (prove by Phase 3).
-- Phase 2, model download. mkdir -p models; download the three files with
-  the curl commands in models/MANIFEST.md into models/. Verify sizes with
-  ls -l against the manifest, then verify SHA256SUMS against the source
-  repo's published checksums; a mismatch means stop and re-download.
-  Acceptance: sha256sum of each file matches the published checksum; total
-  on disk about 10.3 GiB.
-- Phase 3, CLI smoke (first real image). Run the text-to-image invocation
-  from docs/architecture.md with the Q4_K_M files, a trivial prompt, 1024
-  square output (divisible by 32), --cfg-scale 6.0, euler, -o out/first.png,
-  --offload-to-cpu. Acceptance: exit 0, out/first.png exists and is a valid
-  PNG of meaningful size (file out/first.png), and the image is visually
-  coherent (view it per rule 21/agy path). Record: generation wall time,
-  peak VRAM/RAM if measurable, and the command used, in the commit body.
-- Verify, package, handoff: run the Phase acceptance checks; commit the
-  three phases together on dev with a feat(recipe) commit whose body carries
-  the measured numbers and the trailer "Unit: 1 complete". Do NOT commit
-  model files, the sd-cli binary, or out/ (gitignored).
-- Notes/decisions: the mirror choice (abenzerps vs KasugaiSakura) is a
-  hash-verified decision, not a trust decision (SHA256SUMS); the
-  KasugaiSakura repo is a fresh re-upload of the same bytes. Port for the
-  bridge later: 8787 in the architecture doc. No Python anywhere in the
-  deliverable (rule 14); the bridge is Rust (Unit 2).
+- Phase 1, design confirm. Confirm sd-cli is one-shot (generates one image
+  and exits) vs persistent; check whether sd-server already serves
+  /v1/images/generations with b64 (reference-implementation rule). Fix the
+  process model: likely per-request spawn, so each request pays cold start
+  (~30 s load + generation) unless a persistent mode is available; carry
+  the measured peak-VRAM/load costs from Unit 1 into the decision.
+- Phase 2, implement the bridge. Rust HTTP server exposing:
+    GET  /v1/models              -> {"data":[{"id":"Qwen-Image-2.1"}]}
+    POST /v1/images/generations  -> {"data":[{"b64_json": "..."}]}
+  Request fields: prompt, size ("1024x1024" -> -W -H, divisible by 32),
+  n (1), num_inference_steps (default 40 -> --steps), seed (optional ->
+  --seed), cfg_scale (default 6.0). Write sd-cli output to a temp path
+  under out/, read it, base64 it into the response, delete the temp. Map
+  badly-formed size / n>1 to an OpenAI-style error body + non-2xx status
+  (or support n via --batch-count). Use the measured invocation verbatim
+  as the spawn arguments.
+- Phase 3, verify end-to-end. With the bridge listening on 127.0.0.1:8787,
+  curl POST /v1/images/generations {"prompt":...,"size":"1024x1024"} and
+  confirm exit 0, a b64_json that decodes to a valid PNG, and the writer
+  file exists; curl GET /v1/models. Measure a request wall time. Run the
+  QA gate with a user-chosen qa-model before the commit.
+- Verify, package, handoff: run acceptance checks; osv-mcp scan the new
+  crate; commit on feature/bridge with a conventional message carrying the
+  measured request time and the trailer "Unit: 2 complete"; merge to dev;
+  graphify AST graph rebuilt at commit time (rule 12); fold outcome here.
+- Open items carried forward: cold-start vs the open-grok image-tool client
+  timeout (telemeter at wiring, Unit 3); bridge port 8787 free (confirm ss
+  -tlnp at wiring); remote/push still pending a visibility check.
 
 4. Project facts a fresh session cannot re-derive
 
@@ -144,9 +134,8 @@ workstation (I have a shell here; the Spark is irrelevant for this unit).
   model is a user-chosen parameter (ask the user for qa-model=<slug> before
   the QA gate).
 - OPEN items:
-  1. Decide the model mirror at download time: abenzerps/Qwen-Image-2.1-GGUF
-     (recommended, 33k downloads) vs the operator's KasugaiSakura link; the
-     checksums decide, not the name.
+  1. RESOLVED in Unit 1: the model mirror is abenzerps/Qwen-Image-2.1-GGUF
+     (SHA256SUMS verified; the KasugaiSakura link was not needed).
   2. Confirm the open-grok image tool's client timeout tolerates the cold
      start (load ~10 GB + generation); if not, adjust at wiring time.
   3. Bridge port 8787 is proposed but unverified free; check ss -tlnp at
