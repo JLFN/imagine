@@ -1,0 +1,14 @@
+# model files are downloads, never committed
+models/
+# runner binary
+bin/
+# generated test images
+out/
+# rust build output
+target/
+# knowledge-graph and index build output
+graphify-rs-out/
+.rag-index/
+.callgraph-index.bin
+# logs
+*.log
