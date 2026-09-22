@@ -1,5 +1,5 @@
 diff --git a/src/model_loader.cpp b/src/model_loader.cpp
-index ee5aa49..5292889 100644
+index ee5aa49..493d789 100644
 --- a/src/model_loader.cpp
 +++ b/src/model_loader.cpp
 @@ -972,6 +972,76 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
@@ -79,7 +79,7 @@ index ee5aa49..5292889 100644
  bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 bool enable_mmap,
                                 const std::set<std::string>* target_tensor_names,
-@@ -1230,15 +1300,62 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+@@ -1230,15 +1300,81 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                              failed = true;
                              return;
                          }
@@ -98,11 +98,16 @@ index ee5aa49..5292889 100644
 +                        // An int8_tensorwise weight whose destination is a float tensor
 +                        // (the token embedding) cannot use in-place int8 consumption and
 +                        // has no generic dequantization trait. Read the companion row
-+                        // scales from the same file and dequantize here.
++                        // scales from the same source and dequantize here.
++                        //
++                        // The scales come from wherever the weights came from: sd-cli
++                        // reads a plain file, but sd-server mmaps its weights, and a zip
++                        // archive is a third source. Handling only the plain-file case is
++                        // what made a generation abort inside sd-server with "type i8
++                        // unsupported for integer quantization" while sd-cli worked.
 +                        bool handled_int8 = false;
 +                        if (tensor_storage.is_int8_tensorwise && tensor_storage.type == GGML_TYPE_I8 &&
-+                            (dst_tensor->type == GGML_TYPE_F32 || dst_tensor->type == GGML_TYPE_F16) &&
-+                            zip == nullptr && mmapped == nullptr) {
++                            (dst_tensor->type == GGML_TYPE_F32 || dst_tensor->type == GGML_TYPE_F16)) {
 +                            const std::string    scale_name    = tensor_storage.name + "_scale";
 +                            const TensorStorage* scale_storage = nullptr;
 +                            for (const auto& candidate : fdata.tensors) {
@@ -111,14 +116,28 @@ index ee5aa49..5292889 100644
 +                                    break;
 +                                }
 +                            }
-+                            if (scale_storage != nullptr) {
++                            if (scale_storage == nullptr) {
++                                LOG_WARN("int8_tensorwise '%s': no '%s' companion, cannot dequantize",
++                                         tensor_storage.name.c_str(), scale_name.c_str());
++                            } else if (zip != nullptr) {
++                                LOG_ERROR("int8_tensorwise '%s': dequantization from a zip archive is not "
++                                          "implemented; load this model from a file instead",
++                                          tensor_storage.name.c_str());
++                            } else {
 +                                const size_t      scale_bytes = scale_storage->nbytes_to_read();
 +                                std::vector<char> scale_buf(scale_bytes);
-+                                file.clear();
-+                                file.seekg(scale_storage->offset);
-+                                file.read(scale_buf.data(), (std::streamsize)scale_bytes);
-+                                if ((size_t)file.gcount() == scale_bytes &&
-+                                    scale_storage->nelements() >= nrows) {
++                                bool              scale_read = false;
++                                if (mmapped) {
++                                    scale_read = mmapped->copy_data(scale_buf.data(),
++                                                                    scale_bytes,
++                                                                    scale_storage->offset);
++                                } else {
++                                    file.clear();
++                                    file.seekg(scale_storage->offset);
++                                    file.read(scale_buf.data(), (std::streamsize)scale_bytes);
++                                    scale_read = ((size_t)file.gcount() == scale_bytes);
++                                }
++                                if (scale_read && scale_storage->nelements() >= (size_t)nrows) {
 +                                    dequantize_int8_tensorwise((const int8_t*)target_buf,
 +                                                               (const float*)scale_buf.data(),
 +                                                               convert_buf,

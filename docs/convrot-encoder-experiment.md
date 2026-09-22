@@ -84,7 +84,14 @@ That last one is the only remaining route to a higher-fidelity encoder in RAM,
 and it is a memory-for-quality trade, not a saving. Deciding it needs a
 download and a quality comparison against the current GGUF baseline.
 
-## Verdict: the criteria are not met, so it is not adopted (2026-09-22)
+## Verdict: measured as a loss, adopted by operator decision (2026-09-22)
+
+The operator chose to run this encoder as the deployed default anyway, on the
+grounds that it is the configuration the upstream model card recommends and that
+it reconstructs the model's weights more faithfully than the GGUF encoder does.
+That decision is recorded here as a decision, not as a measurement: the numbers
+below stand, and they say the change costs memory without a quality gain that any
+test here could see.
 
 Measured on the GPU with the shipped placement, back to back in the same
 session, 1024x1024 / 28 steps / seed 42, same prompt, only the encoder varying.
@@ -125,11 +132,30 @@ Against the pre-registered criteria:
 
 So the encoding is correct and the file runs, but it buys nothing that the
 measurement can see while costing about 5.8 GB more encoder parameters (host RSS
-6.6 GB to 11.7 GB) and an unresolved amount of extra conditioning time. dev
-keeps the Q4_K_M GGUF encoder. On the diffusion side, their recommended Q4_K_M
+6.6 GB to 11.7 GB) and an unresolved amount of extra conditioning time. It is the
+deployed default from 2026-09-22 by operator decision, with the GGUF encoder kept
+one line away in imagegen.toml. On the diffusion side, their recommended Q4_K_M
 is a trade rather than a win on this box: 158.18 s and 8,163 MiB against Q6_K's
 159.60 s and 9,395 MiB, i.e. the same speed, about 1.2 GiB less VRAM, and less
 DiT precision. Q6_K fits comfortably at 9,395 of 11,893 MiB, so it stays.
+
+### The mmap gap, found only in production
+
+sd-cli and sd-server do not read weights the same way. sd-cli opens a plain file;
+sd-server mmaps them. The first version of patch 0002 implemented only the
+plain-file branch, gated on `mmapped == nullptr`, so the embedding dequantization
+silently did not engage under the server. The deployment test caught it exactly:
+a 1024-square request returned HTTP 502, and the backend log ended with
+
+    what(): type i8 unsupported for integer quantization: no dequantization available
+    WARN sd-server backend exited (signal: 6 (SIGABRT) (core dumped))
+
+The patch now reads the companion row scales from whichever source the weights
+came from - mmap via MmapWrapper::copy_data, or a plain file via seek and read -
+and the zip path logs an explicit error instead of falling through to a throw.
+This is the difference between a change that works in a test harness and one that
+works in the deployed service, and it is why the proof of a deployment has to be
+a real request through the real process, not a CLI run.
 
 The two patches remain worth having: patch 0001 fixes a real upstream defect that
 misreads the geometry of any safetensors text encoder carrying a weight_scale
