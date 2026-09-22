@@ -19,7 +19,7 @@ DIFF=${IMAGEGEN_DIFFUSION:-$REPO/models/qwen-image-2.1-Q6_K.gguf}
 VAE=$REPO/models/qwen_image_2.1_vae_bf16.safetensors
 ENCODER_GGUF=$REPO/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf
 ENCODER_CONVROT=$REPO/models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
-PROMPT="a lovely cat holding a sign says 'qwen2.1.cpp'"
+PROMPT=${PROMPT:-"a lovely cat holding a sign says 'qwen2.1.cpp'"}
 
 # Encoder parameters in RAM, graph on CPU; DiT pinned in VRAM; VAE params in RAM.
 PLACEMENT=(--backend te=cpu,diffusion=cuda0,vae=cuda0
