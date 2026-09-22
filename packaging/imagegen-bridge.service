@@ -1,0 +1,45 @@
+# systemd user unit for the imagegen bridge (on-demand lifecycle).
+#
+# Install:
+#   cp packaging/imagegen-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#
+# Do NOT enable it at boot: this deployment is started on demand by an open-grok
+# hook (~/.opengrok/hooks/imagegen-bridge.json runs
+# ~/.opengrok/hooks/bin/ensure-imagegen-bridge when an image tool is called, and
+# ~/.opengrok/hooks/bin/stop-imagegen-bridge on SessionEnd), and the bridge
+# stops itself after idle_timeout_secs. The unit exists so that start and stop
+# have systemd semantics (clean stop signal, restart on real failure, journal)
+# rather than being raw process management.
+#
+#   systemctl --user start imagegen-bridge
+#   systemctl --user stop imagegen-bridge
+#
+# Deliberately not enabled: `systemctl --user enable imagegen-bridge` would
+# start it at every login, which defeats the point of the idle shutdown.
+
+[Unit]
+Description=imagegen bridge - OpenAI image API over local Qwen-Image-2.1 (stable-diffusion.cpp)
+Documentation=file:/data/imagegen/docs/architecture.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/imagegen
+# sd-server needs the CUDA runtime libraries it was built against.
+Environment=LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64
+ExecStart=/data/imagegen/bin/imagegen-bridge
+# The bridge exits 0 after idling out and 0 on a clean stop, so only genuine
+# failures (nonzero exit) are restarted. A restart after an idle exit would make
+# the idle timer pointless.
+Restart=on-failure
+RestartSec=5
+# The bridge handles both SIGINT and SIGTERM, reaping sd-server in either case,
+# so systemd's default StopSignal is fine; 20 s covers reaping a busy backend.
+TimeoutStopSec=20
+# Same log the detached launcher writes, so one file holds the whole history.
+StandardOutput=append:/data/build-sd/bridge-split.log
+StandardError=append:/data/build-sd/bridge-split.log
+
+[Install]
+WantedBy=default.target

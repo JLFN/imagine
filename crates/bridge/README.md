@@ -27,7 +27,19 @@ adds:
 - `GET /v1/models` — `{"data":[{"id":"Qwen-Image-2.1",...}]}`
 - `POST /v1/images/generations` — OpenAI shape, returns
   `{"created":...,"data":[{"b64_json":"..."}]}`
-- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>}`
+- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>,"in_flight":<n>,"idle_secs":<n>,"idle_timeout_secs":<n>}`
+  The last three exist for the on-demand lifecycle: `in_flight` is what stops a
+  stop hook from interrupting a generation, and `idle_secs` against
+  `idle_timeout_secs` shows how close the bridge is to releasing itself.
+- On-demand lifecycle: the bridge is started when an image is requested and
+  releases itself when the requests stop. An open-grok PreToolUse hook on the
+  image tools runs `~/.opengrok/hooks/bin/ensure-imagegen-bridge`; the bridge
+  exits by itself after `idle_timeout_secs` without a request (`0` disables that,
+  for a permanently resident deployment), and a SessionEnd hook runs
+  `stop-imagegen-bridge`, which refuses to stop while another session is alive or
+  a request is in flight unless given `--force`. `packaging/imagegen-bridge.service`
+  is the optional systemd user unit (not enabled on purpose). See
+  docs/architecture.md, "On-demand lifecycle".
 - Request limits: width and height must be divisible by 32, and no edge may
   exceed `max_edge` (default 1152, the measured ceiling of the pinned layout).
   Larger sizes are rejected with HTTP 400 naming the ceiling and the reason
@@ -50,6 +62,7 @@ adds:
 | `IMAGEGEN_STEPS` | `28` |
 | `IMAGEGEN_CFG_SCALE` | `6.0` |
 | `IMAGEGEN_MAX_EDGE` | `1152` (measured ceiling of the pinned layout) |
+| `IMAGEGEN_IDLE_TIMEOUT_SECS` | `900` (seconds without a request before the bridge exits; `0` disables) |
 | `IMAGEGEN_BACKEND_ARGS` | the pinned placement, see imagegen.toml |
 
 Run it from the repository root so the default model/sd-server paths resolve.

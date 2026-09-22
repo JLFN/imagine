@@ -79,6 +79,7 @@ struct Config {
     cfg_scale: f64,
     backend_args: Vec<String>,
     max_edge: u32,
+    idle_timeout_secs: u32,
 }
 
 /// What the TOML configuration file may contain.
@@ -101,6 +102,7 @@ struct FileConfig {
     steps: Option<u32>,
     cfg_scale: Option<f64>,
     max_edge: Option<u32>,
+    idle_timeout_secs: Option<u32>,
 }
 
 /// Environment wins, then the file, then the built-in fallback.
@@ -188,10 +190,16 @@ impl Config {
                 .or(file.backend_args)
                 .unwrap_or_else(default_backend_args),
             max_edge: pick("IMAGEGEN_MAX_EDGE", file.max_edge, Some(DEFAULT_MAX_EDGE)).unwrap(),
+            idle_timeout_secs: pick(
+                "IMAGEGEN_IDLE_TIMEOUT_SECS",
+                file.idle_timeout_secs,
+                Some(DEFAULT_IDLE_TIMEOUT_SECS),
+            )
+            .unwrap(),
         };
         info!(
             "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
-             steps={} cfg_scale={} max_edge={} placement={}",
+             steps={} cfg_scale={} max_edge={} idle_timeout_secs={} placement={}",
             cfg.diffusion,
             cfg.llm,
             cfg.vae,
@@ -201,6 +209,7 @@ impl Config {
             cfg.steps,
             cfg.cfg_scale,
             cfg.max_edge,
+            cfg.idle_timeout_secs,
             cfg.backend_args.join(" ")
         );
         cfg
@@ -413,6 +422,45 @@ struct AppState {
     cfg: Config,
     backend_base: String,
     backend: std::sync::Arc<BackendHandle>,
+    /// Millisecond timestamp of the last generation request, the idle timer's
+    /// input. Starts at process start, so a bridge that is started and never
+    /// used still releases itself.
+    last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Generation requests currently being served. The idle timer never fires
+    /// while this is non-zero, so a long first request cannot be interrupted by
+    /// its own timeout.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Marks one generation request as in flight for as long as it lives, and
+/// refreshes the idle timer at both ends. The timeout therefore counts from the
+/// end of the last request, never from its start.
+struct ActivityGuard {
+    last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ActivityGuard {
+    fn enter(
+        last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        in_flight.fetch_add(1, SeqCst);
+        last_activity_ms.store(now_ms() as u64, SeqCst);
+        Self {
+            last_activity_ms,
+            in_flight,
+        }
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.last_activity_ms.store(now_ms() as u64, SeqCst);
+        self.in_flight.fetch_sub(1, SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +514,39 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
 /// backend_args, not of the card: raise it together with a layout that can
 /// serve the larger size. See docs/architecture.md.
 const DEFAULT_MAX_EDGE: u32 = 1152;
+
+/// Seconds without a generation request before the bridge shuts itself down and
+/// releases the model stack. On-demand deployments are started by a hook when an
+/// image is requested; nothing would otherwise release the backend afterwards,
+/// and the stack is not small: after the first request the backend holds about
+/// 11 GB of RSS and 5.6 GB of pinned VRAM for as long as the bridge lives.
+///
+/// 900 s (15 minutes) is a deliberately generous default: restaging costs about
+/// 35 to 40 s on the next request, so exiting too eagerly trades a cheap idle
+/// process for an expensive first request. Set it to 0 to disable the timer and
+/// behave like a permanently resident service.
+const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 900;
+
+/// How often the idle timer checks. The check itself is free; the poll interval
+/// bounds how late the shutdown can be, not how long the process lives.
+const IDLE_POLL_SECS: u64 = 30;
+
+/// Pure decision behind the idle shutdown, so the rule is testable without
+/// waiting out a timeout: idle only once the timeout has actually elapsed, and
+/// never while a request is in flight. A timeout of 0 disables the timer.
+fn idle_expired(now_ms: u128, last_activity_ms: u128, in_flight: usize, timeout_secs: u32) -> bool {
+    if timeout_secs == 0 || in_flight > 0 {
+        return false;
+    }
+    now_ms.saturating_sub(last_activity_ms) >= (timeout_secs as u128) * 1000
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
 
 fn check_edge_limit(w: u32, h: u32, max_edge: u32) -> Result<(), String> {
     if w > max_edge || h > max_edge {
@@ -542,12 +623,22 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
+    // Idle state is reported so an operator (or the stop hook) can tell a busy
+    // bridge from an idle one without guessing: a stop that interrupts a request
+    // wastes the whole generation.
+    let in_flight = st
+        .in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let idle_secs = now_ms().saturating_sub(st.last_activity_ms.load(std::sync::atomic::Ordering::SeqCst) as u128) / 1000;
     Json(serde_json::json!({
         "status": "ok",
         "backend": backend_ok,
         "backend_process_alive": st.backend.is_alive(),
         "backend_restarts": st.backend.restarts(),
-        "backend_restart_attempts": st.backend.restart_attempts()
+        "backend_restart_attempts": st.backend.restart_attempts(),
+        "in_flight": in_flight,
+        "idle_secs": idle_secs,
+        "idle_timeout_secs": st.cfg.idle_timeout_secs
     }))
 }
 
@@ -590,6 +681,11 @@ async fn create_generation(
             "n must be 1 (multi-image batches are not supported)",
         );
     }
+
+    // From here the request is accepted and will do backend work, so it counts
+    // as activity for the idle timer until it finishes (successfully or not).
+    let _activity = ActivityGuard::enter(st.last_activity_ms.clone(), st.in_flight.clone());
+
     let steps = req.num_inference_steps.unwrap_or(st.cfg.steps);
     let cfg_scale = req.cfg_scale.unwrap_or(st.cfg.cfg_scale);
     // seed < 0 (or omitted) means random, matching sd-server's convention.
@@ -736,6 +832,8 @@ async fn main() {
         cfg: cfg.clone(),
         backend_base: format!("http://127.0.0.1:{}", cfg.backend_port),
         backend: backend.clone(),
+        last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_ms() as u64)),
+        in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     // Keep the backend up for the lifetime of the bridge. The supervisor owns
@@ -771,9 +869,43 @@ async fn main() {
         .route("/v1/models", get(get_models))
         .route("/v1/images/generations", post(create_generation))
         .route("/health", get(health))
-        .with_state(state);
+        .with_state(state.clone());
 
     info!("imagegen bridge listening on http://{}", addr);
+
+    // Idle shutdown. An on-demand deployment is started by a hook when an image
+    // is requested, so something has to stop it again: nothing releases the
+    // backend otherwise, and after the first request it holds about 11 GB of RSS
+    // and 5.6 GB of pinned VRAM. The check never fires while a request is in
+    // flight, so a long first request cannot be cut off by its own timeout.
+    if cfg.idle_timeout_secs == 0 {
+        info!("idle shutdown disabled (idle_timeout_secs = 0)");
+    } else {
+        let idle_timeout_secs = cfg.idle_timeout_secs;
+        let last_activity_ms = state.last_activity_ms.clone();
+        let in_flight = state.in_flight.clone();
+        let shutting_down = shutting_down.clone();
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            loop {
+                tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)).await;
+                let last = last_activity_ms.load(SeqCst) as u128;
+                let busy = in_flight.load(SeqCst);
+                if idle_expired(now_ms(), last, busy, idle_timeout_secs) {
+                    let idle_for = now_ms().saturating_sub(last) / 1000;
+                    info!(
+                        "idle for {}s (timeout {}s), releasing the backend; the next request \
+                         restages the model stack",
+                        idle_for, idle_timeout_secs
+                    );
+                    shutting_down.store(true, SeqCst);
+                    backend.kill();
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     // Shut sd-server down when the bridge is terminated.
     tokio::spawn(async move {
@@ -791,7 +923,27 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // SIGINT is the documented clean stop (Ctrl-C, and what the stop hook and the
+    // detached launcher use). SIGTERM is handled as well so that a systemd unit
+    // stop, which sends SIGTERM by default, reaps sd-server instead of leaving it
+    // behind: the whole point of the handler is that no orphan backend survives a
+    // stop.
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "cannot install a SIGTERM handler ({}); SIGINT still stops the bridge cleanly",
+                e
+            );
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
+        _ = sigterm.recv() => info!("SIGTERM received"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -855,5 +1007,46 @@ mod tests {
         // Wide aspect ratios are larger on the long edge and still bounded.
         let (w3, h3) = dims_from_aspect("16:9", "1k");
         assert!(check_edge_limit(w3, h3, DEFAULT_MAX_EDGE).is_ok());
+    }
+
+    #[test]
+    fn idle_timer_fires_only_after_the_timeout() {
+        let t0 = 1_000_000u128;
+        // Just under the timeout: still serving.
+        assert!(!idle_expired(t0 + 899_000, t0, 0, 900));
+        // Exactly at the timeout and past it: release.
+        assert!(idle_expired(t0 + 900_000, t0, 0, 900));
+        assert!(idle_expired(t0 + 5_000_000, t0, 0, 900));
+    }
+
+    #[test]
+    fn idle_timer_never_fires_mid_request_or_when_disabled() {
+        let t0 = 1_000_000u128;
+        // A request in flight wins over any elapsed time: a long first request
+        // stages the whole model stack and must not be cut off by its own timer.
+        assert!(!idle_expired(t0 + 10_000_000, t0, 1, 900));
+        // 0 disables the timer, for a permanently resident deployment.
+        assert!(!idle_expired(t0 + 10_000_000, t0, 0, 0));
+        // A clock that appears to go backwards must not cause a shutdown loop.
+        assert!(!idle_expired(t0, t0 + 60_000, 0, 900));
+    }
+
+    #[test]
+    fn activity_guard_counts_and_refreshes() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+        let last = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let before = now_ms() as u64;
+        {
+            let _g = ActivityGuard::enter(last.clone(), in_flight.clone());
+            assert_eq!(in_flight.load(SeqCst), 1, "enter marks the request in flight");
+            assert!(
+                last.load(SeqCst) >= before,
+                "enter refreshes the idle timer"
+            );
+        }
+        assert_eq!(in_flight.load(SeqCst), 0, "drop clears the in-flight mark");
+        assert!(last.load(SeqCst) >= before, "drop refreshes the idle timer");
     }
 }

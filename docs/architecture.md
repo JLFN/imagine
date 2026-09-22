@@ -230,6 +230,93 @@ silently dead backend. Serving 1344 square through the bridge would additionally
 require taking the warm backend down (see Resolution headroom above), so it stays
 a direct sd-cli job.
 
+## On-demand lifecycle (2026-09-22)
+
+Nothing started or stopped the bridge before this: open-grok's image tool is a
+pure HTTP client (there is no process spawning anywhere in its implementation,
+and it carries a 300 s total / 240 s read timeout), so a request sent while the
+bridge was down simply failed, and once started the deployment stayed resident
+forever. Both halves are now hook-driven.
+
+The hooks (~/.opengrok/hooks/imagegen-bridge.json, global scope, always trusted):
+
+  PreToolUse, matcher ^(image_gen|image_edit)$  ->  bin/ensure-imagegen-bridge
+  SessionEnd                                    ->  bin/stop-imagegen-bridge
+
+ensure-imagegen-bridge is the start half. It probes /health, and if nothing
+answers it starts the systemd user unit if that unit is loaded, otherwise it
+launches the binary detached from the project root with the CUDA library path.
+It waits a bounded 10 s in the foreground (a tool call must not stall), hands any
+remaining wait to a detached waiter, fails open, and logs every decision to
+~/.local/state/ensure-imagegen-bridge.log. The common path is one HTTP call.
+
+stop-imagegen-bridge is the stop half, and it is guarded, because stopping the
+wrong thing is worse than leaving it running:
+
+  1. another live open-grok session  -> skip; sessions are long lived and share
+     the bridge, so one session ending is not evidence nobody needs it
+  2. /health reports in_flight > 0   -> skip; never interrupt a generation, which
+     would throw away the whole run
+  3. --force overrides both, for an operator who knows the state
+
+The bridge is its own backstop: idle_timeout_secs (imagegen.toml, default 900 s,
+0 disables) shuts the process down when no generation request has arrived for
+that long. The timer never fires while a request is in flight, so a long first
+request cannot be cut off by its own timeout, and it exits 0 so the unit's
+Restart=on-failure does not bring it straight back. /health reports in_flight,
+idle_secs and idle_timeout_secs so a stop decision can be made from data instead
+of a guess.
+
+What the lifecycle costs, measured on this box:
+
+  state                          bridge RSS   backend RSS   VRAM      first request after
+  started, no request yet          6 MiB        337 MiB      475 MiB   restages weights: 35-40 s
+  after a generation             ~6 MiB        ~11 GB        ~5.6 GB   already warm
+
+So the idle timer is what makes the on-demand model pay off: it releases roughly
+11 GB of host RAM and 5.6 GB of pinned VRAM, and the hook restarts the bridge in
+about a second when an image is next requested.
+
+Verified live on 2026-09-22, end to end and by hand:
+
+- With the bridge stopped and a SECOND session alive, a fresh headless session
+  asked for an image. The PreToolUse hook started the service at 12:02:38, the
+  request was served, and the session received a 1024x1024 PNG: "generating 1
+  image(s) at 1024x1024 steps=28" at 12:02:39, "generated 1 image(s) in
+  175.280632557s". No hand-holding: the hook is what brought the bridge up.
+- With IMAGEGEN_IDLE_TIMEOUT_SECS=20 the bridge logged "idle for 30s (timeout
+  20s), releasing the backend; the next request restages the model stack" and
+  exited on its own after 48 s, leaving no sd-server behind. The 30 s interval is
+  the poll period, so an idle exit lands within one poll of the timeout.
+- With the systemd unit not installed, the same ensure path launched the binary
+  detached, recorded the real pid in ~/.local/state/imagegen-bridge.pid, and
+  became healthy, so the hook works on a machine without the unit too.
+- A systemd stop on the new binary logged its own "SIGTERM received" and reaped
+  sd-server, so a unit stop does not leak the backend.
+- The stop hook's guards were observed doing their job: without --force it
+  refused to stop while two open-grok sessions were alive, and skipped silently
+  only when /health did not answer because the bridge was already down.
+
+packaging/imagegen-bridge.service is the unit: Type=simple, WorkingDirectory the
+repository root, Restart=on-failure, the same log file as the detached launcher,
+and systemd's default SIGTERM stop signal, which the bridge now handles cleanly
+(it reaps sd-server on either SIGINT or SIGTERM; before this, only SIGINT was
+handled and a unit stop relied on systemd killing the whole cgroup). The unit is
+deliberately not enabled: enabling it would start the bridge at every login,
+which is exactly what the idle shutdown exists to avoid.
+
+Two limits worth knowing. The session-end stop stays out of the way while any
+other session is alive, so a long-lived session that never asks for images keeps
+the bridge until the idle timer fires; that is the intended trade, not an
+oversight. And SessionEnd does not fire in headless runs: measured with a
+temporary probe hook (2026-09-22), a headless `open-grok -p` session emits
+session_start and pre_tool_use and a stop with reason end_turn, but no
+session_end, so the stop hook applies to interactive sessions only and the idle
+timer is what covers headless ones. The start half fires in both modes, which is
+what the end-to-end test above relies on. Socket activation is not used either:
+the hook is the trigger, which keeps the start path debuggable and leaves the
+bridge binding its own port.
+
 ## Quality and open-grok on-demand (Unit 2 findings)
 
 - Step count matters more than any other single request field at this size, and
