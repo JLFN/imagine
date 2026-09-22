@@ -58,8 +58,9 @@ curl fallback (identical bytes):
 
 ## Total
 
-About 10.3 GiB on disk. Runtime: diffusion model in VRAM (fits 12 GB),
-encoder in system RAM (~5 GB), VAE small.
+About 10.3 GiB for the Q6_K stack, or 15.9 GiB if the int8 convrot encoder is used
+instead of the GGUF one. Runtime: diffusion model pinned in VRAM (fits 12 GB),
+encoder in system RAM (4.3 GB as GGUF, 10.1 GB as int8 convrot), VAE small.
 
 ## Verified downloads (2026-09-21, this workstation)
 
@@ -82,6 +83,18 @@ SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
   size    5876556448
   sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
+- models/text_encoders/qwen3vl_8b_int8_convrot.safetensors   (deployed default TE)
+  size    9350798360
+  sha256  8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
+  (source: Comfy-Org/Qwen-Image-2.1 text_encoders/ HF LFS oid; the same bytes are
+  published as KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF
+  text_encoders/qwen3vl_8b_int8_convrot.safetensors, verified against both)
+  REQUIRES the patched sd-server built from patches/0001 and patches/0002: stock
+  sd.cpp misreads this file's geometry at load and then cannot dequantize its
+  int8 token embedding. See docs/convrot-encoder-experiment.md. Reports
+  10,104.77 MB of parameters at load against the GGUF encoder's 4,302.33 MB, so it
+  costs about 5.8 GB more host RAM for the same VRAM peak; the GGUF encoder above
+  remains the lighter option and needs no patches.
   The Q6_K diffusion model (~28% larger than Q4_K_M) is the practical
   higher-fidelity default on the 12 GB GPU and is the deployed default in
   the bridge. Its parameters are pinned in VRAM (not RAM-staged): updated

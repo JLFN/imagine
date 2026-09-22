@@ -168,8 +168,9 @@ impl Config {
         };
 
         let cfg = Config {
-            sd_server: pick("IMAGEGEN_SD_SERVER", file.sd_server, None)
-                .unwrap_or_else(|| "bin/sd-server".to_string()),
+            // Every path, the binary included, comes from the file or the
+            // environment. A wrong path is a startup error, not a panic later.
+            sd_server: required(file.sd_server, "IMAGEGEN_SD_SERVER"),
             diffusion: required(file.diffusion, "IMAGEGEN_DIFFUSION"),
             vae: required(file.vae, "IMAGEGEN_VAE"),
             llm: required(file.llm, "IMAGEGEN_LLM"),
@@ -206,7 +207,7 @@ impl Config {
 // Backend process supervision
 // ---------------------------------------------------------------------------
 
-fn spawn_backend(cfg: &Config) -> Child {
+fn spawn_backend(cfg: &Config) -> Result<Child, String> {
     info!(
         "starting sd-server backend on 127.0.0.1:{} ({} / {} / {})",
         cfg.backend_port, cfg.diffusion, cfg.llm, cfg.vae
@@ -228,14 +229,22 @@ fn spawn_backend(cfg: &Config) -> Child {
         .arg(cfg.backend_port.to_string())
         .args(&cfg.backend_args)
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
+        .map_err(|e| format!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
 }
 
 async fn wait_backend_ready(cfg: &Config, client: &reqwest::Client) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/v1/models", cfg.backend_port);
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        match client.get(&url).send().await {
+        // A probe needs its own timeout: without one, a backend that accepts the
+        // connection and then never answers blocks this loop forever and the
+        // deadline below is never reached.
+        match client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => warn!("backend not ready ({}), retrying", r.status()),
             Err(e) => warn!("backend not reachable ({}), retrying", e),
@@ -260,7 +269,12 @@ async fn wait_backend_ready(cfg: &Config, client: &reqwest::Client) -> Result<()
 /// supervisor task replaces it when it dies.
 struct BackendHandle {
     child: std::sync::Mutex<Option<Child>>,
+    /// Successful replacements: the backend died and a new one became ready.
     restarts: std::sync::atomic::AtomicU64,
+    /// Spawns attempted after a death, including ones that never became ready.
+    /// Counted separately so a backend that dies and fails to come back cannot
+    /// look like a healthy number of restarts.
+    restart_attempts: std::sync::atomic::AtomicU64,
 }
 
 impl BackendHandle {
@@ -268,6 +282,7 @@ impl BackendHandle {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             restarts: std::sync::atomic::AtomicU64::new(0),
+            restart_attempts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -301,12 +316,23 @@ impl BackendHandle {
 
     fn replace(&self, child: Child) {
         *self.child.lock().unwrap() = Some(child);
+        self.restart_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Called only once a replaced backend has answered the readiness probe.
+    fn mark_ready(&self) {
         self.restarts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn restarts(&self) -> u64 {
         self.restarts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn restart_attempts(&self) -> u64 {
+        self.restart_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Kill and reap, so shutdown leaves no zombie either.
@@ -346,9 +372,19 @@ async fn supervise_backend(
         if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        handle.replace(spawn_backend(&cfg));
+        match spawn_backend(&cfg) {
+            Ok(child) => handle.replace(child),
+            Err(e) => {
+                // A backend that cannot even be started will not be fixed by
+                // waiting, but the bridge stays up so /health can report it.
+                error!("{}", e);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        }
         match wait_backend_ready(&cfg, &client).await {
             Ok(()) => {
+                handle.mark_ready();
                 info!(
                     "sd-server backend restarted and ready (restart number {})",
                     handle.restarts()
@@ -408,7 +444,24 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
             size
         ));
     }
+    check_edge_limit(w, h)?;
     Ok((w, h))
+}
+
+/// The largest edge this card is documented to cover at this precision. A hard
+/// ceiling keeps one caller from asking for a size that cannot fit and failing
+/// the generation or aborting the backend; a clear rejection is better than
+/// either. Applied to the final size from both request paths.
+const MAX_EDGE: u32 = 1536;
+
+fn check_edge_limit(w: u32, h: u32) -> Result<(), String> {
+    if w > MAX_EDGE || h > MAX_EDGE {
+        return Err(format!(
+            "size {}x{} exceeds the supported maximum of {}x{} on this 12 GB GPU",
+            w, h, MAX_EDGE, MAX_EDGE
+        ));
+    }
+    Ok(())
 }
 
 /// Resolution tier -> long-edge pixels. open-grok sends "1k" by default.
@@ -424,10 +477,10 @@ fn resolution_base(resolution: &str) -> u32 {
 }
 
 /// Map an aspect ratio string ("16:9", "1:1", "3:2", ...) and a resolution
-/// tier to a WIDTHxHEIGHT that is divisible by 32 and stays within the long
-/// edge given by the resolution. Falls back to a square at the resolution
-/// base when the ratio cannot be parsed. This honors open-grok's
-/// aspect_ratio + resolution fields (it does not send a `size`).
+/// tier to a WIDTHxHEIGHT that is divisible by 32. The result is NOT bounded by
+/// the resolution tier: a tier whose long edge exceeds what this card can run
+/// produces dimensions that check_edge_limit then rejects with a clear error,
+/// rather than a silently clamped image.
 fn dims_from_aspect(aspect_ratio: &str, resolution: &str) -> (u32, u32) {
     let long = resolution_base(resolution);
     let snap32 = |v: u32| -> u32 { ((v + 15) / 32).max(1) * 32 };
@@ -466,6 +519,7 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
     let backend_ok = st
         .client
         .get(&url)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -474,7 +528,8 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
         "status": "ok",
         "backend": backend_ok,
         "backend_process_alive": st.backend.is_alive(),
-        "backend_restarts": st.backend.restarts()
+        "backend_restarts": st.backend.restarts(),
+        "backend_restart_attempts": st.backend.restart_attempts()
     }))
 }
 
@@ -503,6 +558,12 @@ async fn create_generation(
             dims_from_aspect(ar, res)
         }
     };
+    // The ceiling has to be applied to the final size, not inside parse_size:
+    // the aspect_ratio + resolution path is the one open-grok actually uses, and
+    // it would otherwise forward 2048x2048 for "2k" straight past the limit.
+    if let Err(msg) = check_edge_limit(width, height) {
+        return err(StatusCode::BAD_REQUEST, &msg);
+    }
 
     let n = req.n.unwrap_or(1);
     if n != 1 {
@@ -624,20 +685,33 @@ async fn main() {
         .init();
 
     let cfg = Config::load();
-    let backend = spawn_backend(&cfg);
+    let backend = match spawn_backend(&cfg) {
+        Ok(child) => child,
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(2);
+        }
+    };
 
     let client = reqwest::Client::new();
-    if let Err(e) = wait_backend_ready(&cfg, &client).await {
-        error!("{}", e);
-        let mut b = backend;
-        let _ = b.kill();
-        let _ = b.wait();
-        std::process::exit(1);
-    }
-    info!("sd-server backend ready");
 
     let backend = std::sync::Arc::new(BackendHandle::new(backend));
     let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Bind and serve BEFORE waiting for the backend. A startup that waits first
+    // cannot answer /health while it waits, which is exactly when an operator
+    // needs it: a backend that spawns but never answers left the bridge
+    // unreachable for 180 seconds and then gone. /health now reports
+    // backend false during that window instead.
+    let addr = format!("{}:{}", cfg.listen_ip, cfg.listen_port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("failed to bind bridge on {}: {}", addr, e);
+            backend.kill();
+            std::process::exit(1);
+        }
+    };
 
     let state = std::sync::Arc::new(AppState {
         client: client.clone(),
@@ -646,13 +720,34 @@ async fn main() {
         backend: backend.clone(),
     });
 
-    // Keep the backend up for the lifetime of the bridge.
+    // Keep the backend up for the lifetime of the bridge. The supervisor owns
+    // every restart, the first start included: it reaps a child that dies and
+    // respawns it, and the readiness wait below is a report, not a gate.
     tokio::spawn(supervise_backend(
         cfg.clone(),
-        client,
+        client.clone(),
         backend.clone(),
         shutting_down.clone(),
     ));
+
+    // Report the first readiness without blocking the listener. A backend that
+    // never becomes ready is visible in /health as backend false, and a process
+    // that is alive but not answering HTTP is NOT auto-restarted yet; that is a
+    // known limitation, recorded in docs/architecture.md.
+    {
+        let cfg = cfg.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            match wait_backend_ready(&cfg, &client).await {
+                Ok(()) => info!("sd-server backend ready"),
+                Err(e) => warn!(
+                    "sd-server backend did not answer within the startup window ({}); \
+                     the bridge is serving and /health reports backend false",
+                    e
+                ),
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/v1/models", get(get_models))
@@ -660,15 +755,6 @@ async fn main() {
         .route("/health", get(health))
         .with_state(state);
 
-    let addr = format!("{}:{}", cfg.listen_ip, cfg.listen_port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("failed to bind bridge on {}: {}", addr, e);
-            let _ = backend.kill();
-            std::process::exit(1);
-        }
-    };
     info!("imagegen bridge listening on http://{}", addr);
 
     // Shut sd-server down when the bridge is terminated.

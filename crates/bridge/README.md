@@ -27,8 +27,10 @@ adds:
 - `GET /v1/models` — `{"data":[{"id":"Qwen-Image-2.1",...}]}`
 - `POST /v1/images/generations` — OpenAI shape, returns
   `{"created":...,"data":[{"b64_json":"..."}]}`
-- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>}`
-
+- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>}`
+- Request limits: width and height must be divisible by 32 and at most 1536 on
+  either edge. Larger sizes are rejected with HTTP 400 rather than forwarded,
+  because they cannot fit this card and would abort the backend.
 ## Configuration (environment, with repo-defaults shown)
 
 | Variable | Default |
