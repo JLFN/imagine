@@ -15,7 +15,7 @@ REPO=/data/imagegen
 OUT=${1:-/data/build-sd/te-split/convrot-experiment}
 BIN=${2:-/data/build-sd/stable-diffusion.cpp/build/bin/sd-cli}
 
-DIFF=$REPO/models/qwen-image-2.1-Q6_K.gguf
+DIFF=${IMAGEGEN_DIFFUSION:-$REPO/models/qwen-image-2.1-Q6_K.gguf}
 VAE=$REPO/models/qwen_image_2.1_vae_bf16.safetensors
 ENCODER_GGUF=$REPO/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf
 ENCODER_CONVROT=$REPO/models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
@@ -28,9 +28,9 @@ PLACEMENT=(--backend te=cpu,diffusion=cuda0,vae=cuda0
 mkdir -p "$OUT"
 cd "$REPO" || exit 1
 
-if pgrep -f "bin/imagegen-bridge" >/dev/null 2>&1; then
+if pgrep -x imagegen-bridge >/dev/null 2>&1; then
   echo "REFUSING TO RUN: the production bridge is up and holds VRAM pinned."
-  echo "Stop it first with:  kill -INT \$(pgrep -f bin/imagegen-bridge)"
+  echo "Stop it first with:  kill -INT \$(pgrep -x imagegen-bridge)"
   exit 1
 fi
 

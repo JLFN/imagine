@@ -1,9 +1,8 @@
 # Experiment: the ComfyUI int8 convrot text encoder as the TE
 
-Status: CLOSED, RESULT LOSS. Not merged; dev is untouched. The patch here is
-the prerequisite for any safetensors TE that carries weight_scale, but it was
-not sufficient to make the int8 encoder run, and the remaining gap is a
-missing feature rather than a configuration. The branch is kept as the record.
+Status: IMPLEMENTED AND RUNS on branch feat/convrot-encoder-te. Two patches were
+needed. Correctness is verified numerically against BF16 ground truth, and the
+acceptance criteria below still decide adoption; dev is untouched until then.
 
 ## Result (2026-09-22)
 
@@ -14,28 +13,50 @@ the geometry correctly:
                             hidden_size = 4096, intermediate_size = 12288
 
 That matches the GGUF encoder exactly, so the config-inference diagnosis was
-right. The load then proceeds to 643 of 649 tensors and dies on a second,
-different wall:
+right. That fixed the geometry; the load then reached 643 of 649 tensors and
+died on a second, independent cause:
 
     what(): type i8 unsupported for integer quantization: no dequantization available
     Aborted (core dumped), exit 134
 
-Why that is not fixable by configuration: src/model_loader.cpp:137 throws from
-convert_tensor when the destination type differs from GGML_TYPE_I8, because
-int8 tensorwise weights are meant to be consumed in place with per-row scales
-and GGML_TYPE_I8 has no to_float trait. That conversion is attempted because
-the TE module has no int8 path: the int8_tensorwise and convrot handling lives
-in src/model/common/ggml_block.hpp (the DiT's Linear block),
-src/model_io/safetensors_io.cpp, src/model_io/tensor_storage.h and
-src/model_manager_files.cpp, and appears nowhere in src/model/te/llm.hpp. The
-DIFFUSION model runs int8 convrot because its Linear block implements the
-rotation, the activation quantization and the int8 GEMM; the LLM's own linear
-blocks do not.
+Cause 2, the token embedding. int8_tensorwise weights are meant to be consumed in
+place by the int8 matmul path, and GGML_TYPE_I8 has no to_float trait, so nothing
+can dequantize one. The token embedding is a gather rather than a matmul, so
+Embedding::init_params forces its table to F32 when the file stores I8, the
+loader then asks for a conversion, and convert_tensor throws. Note the LLM's
+linear layers were never the problem: they use the same int8-aware Linear block
+the diffusion model uses, and no int8 path had to be written for them.
 
-So this file cannot be used as the text encoder without implementing the int8
-tensorwise path for the LLM blocks - a real feature (the kernels exist for the
-other module, so it is wiring plus correctness work in the LLM graph, and it
-belongs upstream), not a flag.
+The fix (patches/0002-...) adds dequantize_int8_tensorwise to the loader. It
+reads the companion row scales from the same file with the file handle the worker
+already holds, applies one scale per output row, then undoes the offline convrot
+rotation with the normalized regular Hadamard, copied verbatim from
+ggml_regular_hadamard_group_f32 in ggml/src/ggml-cpu/ggml-cpu.c. That transform is
+its own inverse, which is why applying it once more undoes the rotation.
+
+The rotation must be undone here rather than left to the runtime. A downstream
+quantized linear does rotate its input back, but a learned-weight RMSNorm sits
+between the embedding and the first quantized linear, so the rotation would
+survive it.
+
+## Correctness verification (not merely "it ran")
+
+Ground truth is the same model's weights in BF16 (Comfy-Org/Qwen-Image-2.1,
+text_encoders/qwen3vl_8b_bf16.safetensors), fetched by HTTP byte range so only
+the header and the tensors under test were downloaded. Reconstructing W from the
+int8 file the way the patch does - per-row scale, then the rotation undo - gives:
+
+    model.layers.0.self_attn.q_proj.weight  pearson 0.999963  rel_l2 0.0086
+    model.embed_tokens.weight               pearson 0.999961  rel_l2 0.0089
+    control, rotation NOT undone            rel_l2 1.3734
+
+0.0086-0.0089 is int8 quantization noise, and the control shows the undo is doing
+real work rather than being a no-op. Reproduce with
+tools/verify-convrot-dequant.py.
+
+End to end, CPU-only: the encoder loads all 649 of its tensors, conditioning
+completes, and an image is produced. Conditioning cost on the same CPU footing and
+the same prompt: int8 convrot 9.69 s against the Q4_K_M GGUF's 10.29 s.
 
 Measured cost of the attempt, before the failure: the encoder's parameters
 report as 10,104.77 MB in RAM, against the GGUF encoder's 4,302.33 MB. So even
@@ -62,6 +83,57 @@ verified where downloaded.
 That last one is the only remaining route to a higher-fidelity encoder in RAM,
 and it is a memory-for-quality trade, not a saving. Deciding it needs a
 download and a quality comparison against the current GGUF baseline.
+
+## Verdict: the criteria are not met, so it is not adopted (2026-09-22)
+
+Measured on the GPU with the shipped placement, back to back in the same
+session, 1024x1024 / 28 steps / seed 42, same prompt, only the encoder varying.
+Both sides pin the diffusion model in VRAM, keep the encoder on the CPU and the
+VAE parameters in RAM.
+
+With the deployed Q6_K diffusion model:
+
+    encoder            conditioning  sampling  decode  total    peak VRAM  host RSS
+    Q4_K_M GGUF (now)      10.26 s    143.88 s  5.43 s  159.60 s   9,395 MiB  6.6 GB
+    int8 convrot           22.66 s    141.83 s  4.11 s  168.64 s   9,397 MiB 11.7 GB
+
+With their recommended Q4_K_M diffusion model:
+
+    encoder            conditioning  sampling  decode  total    peak VRAM  host RSS
+    Q4_K_M GGUF (now)      13.54 s    139.53 s  5.08 s  158.18 s   8,163 MiB  6.6 GB
+    int8 convrot           16.71 s    130.08 s  4.12 s  150.93 s   8,174 MiB 11.7 GB
+
+Against the pre-registered criteria:
+
+1. Loads and completes: PASS.
+2. Encoder parameters in RAM, not VRAM: PASS (10,104.77 MB RAM, 0 MB VRAM).
+3. Peak VRAM no worse: PASS (identical within noise).
+4. Total time within +5 percent: FAIL in the Q6_K pair (168.64 s against
+   159.60 s, +5.7 percent) and inconclusive in the Q4_K_M pair, where the
+   candidate came out 7.2 s faster on a sampling phase that must be identical
+   because the diffusion model is the same - that difference is run-to-run
+   variance, not an encoder effect. The conditioning deltas are also unstable
+   (+12.4 s and +3.2 s in the two pairs, while the same GGUF encoder measured
+   2.62 s, 10.26 s and 13.54 s across runs), so the honest reading is that the
+   int8 encoder's conditioning is somewhat more expensive and the measurement
+   cannot resolve it tightly.
+5. Quality strictly better: FAIL, by the tie rule this document set. Both
+   images render the requested literal text correctly. Graded blind by a
+   separate vision model (the two outputs were presented as A and B with no
+   indication of which encoder produced them), both transcribed qwen2.1.cpp
+   fully legibly and both scored 10/10 on prompt adherence.
+
+So the encoding is correct and the file runs, but it buys nothing that the
+measurement can see while costing about 5.8 GB more encoder parameters (host RSS
+6.6 GB to 11.7 GB) and an unresolved amount of extra conditioning time. dev
+keeps the Q4_K_M GGUF encoder. On the diffusion side, their recommended Q4_K_M
+is a trade rather than a win on this box: 158.18 s and 8,163 MiB against Q6_K's
+159.60 s and 9,395 MiB, i.e. the same speed, about 1.2 GiB less VRAM, and less
+DiT precision. Q6_K fits comfortably at 9,395 of 11,893 MiB, so it stays.
+
+The two patches remain worth having: patch 0001 fixes a real upstream defect that
+misreads the geometry of any safetensors text encoder carrying a weight_scale
+tensor, and the embedding work is what any weights-only text encoder would need.
 
 ## What is being tried
 
