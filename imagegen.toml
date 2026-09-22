@@ -66,3 +66,15 @@ cfg_scale = 6.0
 # 5.6 GB of VRAM, and the offload layout needs the whole card, so the two cannot
 # run at once. Raise max_edge only together with a layout that can serve it.
 max_edge = 1152
+
+# Seconds without a generation request before the bridge stops itself and
+# releases the backend, and 0 to disable that. The deployment is started on
+# demand (an open-grok PreToolUse hook runs hooks/bin/ensure-imagegen-bridge when
+# an image tool is called), so something has to stop it again: after the first
+# request the backend holds about 11 GB of host RSS and 5.6 GB of pinned VRAM,
+# and before the first request it holds almost nothing (6 MiB bridge, 337 MiB
+# backend, 475 MiB VRAM). 900 s is generous on purpose, because the next request
+# after a shutdown pays 35 to 40 s of weight staging. The timer never fires while
+# a request is in flight, and /health reports in_flight, idle_secs and
+# idle_timeout_secs so a stop can tell a busy bridge from an idle one.
+idle_timeout_secs = 900
