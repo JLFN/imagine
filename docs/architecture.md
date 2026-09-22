@@ -26,9 +26,9 @@ Text-to-image (width/height divisible by 32; resolution-dependent flow
 schedule is selected automatically):
 
   sd-cli \
-    --diffusion-model models/qwen-image-2.1-Q4_K_M.gguf \
-    --vae models/qwen_image_2.1_vae_bf16.safetensors \
-    --llm models/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
+    --diffusion-model models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf \
+    --vae models/vae/qwen_image_2.1_vae_bf16.safetensors \
+    --llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
     -p "<prompt>" --cfg-scale 6.0 --sampling-method euler \
     -v --offload-to-cpu -o out/image.png
 
@@ -103,6 +103,54 @@ Layout is not bit-reproducible: the same seed and prompt under two layouts
 differed on 90% of channel bytes (mean absolute difference 6.07 of 255).
 Structurally identical images, but do not expect byte equality across
 placement changes.
+
+## Configuration and supervision (2026-09-22)
+
+Model paths are not compiled into the bridge. They live in imagegen.toml at the
+repository root, which the bridge reads from its working directory (point
+IMAGEGEN_CONFIG elsewhere to override). A missing model path is a startup error
+naming the file and the variable, never a built-in guess: silently loading a
+different model is worse than refusing to start. Environment variables override
+the file one value at a time, which is how a test or an operator changes a single
+path without editing the file. The effective configuration is logged at startup.
+
+Model files follow the upstream card's layout, one directory per component:
+models/diffusion_models/ for the GGUF diffusion models, models/text_encoders/ for
+the text encoders, models/vae/ for the VAE. The files themselves are unchanged and
+hash-match the published checksums.
+
+The default text encoder is the ComfyUI int8 convrot file the upstream card
+recommends, which is why the deployed sd-server is the patched build from
+patches/0001 and patches/0002: stock sd.cpp aborts on that file. The GGUF encoder
+stays on disk at models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf and needs
+no patches; set IMAGEGEN_LLM to it (or edit imagegen.toml) to go back. Its
+measured cost against the GGUF encoder is about 5.8 GB more host RAM for the same
+VRAM peak, a somewhat higher conditioning time, and a tie on image quality.
+
+The bridge supervises its backend. It reaps the child, and if the process dies it
+restarts it with exponential backoff and waits for it to answer before calling it
+ready. /health reports backend (an HTTP probe of the backend), backend_process_alive
+(the child's state), backend_restarts (healthy replacements) and
+backend_restart_attempts (spawns attempted after a death). Before this, the child
+was spawned once and never waited on: on 2026-09-22 the bridge ran 8h51m with a
+zombie sd-server, a dead backend port and every image request failing silently.
+
+The listener binds before the first readiness wait, so /health answers during a
+startup where the backend never becomes ready, reporting backend false rather
+than leaving the bridge unreachable. Two limits are worth knowing:
+
+- Supervision keys on process liveness. A backend that stays ALIVE but never
+  answers HTTP is visible in /health as backend false but is not auto-restarted.
+  Restarting on a failed probe is future work.
+- Readiness is an HTTP probe, so it passes as soon as sd-server binds its port,
+  which happens before weights are loaded. The first request after a restart
+  therefore pays the full model staging cost.
+
+Requests are bounded: width and height must be divisible by 32 and at most 1536
+on either edge, checked on the final size from BOTH request paths (an explicit
+size, and open-grok's aspect_ratio plus resolution). A larger request receives
+HTTP 400 naming the limit, because it cannot fit this card and would otherwise
+fail the generation or abort the backend.
 
 ## Quality and open-grok on-demand (Unit 2 findings)
 

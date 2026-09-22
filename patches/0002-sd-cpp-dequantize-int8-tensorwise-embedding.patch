@@ -1,0 +1,172 @@
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index ee5aa49..493d789 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -972,6 +972,76 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
+     return result;
+ }
+ 
++// The convrot rotation the patched ggml applies to activations before an int8
++// matmul. Copied from ggml_regular_hadamard_group_f32 in
++// ggml/src/ggml-cpu/ggml-cpu.c so the host can reproduce it exactly. It is the
++// normalized regular Hadamard built from H4, so it is its own inverse: applying
++// it once more undoes the offline rotation the quantizer baked into the weights.
++static void regular_hadamard_group_f32(float* values, int group_size) {
++    const float scale = 1.0f / sqrtf((float)group_size);
++    for (int i = 0; i < group_size; ++i) {
++        values[i] *= scale;
++    }
++
++    for (int stride = 1; stride < group_size; stride *= 4) {
++        for (int base = 0; base < group_size; base += 4 * stride) {
++            for (int j = 0; j < stride; ++j) {
++                const int i0 = base + j;
++                const int i1 = i0 + stride;
++                const int i2 = i1 + stride;
++                const int i3 = i2 + stride;
++                const float a = values[i0];
++                const float b = values[i1];
++                const float c = values[i2];
++                const float d = values[i3];
++                values[i0] =  a + b + c - d;
++                values[i1] =  a + b - c + d;
++                values[i2] =  a - b + c + d;
++                values[i3] = -a + b + c + d;
++            }
++        }
++    }
++}
++
++// Dequantize an int8_tensorwise weight into a float destination.
++//
++// int8_tensorwise weights are normally consumed in place by the int8 matmul path
++// (ggml_ext_linear_i8_tensorwise), which is why the generic converter refuses
++// them: GGML_TYPE_I8 has no to_float trait, so nothing can dequantize one.
++// Blocks that cannot use that path and need a float tensor instead - the token
++// embedding, which is a gather rather than a matmul - reach this function with
++// their per-row scales already read from the file. The convrot rotation is undone
++// because the graph expects the true values: the rotation lives in the weights
++// and is meant to be cancelled by the rotation the runtime applies to the
++// activations of a quantized linear, which does not happen for a lookup that then
++// passes through a learned-weight normalization.
++static void dequantize_int8_tensorwise(const int8_t* src,
++                                       const float*  row_scales,
++                                       void*         dst,
++                                       ggml_type     dst_type,
++                                       int64_t       nrows,
++                                       int64_t       ncols,
++                                       int           convrot_group_size) {
++    std::vector<float> row((size_t)ncols);
++    for (int64_t r = 0; r < nrows; ++r) {
++        const int8_t* qrow = src + r * ncols;
++        const float s      = row_scales != nullptr ? row_scales[r] : 1.0f;
++        for (int64_t i = 0; i < ncols; ++i) {
++            row[(size_t)i] = (float)qrow[i] * s;
++        }
++        if (convrot_group_size > 0) {
++            for (int64_t g = 0; g + convrot_group_size <= ncols; g += convrot_group_size) {
++                regular_hadamard_group_f32(row.data() + g, convrot_group_size);
++            }
++        }
++        if (dst_type == GGML_TYPE_F32) {
++            memcpy((float*)dst + r * ncols, row.data(), (size_t)ncols * sizeof(float));
++        } else {
++            ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t*)dst + r * ncols, (int)ncols);
++        }
++    }
++}
++
+ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+                                bool enable_mmap,
+                                const std::set<std::string>* target_tensor_names,
+@@ -1230,15 +1300,81 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+                             failed = true;
+                             return;
+                         }
+-                        std::string processed_name = convert_tensor_name(tensor_storage.name, imatrix_version);
+-                        std::vector<float> imatrix = get_imatrix_collector().get_values(processed_name);
+-                        convert_tensor((void*)target_buf,
+-                                       tensor_storage.type,
+-                                       convert_buf,
+-                                       dst_tensor->type,
+-                                       (int)tensor_storage.nelements() / (int)tensor_storage.ne[0],
+-                                       (int)tensor_storage.ne[0],
+-                                       std::move(imatrix));
++                        const int nrows = (int)tensor_storage.nelements() / (int)tensor_storage.ne[0];
++                        const int ncols = (int)tensor_storage.ne[0];
++
++                        // An int8_tensorwise weight whose destination is a float tensor
++                        // (the token embedding) cannot use in-place int8 consumption and
++                        // has no generic dequantization trait. Read the companion row
++                        // scales from the same source and dequantize here.
++                        //
++                        // The scales come from wherever the weights came from: sd-cli
++                        // reads a plain file, but sd-server mmaps its weights, and a zip
++                        // archive is a third source. Handling only the plain-file case is
++                        // what made a generation abort inside sd-server with "type i8
++                        // unsupported for integer quantization" while sd-cli worked.
++                        bool handled_int8 = false;
++                        if (tensor_storage.is_int8_tensorwise && tensor_storage.type == GGML_TYPE_I8 &&
++                            (dst_tensor->type == GGML_TYPE_F32 || dst_tensor->type == GGML_TYPE_F16)) {
++                            const std::string    scale_name    = tensor_storage.name + "_scale";
++                            const TensorStorage* scale_storage = nullptr;
++                            for (const auto& candidate : fdata.tensors) {
++                                if (candidate.name == scale_name) {
++                                    scale_storage = &candidate;
++                                    break;
++                                }
++                            }
++                            if (scale_storage == nullptr) {
++                                LOG_WARN("int8_tensorwise '%s': no '%s' companion, cannot dequantize",
++                                         tensor_storage.name.c_str(), scale_name.c_str());
++                            } else if (zip != nullptr) {
++                                LOG_ERROR("int8_tensorwise '%s': dequantization from a zip archive is not "
++                                          "implemented; load this model from a file instead",
++                                          tensor_storage.name.c_str());
++                            } else {
++                                const size_t      scale_bytes = scale_storage->nbytes_to_read();
++                                std::vector<char> scale_buf(scale_bytes);
++                                bool              scale_read = false;
++                                if (mmapped) {
++                                    scale_read = mmapped->copy_data(scale_buf.data(),
++                                                                    scale_bytes,
++                                                                    scale_storage->offset);
++                                } else {
++                                    file.clear();
++                                    file.seekg(scale_storage->offset);
++                                    file.read(scale_buf.data(), (std::streamsize)scale_bytes);
++                                    scale_read = ((size_t)file.gcount() == scale_bytes);
++                                }
++                                if (scale_read && scale_storage->nelements() >= (size_t)nrows) {
++                                    dequantize_int8_tensorwise((const int8_t*)target_buf,
++                                                               (const float*)scale_buf.data(),
++                                                               convert_buf,
++                                                               dst_tensor->type,
++                                                               nrows,
++                                                               ncols,
++                                                               tensor_storage.int8_convrot
++                                                                   ? tensor_storage.int8_convrot_group_size
++                                                                   : 0);
++                                    handled_int8 = true;
++                                } else {
++                                    LOG_WARN("int8_tensorwise '%s': row scales unreadable, falling back",
++                                             tensor_storage.name.c_str());
++                                }
++                            }
++                        }
++                        if (handled_int8) {
++                            // dequantized above
++                        } else {
++                            std::string processed_name = convert_tensor_name(tensor_storage.name, imatrix_version);
++                            std::vector<float> imatrix = get_imatrix_collector().get_values(processed_name);
++                            convert_tensor((void*)target_buf,
++                                           tensor_storage.type,
++                                           convert_buf,
++                                           dst_tensor->type,
++                                           nrows,
++                                           ncols,
++                                           std::move(imatrix));
++                        }
+                     } else {
+                         convert_buf = read_buf;
+                     }

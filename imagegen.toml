@@ -1,0 +1,57 @@
+# imagegen bridge configuration.
+#
+# The bridge reads this file from its working directory by default; set
+# IMAGEGEN_CONFIG to use a different path. Every value here can be overridden by
+# the matching environment variable (IMAGEGEN_DIFFUSION, IMAGEGEN_LLM, ...),
+# which is how a test points one value elsewhere without editing this file.
+#
+# Model paths have no built-in default on purpose: a wrong path that silently
+# loads a different model is worse than a refusal to start.
+#
+# Layout follows the upstream model card, one directory per component:
+#   models/diffusion_models/   the GGUF diffusion models
+#   models/text_encoders/      the text encoders
+#   models/vae/                the VAE
+
+# sd-server binary, and the model paths it is given.
+sd_server = "bin/sd-server"
+diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
+vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
+
+# The text encoder. The upstream card recommends the ComfyUI int8 convrot file
+# (8.71 GiB) over the bf16 one (16.33 GiB), and that ordering is true within that
+# pair. Against the GGUF encoder below it is not a memory saving: it reports
+# 10,104.77 MB of parameters against 4,302.33 MB, for the same VRAM peak, a
+# somewhat higher conditioning time, and a tie on image quality.
+#
+# It also needs the patched build from patches/0001 and patches/0002. The patch
+# that dequantizes the int8 token embedding reads the companion row scales from
+# whichever source the weights came from: a plain file (sd-cli) or an mmap
+# (sd-server). Handling only the plain-file case made a generation abort the
+# backend with "type i8 unsupported for integer quantization" while sd-cli worked;
+# both paths are implemented as of 2026-09-22. The zip path is still unimplemented
+# and logs an explicit error rather than throwing.
+llm = "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+
+# Fallback that needs no patched sd.cpp, at 4.3 GB instead of 10.1 GB of params:
+# llm = "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+
+# Where each module's graphs run and where its parameters live. Measured on this
+# workstation: diffusion parameters pinned in VRAM, text encoder entirely on the
+# CPU, VAE parameters in RAM with GPU compute. This holds ~4.4 GiB less host RAM
+# and ~3.4 GiB less of the VRAM peak than sd.cpp's --offload-to-cpu. Pinning the
+# text encoder's parameters as well cannot complete a 1024-square generation on
+# this 12 GB card. See docs/architecture.md.
+backend_args = [
+  "--backend", "te=cpu,diffusion=cuda0,vae=cuda0",
+  "--params-backend", "te=cpu,diffusion=cuda0,vae=cpu",
+]
+
+# Where the bridge listens, and where its sd-server backend listens.
+listen_ip    = "127.0.0.1"
+listen_port  = 8787
+backend_port = 8788
+
+# Request defaults when the client does not send them.
+steps     = 28
+cfg_scale = 6.0

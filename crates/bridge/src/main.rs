@@ -13,9 +13,19 @@
 // Configuration is read from the environment (defaults match this repo's
 // layout and the measured Unit 1 invocation):
 //   IMAGEGEN_SD_SERVER       path to sd-server           (bin/sd-server)
-//   IMAGEGEN_DIFFUSION       path to diffusion model     (models/qwen-image-2.1-Q6_K.gguf)
-//   IMAGEGEN_VAE             path to vae                 (models/qwen_image_2.1_vae_bf16.safetensors)
-//   IMAGEGEN_LLM             path to text encoder        (models/Qwen3VL-8B-Instruct-Q4_K_M.gguf)
+//   IMAGEGEN_DIFFUSION       path to diffusion model     (models/diffusion_models/qwen-image-2.1-Q6_K.gguf)
+//   IMAGEGEN_VAE             path to vae                 (models/vae/qwen_image_2.1_vae_bf16.safetensors)
+//   IMAGEGEN_LLM             path to text encoder        (models/text_encoders/qwen3vl_8b_int8_convrot.safetensors)
+//
+// The default text encoder is the ComfyUI int8 convrot file, matching the
+// configuration the upstream model card recommends. It requires the patched
+// sd-server built from patches/0001 and patches/0002 in this repo: stock
+// sd.cpp aborts on that file. Measured cost against the GGUF encoder it
+// replaces is +5.8 GB of host RAM (10,104.77 MB of parameters against
+// 4,302.33 MB), the same VRAM peak, and a somewhat higher conditioning time,
+// with image quality a measured tie. Set IMAGEGEN_LLM to
+// models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf to go back to the GGUF
+// encoder, which runs on a stock sd-server.
 //   IMAGEGEN_BACKEND_ARGS    sd-server placement flags   (--backend te=cpu,diffusion=cuda0,vae=cuda0
 //                                                         --params-backend te=cpu,diffusion=cuda0,vae=cpu)
 //   IMAGEGEN_LISTEN_IP       bridge listen IP            (127.0.0.1)
@@ -70,64 +80,126 @@ struct Config {
     backend_args: Vec<String>,
 }
 
-fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// What the TOML configuration file may contain.
+///
+/// Model paths are deliberately NOT defaulted in the binary: a wrong path that
+/// silently loads a different model is worse than a refusal to start, so a
+/// missing path is a startup error naming the file and the variable. Explicitly
+/// environment-overridable so a test can point one value elsewhere without
+/// editing the file.
+#[derive(Deserialize, Default)]
+struct FileConfig {
+    sd_server: Option<String>,
+    diffusion: Option<String>,
+    vae: Option<String>,
+    llm: Option<String>,
+    backend_args: Option<Vec<String>>,
+    listen_ip: Option<String>,
+    listen_port: Option<u16>,
+    backend_port: Option<u16>,
+    steps: Option<u32>,
+    cfg_scale: Option<f64>,
 }
 
-/// Whitespace-separated argument list, so one env var can carry a flag pair
-/// such as `--backend te=cpu,diffusion=cuda0` (each token stays one argv entry).
-fn env_args(key: &str, default: &str) -> Vec<String> {
-    env_str(key, default)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
-}
-
-fn env_u16(key: &str, default: u16) -> u16 {
-    std::env::var(key)
+/// Environment wins, then the file, then the built-in fallback.
+fn pick<T: std::str::FromStr>(env_key: &str, file_val: Option<T>, fallback: Option<T>) -> Option<T> {
+    std::env::var(env_key)
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+        .and_then(|v| v.parse::<T>().ok())
+        .or(file_val)
+        .or(fallback)
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Placement flags that were measured on this workstation: diffusion parameters
+/// pinned in VRAM, text encoder graph and parameters on the CPU, VAE parameters
+/// in RAM with GPU compute. See docs/architecture.md.
+fn default_backend_args() -> Vec<String> {
+    [
+        "--backend",
+        "te=cpu,diffusion=cuda0,vae=cuda0",
+        "--params-backend",
+        "te=cpu,diffusion=cuda0,vae=cpu",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Config {
-            sd_server: env_str("IMAGEGEN_SD_SERVER", "bin/sd-server"),
-            diffusion: env_str(
-                "IMAGEGEN_DIFFUSION",
-                "models/qwen-image-2.1-Q6_K.gguf",
-            ),
-            vae: env_str("IMAGEGEN_VAE", "models/qwen_image_2.1_vae_bf16.safetensors"),
-            llm: env_str(
-                "IMAGEGEN_LLM",
-                "models/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
-            ),
-            listen_ip: env_str("IMAGEGEN_LISTEN_IP", "127.0.0.1"),
-            listen_port: env_u16("IMAGEGEN_LISTEN_PORT", 8787),
-            backend_port: env_u16("IMAGEGEN_BACKEND_PORT", 8788),
-            steps: env_u32("IMAGEGEN_STEPS", 28),
-            cfg_scale: env_f64("IMAGEGEN_CFG_SCALE", 6.0),
-            backend_args: env_args(
-                "IMAGEGEN_BACKEND_ARGS",
-                "--backend te=cpu,diffusion=cuda0,vae=cuda0 \
-                 --params-backend te=cpu,diffusion=cuda0,vae=cpu",
-            ),
-        }
+    fn load() -> Self {
+        let path =
+            std::env::var("IMAGEGEN_CONFIG").unwrap_or_else(|_| "imagegen.toml".to_string());
+
+        let file: FileConfig = match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(parsed) => {
+                    info!("configuration loaded from {}", path);
+                    parsed
+                }
+                Err(e) => {
+                    error!("{} is not valid TOML: {}", path, e);
+                    std::process::exit(2);
+                }
+            },
+            Err(_) => {
+                warn!(
+                    "no configuration file at {} (set IMAGEGEN_CONFIG to point elsewhere); \
+                     using the environment only",
+                    path
+                );
+                FileConfig::default()
+            }
+        };
+
+        let required = |file_val: Option<String>, env_key: &str| -> String {
+            if let Ok(v) = std::env::var(env_key) {
+                return v;
+            }
+            match file_val {
+                Some(v) => v,
+                None => {
+                    error!(
+                        "no model path for {}: set it in {} or in the environment",
+                        env_key, path
+                    );
+                    std::process::exit(2);
+                }
+            }
+        };
+
+        let cfg = Config {
+            // Every path, the binary included, comes from the file or the
+            // environment. A wrong path is a startup error, not a panic later.
+            sd_server: required(file.sd_server, "IMAGEGEN_SD_SERVER"),
+            diffusion: required(file.diffusion, "IMAGEGEN_DIFFUSION"),
+            vae: required(file.vae, "IMAGEGEN_VAE"),
+            llm: required(file.llm, "IMAGEGEN_LLM"),
+            listen_ip: pick("IMAGEGEN_LISTEN_IP", file.listen_ip, None)
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            listen_port: pick("IMAGEGEN_LISTEN_PORT", file.listen_port, Some(8787)).unwrap(),
+            backend_port: pick("IMAGEGEN_BACKEND_PORT", file.backend_port, Some(8788)).unwrap(),
+            steps: pick("IMAGEGEN_STEPS", file.steps, Some(28)).unwrap(),
+            cfg_scale: pick("IMAGEGEN_CFG_SCALE", file.cfg_scale, Some(6.0)).unwrap(),
+            backend_args: std::env::var("IMAGEGEN_BACKEND_ARGS")
+                .ok()
+                .map(|s| s.split_whitespace().map(str::to_string).collect())
+                .or(file.backend_args)
+                .unwrap_or_else(default_backend_args),
+        };
+        info!(
+            "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
+             steps={} cfg_scale={} placement={}",
+            cfg.diffusion,
+            cfg.llm,
+            cfg.vae,
+            cfg.listen_ip,
+            cfg.listen_port,
+            cfg.backend_port,
+            cfg.steps,
+            cfg.cfg_scale,
+            cfg.backend_args.join(" ")
+        );
+        cfg
     }
 }
 
@@ -135,7 +207,7 @@ impl Config {
 // Backend process supervision
 // ---------------------------------------------------------------------------
 
-fn spawn_backend(cfg: &Config) -> Child {
+fn spawn_backend(cfg: &Config) -> Result<Child, String> {
     info!(
         "starting sd-server backend on 127.0.0.1:{} ({} / {} / {})",
         cfg.backend_port, cfg.diffusion, cfg.llm, cfg.vae
@@ -157,14 +229,22 @@ fn spawn_backend(cfg: &Config) -> Child {
         .arg(cfg.backend_port.to_string())
         .args(&cfg.backend_args)
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
+        .map_err(|e| format!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
 }
 
 async fn wait_backend_ready(cfg: &Config, client: &reqwest::Client) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/v1/models", cfg.backend_port);
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        match client.get(&url).send().await {
+        // A probe needs its own timeout: without one, a backend that accepts the
+        // connection and then never answers blocks this loop forever and the
+        // deadline below is never reached.
+        match client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => warn!("backend not ready ({}), retrying", r.status()),
             Err(e) => warn!("backend not reachable ({}), retrying", e),
@@ -177,6 +257,150 @@ async fn wait_backend_ready(cfg: &Config, client: &reqwest::Client) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Backend supervision
+// ---------------------------------------------------------------------------
+
+/// Owns the sd-server child so it can be reaped, replaced and killed.
+///
+/// The original code spawned the backend once and never waited on it, so a
+/// backend that died went unnoticed: on 2026-09-22 this bridge served nothing
+/// for 8h51m while its sd-server child sat as a zombie and /v1/models kept
+/// answering from a static list. The child is owned here instead, and a
+/// supervisor task replaces it when it dies.
+struct BackendHandle {
+    child: std::sync::Mutex<Option<Child>>,
+    /// Successful replacements: the backend died and a new one became ready.
+    restarts: std::sync::atomic::AtomicU64,
+    /// Spawns attempted after a death, including ones that never became ready.
+    /// Counted separately so a backend that dies and fails to come back cannot
+    /// look like a healthy number of restarts.
+    restart_attempts: std::sync::atomic::AtomicU64,
+}
+
+impl BackendHandle {
+    fn new(child: Child) -> Self {
+        Self {
+            child: std::sync::Mutex::new(Some(child)),
+            restarts: std::sync::atomic::AtomicU64::new(0),
+            restart_attempts: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reap the child if it has exited, returning its status once. Taking the
+    /// status out of try_wait is what reaps it, so no zombie is left behind.
+    fn reap_if_dead(&self) -> Option<std::process::ExitStatus> {
+        let mut guard = self.child.lock().unwrap();
+        let status = match guard.as_mut() {
+            Some(c) => match c.try_wait() {
+                Ok(Some(status)) => Some(status),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("sd-server status check failed: {}", e);
+                    None
+                }
+            },
+            None => None,
+        };
+        if status.is_some() {
+            *guard = None;
+        }
+        status
+    }
+
+    fn is_alive(&self) -> bool {
+        match self.child.lock().unwrap().as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
+    fn replace(&self, child: Child) {
+        *self.child.lock().unwrap() = Some(child);
+        self.restart_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Called only once a replaced backend has answered the readiness probe.
+    fn mark_ready(&self) {
+        self.restarts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn restarts(&self) -> u64 {
+        self.restarts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn restart_attempts(&self) -> u64 {
+        self.restart_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Kill and reap, so shutdown leaves no zombie either.
+    fn kill(&self) {
+        if let Some(mut c) = self.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Keep the backend up. Polls the child, and on death respawns it with
+/// exponential backoff, waiting for it to answer before calling it ready.
+async fn supervise_backend(
+    cfg: Config,
+    client: reqwest::Client,
+    handle: std::sync::Arc<BackendHandle>,
+    shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        if let Some(status) = handle.reap_if_dead() {
+            warn!("sd-server backend exited ({})", status);
+        }
+        if handle.is_alive() {
+            backoff = Duration::from_secs(1);
+            continue;
+        }
+
+        warn!("sd-server backend is down; restarting in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+        if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match spawn_backend(&cfg) {
+            Ok(child) => handle.replace(child),
+            Err(e) => {
+                // A backend that cannot even be started will not be fixed by
+                // waiting, but the bridge stays up so /health can report it.
+                error!("{}", e);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        }
+        match wait_backend_ready(&cfg, &client).await {
+            Ok(()) => {
+                handle.mark_ready();
+                info!(
+                    "sd-server backend restarted and ready (restart number {})",
+                    handle.restarts()
+                );
+                backoff = Duration::from_secs(1);
+            }
+            Err(e) => {
+                warn!("restarted backend did not become ready: {}", e);
+                handle.kill();
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared application state
 // ---------------------------------------------------------------------------
 
@@ -184,6 +408,7 @@ struct AppState {
     client: reqwest::Client,
     cfg: Config,
     backend_base: String,
+    backend: std::sync::Arc<BackendHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +444,24 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
             size
         ));
     }
+    check_edge_limit(w, h)?;
     Ok((w, h))
+}
+
+/// The largest edge this card is documented to cover at this precision. A hard
+/// ceiling keeps one caller from asking for a size that cannot fit and failing
+/// the generation or aborting the backend; a clear rejection is better than
+/// either. Applied to the final size from both request paths.
+const MAX_EDGE: u32 = 1536;
+
+fn check_edge_limit(w: u32, h: u32) -> Result<(), String> {
+    if w > MAX_EDGE || h > MAX_EDGE {
+        return Err(format!(
+            "size {}x{} exceeds the supported maximum of {}x{} on this 12 GB GPU",
+            w, h, MAX_EDGE, MAX_EDGE
+        ));
+    }
+    Ok(())
 }
 
 /// Resolution tier -> long-edge pixels. open-grok sends "1k" by default.
@@ -235,10 +477,10 @@ fn resolution_base(resolution: &str) -> u32 {
 }
 
 /// Map an aspect ratio string ("16:9", "1:1", "3:2", ...) and a resolution
-/// tier to a WIDTHxHEIGHT that is divisible by 32 and stays within the long
-/// edge given by the resolution. Falls back to a square at the resolution
-/// base when the ratio cannot be parsed. This honors open-grok's
-/// aspect_ratio + resolution fields (it does not send a `size`).
+/// tier to a WIDTHxHEIGHT that is divisible by 32. The result is NOT bounded by
+/// the resolution tier: a tier whose long edge exceeds what this card can run
+/// produces dimensions that check_edge_limit then rejects with a clear error,
+/// rather than a silently clamped image.
 fn dims_from_aspect(aspect_ratio: &str, resolution: &str) -> (u32, u32) {
     let long = resolution_base(resolution);
     let snap32 = |v: u32| -> u32 { ((v + 15) / 32).max(1) * 32 };
@@ -277,11 +519,18 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
     let backend_ok = st
         .client
         .get(&url)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
-    Json(serde_json::json!({ "status": "ok", "backend": backend_ok }))
+    Json(serde_json::json!({
+        "status": "ok",
+        "backend": backend_ok,
+        "backend_process_alive": st.backend.is_alive(),
+        "backend_restarts": st.backend.restarts(),
+        "backend_restart_attempts": st.backend.restart_attempts()
+    }))
 }
 
 async fn create_generation(
@@ -309,6 +558,12 @@ async fn create_generation(
             dims_from_aspect(ar, res)
         }
     };
+    // The ceiling has to be applied to the final size, not inside parse_size:
+    // the aspect_ratio + resolution path is the one open-grok actually uses, and
+    // it would otherwise forward 2048x2048 for "2k" straight past the limit.
+    if let Err(msg) = check_edge_limit(width, height) {
+        return err(StatusCode::BAD_REQUEST, &msg);
+    }
 
     let n = req.n.unwrap_or(1);
     if n != 1 {
@@ -429,22 +684,70 @@ async fn main() {
         )
         .init();
 
-    let cfg = Config::from_env();
-    let mut backend = spawn_backend(&cfg);
+    let cfg = Config::load();
+    let backend = match spawn_backend(&cfg) {
+        Ok(child) => child,
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(2);
+        }
+    };
 
     let client = reqwest::Client::new();
-    if let Err(e) = wait_backend_ready(&cfg, &client).await {
-        error!("{}", e);
-        let _ = backend.kill();
-        std::process::exit(1);
-    }
-    info!("sd-server backend ready");
+
+    let backend = std::sync::Arc::new(BackendHandle::new(backend));
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Bind and serve BEFORE waiting for the backend. A startup that waits first
+    // cannot answer /health while it waits, which is exactly when an operator
+    // needs it: a backend that spawns but never answers left the bridge
+    // unreachable for 180 seconds and then gone. /health now reports
+    // backend false during that window instead.
+    let addr = format!("{}:{}", cfg.listen_ip, cfg.listen_port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("failed to bind bridge on {}: {}", addr, e);
+            backend.kill();
+            std::process::exit(1);
+        }
+    };
 
     let state = std::sync::Arc::new(AppState {
-        client,
+        client: client.clone(),
         cfg: cfg.clone(),
         backend_base: format!("http://127.0.0.1:{}", cfg.backend_port),
+        backend: backend.clone(),
     });
+
+    // Keep the backend up for the lifetime of the bridge. The supervisor owns
+    // every restart, the first start included: it reaps a child that dies and
+    // respawns it, and the readiness wait below is a report, not a gate.
+    tokio::spawn(supervise_backend(
+        cfg.clone(),
+        client.clone(),
+        backend.clone(),
+        shutting_down.clone(),
+    ));
+
+    // Report the first readiness without blocking the listener. A backend that
+    // never becomes ready is visible in /health as backend false, and a process
+    // that is alive but not answering HTTP is NOT auto-restarted yet; that is a
+    // known limitation, recorded in docs/architecture.md.
+    {
+        let cfg = cfg.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            match wait_backend_ready(&cfg, &client).await {
+                Ok(()) => info!("sd-server backend ready"),
+                Err(e) => warn!(
+                    "sd-server backend did not answer within the startup window ({}); \
+                     the bridge is serving and /health reports backend false",
+                    e
+                ),
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/v1/models", get(get_models))
@@ -452,22 +755,14 @@ async fn main() {
         .route("/health", get(health))
         .with_state(state);
 
-    let addr = format!("{}:{}", cfg.listen_ip, cfg.listen_port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("failed to bind bridge on {}: {}", addr, e);
-            let _ = backend.kill();
-            std::process::exit(1);
-        }
-    };
     info!("imagegen bridge listening on http://{}", addr);
 
     // Shut sd-server down when the bridge is terminated.
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received, stopping sd-server");
-        let _ = backend.kill();
+        shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+        backend.kill();
         std::process::exit(0);
     });
 

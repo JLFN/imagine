@@ -1,0 +1,53 @@
+The LLM text-encoder config inference in sd.cpp keys off tensor NAME substrings.
+This patch makes it ignore the quantized companions that also match, so a
+ComfyUI int8/w4a8 safetensors text encoder (whose weights carry a
+<module>.weight_scale tensor) can be loaded at all.
+
+Symptom without the patch (sd-cli, Qwen3VL-8B-Instruct int8 convrot encoder as
+--llm):
+
+  [VERBOSE] llm.hpp:370 - llm: num_layers = 36, vocab_size = 1, hidden_size = 151936, intermediate_size = 12288
+  ggml_block.hpp:173: GGML_ASSERT(scale_nelements == 1 || scale_nelements == out_features) failed
+  Aborted (core dumped), exit 134, no image
+
+Mechanism: src/model/te/llm.hpp scans the tensor map with
+  if (contains(name, "embed_tokens.weight")) { hidden_size = ne[0]; vocab_size = ne[1]; }
+The ComfyUI file holds both
+  model.embed_tokens.weight        (I8, torch [151936, 4096])
+  model.embed_tokens.weight_scale  (F32, torch [151936, 1])
+and "model.embed_tokens.weight_scale" contains the substring
+"embed_tokens.weight" too. In the sorted tensor map the scale entry comes after
+the weight, so it overwrites the correct dimensions. The safetensors reader
+normalizes a [N, 1] scale to a 1-D tensor (ne[0] = N, ne[1] = 1), which yields
+exactly hidden_size = 151936 and vocab_size = 1 from the log above; every
+downstream Linear is then built with the wrong geometry and the GGML_ASSERT in
+ggml_block.hpp:173 fires.
+
+The fix excludes the scale companion. It cannot regress the GGUF encoder: GGUF
+quantized weights are self-contained and have no weight_scale tensor, so the
+guard never triggers on that path.
+
+Applies to upstream master 6dcb5bb (leejet/stable-diffusion.cpp), in-tree
+source at /data/build-sd/stable-diffusion.cpp.
+
+--- a/src/model/te/llm.hpp
++++ b/src/model/te/llm.hpp
+@@ -332,7 +332,8 @@
+                 pos = name.find("layers.");
+                 if (pos != std::string::npos) {
+                     auto items = split_string(name.substr(pos), '.');
+                     if (items.size() > 1) {
+                         int block_index = atoi(items[1].c_str());
+                         if (block_index + 1 > config.num_layers) {
+                             config.num_layers = block_index + 1;
+                         }
+                     }
+                 }
+-                if (contains(name, "embed_tokens.weight")) {
++                // Skip the quantized companions: <module>.weight_scale also
++                // contains "<module>.weight" and would overwrite the geometry.
++                if (contains(name, "embed_tokens.weight") &&
++                    !contains(name, "weight_scale")) {
+                     config.hidden_size = tensor_storage.ne[0];
+                     config.vocab_size  = tensor_storage.ne[1];
+                 }
