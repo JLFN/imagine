@@ -11,22 +11,33 @@ session_id: 01a0c775-65e6-7e73-8df2-6220db99459f
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
 --- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
+4e8f1a0 feat(bridge): pin Q6_K diffusion in VRAM and run the text encoder on CPU
 9169fed feat(bridge): on-demand OpenAI image API bridge over sd-server
 347ed52 docs(handoff): mark Unit 1 complete and plan Unit 2 (Rust bridge)
 6b17eee feat(recipe): first real Qwen-Image-2.1 image on the workstation
 --- progress diff stat:
-.gitignore                |    4 +-
- Cargo.lock                | 1146 +++++++++++++++++++++++++++++++++++++++++++++
- Cargo.toml                |    7 +
- crates/bridge/Cargo.toml  |   15 +
- crates/bridge/README.md   |   64 +++
- crates/bridge/src/main.rs |  443 ++++++++++++++++++
- docs/architecture.md      |   62 ++-
- imagegen-handoff.md       |  162 +++++++
- models/MANIFEST.md        |   94 ++++
- 9 files changed, 1988 insertions(+), 9 deletions(-)
---- staleness (last_updated_commit 341bc8d4bb3a4c7bb61c28806e51ac77002e73a8e .. HEAD):
-  (clean: handoff is current)
+.gitignore                                         |   13 +-
+ Cargo.lock                                         | 1228 ++++++++++++++++++++
+ Cargo.toml                                         |    7 +
+ crates/bridge/Cargo.toml                           |   16 +
+ crates/bridge/README.md                            |   87 ++
+ crates/bridge/src/main.rs                          |  777 +++++++++++++
+ docs/architecture.md                               |  173 ++-
+ docs/convrot-encoder-experiment.md                 |  234 ++++
+ imagegen-handoff.md                                |  229 ++++
+ imagegen.toml                                      |   57 +
+ models/MANIFEST.md                                 |  115 ++
+ ...01-sd-cpp-llm-te-config-skip-weight-scale.patch |   53 +
+ ...-cpp-dequantize-int8-tensorwise-embedding.patch |  172 +++
+ qa-evidence/qa-gen-1024-28steps-seed42.png         |  Bin 0 -> 2463614 bytes
+ qa-evidence/qa-gen-512-seed11.png                  |  Bin 0 -> 286535 bytes
+ qa-evidence/qa-gen-512-seed3.png                   |  Bin 0 -> 280816 bytes
+ qa-evidence/qa-report.md                           |  218 ++++
+ tools/convrot-te-experiment.sh                     |   72 ++
+ tools/verify-convrot-dequant.py                    |  105 ++
+ 19 files changed, 3542 insertions(+), 14 deletions(-)
+--- staleness (last_updated_commit 92c7e02 .. HEAD):
+a3c2a97 docs(handoff): record Unit 6, its QA rounds and the Unit 7 plan
 --- end handoff probe ---
 
 
