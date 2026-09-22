@@ -130,10 +130,27 @@ VRAM peak, a somewhat higher conditioning time, and a tie on image quality.
 The bridge supervises its backend. It reaps the child, and if the process dies it
 restarts it with exponential backoff and waits for it to answer before calling it
 ready. /health reports backend (an HTTP probe of the backend), backend_process_alive
-(the child's state) and backend_restarts (how many times it has been replaced).
-Before this, the child was spawned once and never waited on: on 2026-09-22 the
-bridge ran 8h51m with a zombie sd-server, a dead backend port and every image
-request failing silently.
+(the child's state), backend_restarts (healthy replacements) and
+backend_restart_attempts (spawns attempted after a death). Before this, the child
+was spawned once and never waited on: on 2026-09-22 the bridge ran 8h51m with a
+zombie sd-server, a dead backend port and every image request failing silently.
+
+The listener binds before the first readiness wait, so /health answers during a
+startup where the backend never becomes ready, reporting backend false rather
+than leaving the bridge unreachable. Two limits are worth knowing:
+
+- Supervision keys on process liveness. A backend that stays ALIVE but never
+  answers HTTP is visible in /health as backend false but is not auto-restarted.
+  Restarting on a failed probe is future work.
+- Readiness is an HTTP probe, so it passes as soon as sd-server binds its port,
+  which happens before weights are loaded. The first request after a restart
+  therefore pays the full model staging cost.
+
+Requests are bounded: width and height must be divisible by 32 and at most 1536
+on either edge, checked on the final size from BOTH request paths (an explicit
+size, and open-grok's aspect_ratio plus resolution). A larger request receives
+HTTP 400 naming the limit, because it cannot fit this card and would otherwise
+fail the generation or abort the backend.
 
 ## Quality and open-grok on-demand (Unit 2 findings)
 
