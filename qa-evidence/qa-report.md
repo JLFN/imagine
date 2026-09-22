@@ -1,218 +1,246 @@
-QA report for the imagegen bridge, Unit 6 (config file, backend supervision,
-upstream model layout, int8 convrot encoder as the shipped default) and its
-QA-driven fixes.
+QA report for imagegen Unit 7: the 1344-square resolution-headroom measurement,
+the true tiled-versus-untiled VAE decode comparison at 1024 square, the rule 14
+port of the convrot verifier from Python to Rust, and the bridge request ceiling
+that the headroom measurement made necessary.
 
 qa-model: deepseek-flash (the primary agent, by operator request)
-Date: 2026-09-22. Revision tested: fb054be plus the uncommitted startup
-restructure and architecture-doc notes in the working tree.
+Date: 2026-09-22. Revision tested: the working tree on
+feature/unit7-resolution-and-port, on top of dev e7c478f, with the bridge
+running the newly built bin/imagegen-bridge (5,311,720 bytes).
 
 INDEPENDENCE DISCLOSURE, read this first
 This pass was performed by the same agent that wrote the code, at the operator's
-request, replacing a separate QA model. That makes it self-verification and
-strictly weaker than the two independent passes that preceded it (qa-model
-qwen38-flash-next-ds4, recorded in this file's history). To compensate, every
-check below was run live against the deployed service or a throwaway instance,
-evidence is quoted verbatim, and the list of things NOT verified is explicit.
-The three defects those independent passes found are the reason this revision
-exists at all; a self-pass should not be read as having equal weight.
+request, so it is self-verification and strictly weaker than an independent QA
+model's pass. To compensate, every check below was run live - against the
+deployed bridge, against a throwaway bridge instance on separate ports, or
+against the actual measurement logs - and the evidence is quoted verbatim. The
+list of things NOT verified is explicit at the end. Two defects were found and
+fixed during this pass (section 5); a self-pass that found nothing should be read
+with suspicion.
 
 Surfaces covered, each with the command and what was observed.
 
-CONFIG imagegen.toml (the file is the binding source of truth)
-  command: P=$(pgrep -x sd-server | head -1); tr '\0' ' ' < /proc/$P/cmdline
-  observed: bin/sd-server --diffusion-model
-    models/diffusion_models/qwen-image-2.1-Q6_K.gguf --vae
-    models/vae/qwen_image_2.1_vae_bf16.safetensors --llm
-    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors --listen-ip
-    127.0.0.1 --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cuda0
-    --params-backend te=cpu,diffusion=cuda0,vae=cpu
-  Every value is the imagegen.toml value; the bridge process carries no
-  IMAGEGEN variables in its environ, so nothing came from the environment.
-
-CONFIG IMAGEGEN_CONFIG and the missing-path refusal
-  command: env -i IMAGEGEN_CONFIG=/tmp/qa-mine/absent.toml ./bin/imagegen-bridge
-  observed: exit=2, "no model path for IMAGEGEN_SD_SERVER: set it in
-  /tmp/qa-mine/absent.toml or in the environment"
-  Same command with only sd_server present advances to the next missing key, so
-  the check names one missing path at a time rather than failing anonymously.
-  COSMETIC FINDING, recorded rather than fixed: the message says "no model path"
-  for IMAGEGEN_SD_SERVER, which is the sd-server binary rather than a model. The
-  behaviour is correct (it refuses and exits 2); only the wording is imprecise. It
-  is left as found because changing it after this verification would invalidate the
-  evidence above for a string that no logic depends on.
-
-CONFIG malformed TOML
-  command: printf 'this is not toml = = =\n' > bad.toml; env -i
-    IMAGEGEN_CONFIG=bad.toml ./bin/imagegen-bridge
-  observed: exit=2, parser message "expected `.`, `=`"
-
-CONFIG per-key precedence, environment over file
-  command: a throwaway with a config whose values are deliberately fake
-    (sd_server /tmp/qa-mine/stub.sh, diffusion FROM-FILE-A.gguf, vae
-    FROM-FILE-B.safetensors, llm FROM-FILE-C.safetensors, backend_args
-    ["--backend","FILE-PLACEMENT"], listen_port 8797, backend_port 8798), started
-    with IMAGEGEN_CONFIG set and IMAGEGEN_DIFFUSION=FROM-ENV.gguf,
-    IMAGEGEN_LISTEN_PORT=8795, IMAGEGEN_BACKEND_PORT=8796
-  observed, from the stub's own recorded argv:
-    --diffusion-model FROM-ENV.gguf --vae FROM-FILE-B.safetensors --llm
-    FROM-FILE-C.safetensors --listen-ip 127.0.0.1 --listen-port 8796 --backend
-    FILE-PLACEMENT
-  So the three overridden keys took the environment and the others kept the file.
-
-CONFIG backend_args reach the backend
-  observed: the production argv above ends with the two placement flag pairs, and
-  the same pair appears verbatim in the stub argv, so placement is file-driven and
-  env-overridable rather than compiled in.
-
-BEHAVIOR startup observability (the defect the independent pass found)
-  command: IMAGEGEN_SD_SERVER=/bin/true IMAGEGEN_LISTEN_PORT=8797
-    IMAGEGEN_BACKEND_PORT=8798 (a backend that spawns and exits instantly)
-  observed: port 8797 bound (ss -tln), and GET /health answered DURING the
-    failure: {"backend":false,"backend_process_alive":false,
-    "backend_restart_attempts":1,"backend_restarts":0,"status":"ok"}
-  The listener binds before the readiness wait, so the bridge is observable while
-  the backend is broken instead of being unreachable for 180 s and then gone.
-
-BEHAVIOR readiness and /health probe timeouts are bounded
-  command: a stub that accepts the TCP connection and never answers, bridge on
-    8799/8800; time curl -s -m 40 http://127.0.0.1:8799/health
-  observed: answer in real 0m10.007s:
-    {"backend":false,"backend_process_alive":true,"backend_restart_attempts":0,
-     "backend_restarts":0,"status":"ok"}
-  Bounded at the 10 s probe timeout. Note for monitoring clients: /health can take
-  up to about 10 s when the backend is wedged.
-
-BEHAVIOR a wedged-but-alive backend is not auto-restarted (documented limitation)
-  observed: over 20 s with that wedged stub, log lines matching
-    "restarting|exited" = 0, and health still reported
-    backend_process_alive true with both counters 0. The limitation stated in
-    docs/architecture.md is accurate as written.
-
-BEHAVIOR backend supervision on production
-  command: kill -9 on the sd-server child, then poll /health
-  observed: before {"...backend_restart_attempts":0,"backend_restarts":0...};
-    t+3s attempts 1, restarts 0; t+7s attempts 1, restarts 1; log:
-      WARN sd-server backend exited (signal: 9 (SIGKILL))
-      WARN sd-server backend is down; restarting in 1s
-      INFO sd-server backend restarted and ready (restart number 1)
-  The two counters separate a spawn attempt from a confirmed healthy replacement,
-  which is the fix for the finding that attempts alone looked healthy.
-
-BEHAVIOR no zombie and no duplicate child
-  command: ps -o pid,stat,cmd --ppid $(pgrep -x imagegen-bridge | head -1)
-  observed: exactly one child, state Sl, with the expected convrot argv.
-
-ENDPOINT GET /health
-  observed: HTTP 200, {"backend":true,"backend_process_alive":true,
-  "backend_restart_attempts":0,"backend_restarts":0,"status":"ok"}
-
-ENDPOINT GET /v1/models
-  observed: HTTP 200, {"data":[{"id":"Qwen-Image-2.1","object":"model",
-  "owned_by":"local"}]}
-
-ENDPOINT POST /v1/images/generations (full-quality artifact, production settings)
-  command: 1024x1024, 28 steps, seed 42, prompt "a lovely cat holding a sign says
-    qwen2.1.cpp", through the production bridge with the int8 convrot encoder
-  observed: http_code=200 total_time=140.023654s; a real PNG 1024x1024 RGBA,
-    2,463,614 bytes, saved as qa-evidence/qa-gen-1024-28steps-seed42.png.
-    Structure check: mean RGB [156.7 143.9 122.8], per-channel std
-    [51.9 54.9 61.2], so it is a rendered image and not a blank frame. /health
-    after the request: backend true, both counters 1.
-  Reproducibility, same pass: this file is byte-identical to the image produced by
-    the earlier deployment proof at the same seed and prompt
-    (sha256 cc9d0fd6a682eee8f01028cc906055860370d2d3240656fbc053b120d7a8a078 for
-    both qa-evidence/qa-gen-1024-28steps-seed42.png and out/proof-convrot-1024.png).
-    Two separate bridge processes, same bytes out, which is the strongest
-    end-to-end signal in this report.
-
-ENDPOINT the small fast frames are evidence too
-  qa-evidence/qa-gen-512-seed11.png (mine, 512x512, 4 steps, 286,535 bytes) and
-  qa-evidence/qa-gen-512-seed3.png (from the independent pass, 512x512, 4 steps,
-  280,816 bytes). Both are genuine PNGs, kept as the cheap high-frequency checks
-  beside the 1024-square artifact above.
-
-
-ENDPOINT POST /v1/images/generations (real generation after the respawn)
-  command: 512x512, 4 steps, seed 11, on the production bridge
-  observed: http=200 time=29.909068s, a real PNG 512x512 RGBA, 286,535 bytes,
-  saved as qa-evidence/qa-gen-512-seed11.png. The same body was also run earlier
-  in the deployment proof at 1024x1024, 28 steps: HTTP 200, PNG, 158.56 s, inside
-  open-grok's 240 s read timeout.
-
-ENDPOINT POST error paths (all on production, backend untouched)
-  observed, seven malformed requests, each HTTP 400 with an
-  OpenAI-shaped error object of type invalid_request_error:
-    n=2                      "n must be 1 (multi-image batches are not supported)"
-    100x100                  "size '100x100' is not supported: width and height must be divisible by 32"
-    2048x2048                "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
-    aspect 1:1 + 2k          "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
-    whitespace prompt        "prompt is required"
-    {}                       "invalid request body: missing field `prompt`"
-    not json                 "invalid request body: expected ident at line 1 column 2"
-  /health before and after the seven rejects is byte-identical with both counters
-  at 0, so none of them reached or disturbed the backend.
-
-ENDPOINT size boundary, both request paths (throwaway, no models)
+BINARY convrot-verify (the Python-to-Rust port required by rule 14)
+  command: bash /data/build/linux/build.sh -p /data/imagegen -b convrot-verify;
+           bin/convrot-verify
   observed:
-    1536x1536 via size        forwarded (HTTP 502 from the fake stub, not 400)
-    1504x1504 via size        forwarded
-    1568x1568 via size        HTTP 400, "size 1568x1568 exceeds ... 1536x1536"
-    aspect 3:2 + 1080p        HTTP 400, "size 2048x1376 exceeds ... 1536x1536"
-    aspect 1:1 + 1k           forwarded
-  The ceiling applies to the final size from the aspect path as well, which is the
-  fix for the bypass the independent pass found.
+    int8 tensors: 1258  bf16 tensors: 750
 
-MODEL files (this pass, sha256 recomputed)
+    model.layers.0.self_attn.q_proj.weight
+      shape [4096, 4096] scales 4096 rows checked 8
+      pearson=0.999963 rel_l2=0.0086 max_abs=0.0006
+      (control, rotation NOT undone: rel_l2=1.3734)
+
+    model.embed_tokens.weight
+      shape [151936, 4096] scales 151936 rows checked 4
+      pearson=0.999961 rel_l2=0.0089 max_abs=0.0010
+      (control, rotation NOT undone: rel_l2=1.3746)
+
+    verdict: PASS (pearson >= 0.99, rel_l2 <= 0.02 on every tensor checked)
+    exit=0
+  The baseline this is compared against is the Python script's own output, run in
+  this session BEFORE the script was deleted, on the same file and the same two
+  modules:
+    q_proj        pearson=0.999963 rel_l2=0.0086 max_abs=0.0006  control 1.3734
+    embed_tokens  pearson=0.999961 rel_l2=0.0089 max_abs=0.0010  control 1.3746
+  Every printed digit matches. The port reproduces the Python baseline exactly.
+
+BINARY convrot-verify, negative path (the verdict must fail a wrong file)
+  command: bin/convrot-verify /tmp/fake-weights.safetensors
+    (a 639,731,670-byte synthetic safetensors with the same header shape as the
+    real encoder but random I8 weights and random F32 scales)
   observed:
-    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
-      8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
-    models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
-      67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
-    models/vae/qwen_image_2.1_vae_bf16.safetensors
-      bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
-    models/diffusion_models/qwen-image-2.1-Q6_K.gguf
-      a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
-  All four match their models/MANIFEST.md entries, including the convrot encoder
-  entry added in response to the first independent pass's finding.
+    q_proj        pearson=0.001856 rel_l2=318.6653 max_abs=26.6902
+    embed_tokens  pearson=0.012937 rel_l2=119.1506 max_abs=22.6287
+    verdict: FAIL (a tensor disagreed with its BF16 ground truth)
+    exit=1
+  The measurement therefore discriminates: 0.999963 against 0.001856.
+  Additional error paths, both exit 1 with a clear message and no partial
+  verdict:
+    bin/convrot-verify /tmp/does-not-exist.safetensors
+      -> error: open /tmp/does-not-exist.safetensors: No such file or directory
+         (os error 2)
+    bin/convrot-verify /tmp/fake-weights.safetensors   (first, malformed
+      generator run, whose declared tensor sizes exceeded the data written)
+      -> error: read model.embed_tokens.weight_scale from
+         /tmp/fake-weights.safetensors: failed to fill whole buffer
 
-MODEL layout matches the upstream card
-  observed: models/diffusion_models/, models/text_encoders/, models/vae/ exist and
-  hold the files above; every path in imagegen.toml resolves.
+Rule 14 - no Python left in the repository
+  commands: git ls-files | grep -E '\.py$'          -> (no output)
+            find . -name '*.py' -not -path './target/*' -not -path './.git/*'
+                                                     -> (no output)
+  observed: the only tracked Python file, tools/verify-convrot-dequant.py, is
+  removed in this revision (git rm) and its replacement is the Rust binary above.
+  docs/convrot-encoder-experiment.md now points at bin/convrot-verify.
 
-Not verified in this pass, with the reason
+CONFIG KEY max_edge (imagegen.toml; the bridge's new request ceiling)
+  Unit tests, command: cargo test -p imagegen-bridge
+  observed: 5 passed; 0 failed - ceiling_allows_the_measured_working_size,
+  ceiling_rejects_the_size_the_layout_cannot_serve,
+  ceiling_is_symmetric_and_configurable, size_parsing_rejects_non_multiples_of_32,
+  aspect_path_stays_inside_the_ceiling.
 
-1. The 1024x1024, 28-step timing with the convrot encoder was measured earlier
-   today in the deployment proof (158.56 s) but not re-run here; a re-run costs a
-   full model staging and would have contended with the checks above.
-2. A true untiled-versus-tiled VAE decode comparison at 1024 square. At 768
-   square both sides tile, so the isolation the earlier attempt intended did not
-   happen; the recorded result is only that the decode is insensitive to tile
-   count (0.15 of 255 mean difference).
-3. 1344-square headroom under the pinned layout. Never measured; expected to be
-   too tight, and the bridge now rejects anything above 1536 with a clear 400.
-4. That the stock sd-server aborts on the convrot file. Proving it needs a second
-   9.3 GB model load, which would contend with production for the card. The .stock
-   binaries exist and are unverified in this pass.
-5. Exponential backoff growth beyond the first step: each failed cycle costs the
-   full 180 s startup window, so a multi-step check is expensive.
-6. The zip path for int8_tensorwise dequantization, which is unimplemented and
-   logs an error. Exercising it needs a zip-packaged model that does not exist
-   here.
-7. Direct evidence that the mmap dequantization branch engages. There is no
-   positive log line for it; the evidence is indirect - the backend loads the
-   convrot encoder and reports text_encoders 10104.77 MB in RAM, and a generation
-   succeeds, which the plain-file-only version failed to do.
+  Live, the deployed instance was restarted on the newly built binary and the
+  effective configuration logged:
+    effective configuration: diffusion=models/diffusion_models/qwen-image-2.1-Q6_K.gguf
+      llm=models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
+      vae=models/vae/qwen_image_2.1_vae_bf16.safetensors listen=127.0.0.1:8787
+      backend_port=8788 steps=28 cfg_scale=6 max_edge=1152
+      placement=--backend te=cpu,diffusion=cuda0,vae=cuda0
+      --params-backend te=cpu,diffusion=cuda0,vae=cpu
 
-Open items recorded, not defects of this revision
-- tools/verify-convrot-dequant.py is Python inside the repository and rule 14
-  requires zero Python in the deliverable: port to Rust or remove before delivery.
-- The int8 convrot encoder costs about 5.8 GB more host RAM than the GGUF encoder
-  for the same VRAM peak, with image quality a measured tie. It is the shipped
-  default by operator decision, not because the measurement favours it.
-- The 1536 ceiling rejects open-grok's "2k" and "4k" tiers with a clear 400. The
-  default "1k" path is unaffected.
-- A backend that stays alive but never answers is not auto-restarted; it is
-  visible in /health as backend false.
-- The two sd.cpp patches have not been sent upstream.
+  ENDPOINT POST /v1/images/generations, rejection path
+  command: curl -X POST http://127.0.0.1:8787/v1/images/generations -d
+           '{"prompt":"x","size":"1344x1344"}'
+  observed: http_code=400, total_time=0.00029s, message:
+    "size 1344x1344 exceeds the maximum 1152x1152 supported by the configured
+     layout (diffusion parameters pinned in VRAM): at larger sizes the sampling
+     graph cannot be allocated on this 12 GB GPU and the request fails during
+     weight preparation. Raise max_edge in the configuration only together with a
+     layout that can serve it; for a one-off large image run sd-cli directly with
+     --offload-to-cpu. See docs/architecture.md."
+  The rejection is 0.3 ms: it happens before any backend work. Before this
+  revision the same request was accepted and failed inside the backend after
+  about 35 s with an opaque error.
+
+  ENDPOINT POST /v1/images/generations, the aspect path
+  command: curl -X POST ... -d '{"prompt":"x","aspect_ratio":"1:1","resolution":"2k"}'
+  observed: http_code=400 with the same message for size 2048x2048. Both request
+  paths are bounded, which was a defect fixed in Unit 6 and is still enforced.
+
+  ENDPOINT POST /v1/images/generations, acceptance at the ceiling
+  command: curl -X POST ... -d '{"prompt":"a lovely cat holding a sign says
+           qwen2.1.cpp","size":"1152x1152","num_inference_steps":8,"seed":5}'
+  observed: http_code=200 total_time=72.48s; out/unit7-verify-1152.png PNG
+  (1152, 1152) RGBA 2,297,223 bytes; bridge log "generating 1 image(s) at
+  1152x1152 steps=8 cfg=6 seed=5" then "generated 1 image(s) in
+  72.478421964s". 1152 square is accepted AND served end to end.
+
+  ENDPOINT POST /v1/images/generations, regression at the documented tier
+  command: curl -X POST ... -d '{...,"size":"1024x1024","num_inference_steps":8,
+           "seed":7}'
+  observed: http_code=200 total_time=45.47s; out/unit7-verify-1024.png PNG
+  (1024, 1024) RGBA 2,098,199 bytes; /health still
+  {"backend":true,"backend_process_alive":true,"backend_restarts":0,"status":"ok"}.
+  The common open-grok path is unaffected by the ceiling change.
+
+  The ceiling is CONFIGURATION-DRIVEN, proved against a throwaway instance
+  command: IMAGEGEN_MAX_EDGE=2000 IMAGEGEN_LISTEN_PORT=8899
+           IMAGEGEN_BACKEND_PORT=8898 IMAGEGEN_SD_SERVER=/bin/true
+           setsid ./bin/imagegen-bridge
+  observed: its config line reads "listen=127.0.0.1:8899 max_edge=2000";
+    size 1344x1344 -> http_code=502 ("backend unreachable", the /bin/true stub)
+      i.e. NOT rejected by the ceiling, so the value really comes from config;
+    size 2048x2048 -> http_code=400 naming "the maximum 2000x2000";
+    the deployed bridge was untouched and still healthy afterwards
+      ({"backend":true,...,"status":"ok"}, exactly one imagegen-bridge process).
+  No second real sd-server was started, so the running deployment never
+  contended for the card.
+
+The measurement claims in docs/architecture.md (Phase 1 and Phase 2)
+  Every figure in the new "Resolution headroom and the VAE decode" section was
+  traced back to the raw sd-cli log it came from:
+    269.29 s, 275.88 s, 10,060 MiB   -> /data/build-sd/te-split/unit7/pinned-1152-gguf.log
+    470.59 s, 502.54 s, 11,276 MiB   -> .../offload-1344-convrot.log
+    622.61 MB against 622.44 MB      -> .../res1344-convrot.log AND res1344-gguf.log
+                                        (both encoders, identical demand)
+    793.24 MB against 654.50 MB      -> .../pinned-1344-maxvram.log
+    11,280 / 10,756 / 11,068 MiB     -> the three vram-*.log peak sorts
+    decode 2.09 s / 4.04 s           -> tiling-1024-untiled.log / tiling-1024-tiled.log
+    11,558 / 8,692 MiB               -> the tiling pair's vram logs
+    0.2847 of 255, max 25, 44.81 pct, 0.03 pct, seam bands 0.64-0.75
+                                     -> computed from the two PNGs in this pass
+  The failure is recorded as a failure: 1344 square does NOT fit under the pinned
+  layout, for both text encoders, and the doc no longer says "unverified".
+  The isolation claim for Phase 2 was checked in the logs rather than assumed:
+  tiling-1024-untiled.log contains no "retrying with spatial tiling" line and no
+  tile count (a genuinely untiled decode), while tiling-1024-tiled.log contains
+  "num tiles : 3, 3" and "processing 9 tiles". That is what the earlier
+  768-square attempt lacked.
+
+Rule 19 mount and the project test suite
+  command: bash tests/run.sh   (cargo test --workspace, then tests/qa-gate.sh)
+  observed before the report existed: the gate short-circuited with "QA GATE: ALL
+  PASS (HEAD is at dev; nothing new to QA)" because the work was not yet
+  committed; after the first commit it must extract the new surfaces and demand a
+  fresh report naming each of them (BINARY convrot-verify, CONFIG KEY max_edge),
+  with the report's last non-empty line being the operative verdict. That
+  behaviour is the reason this file exists in this shape.
+  tests/run.sh is new in this revision and is the project's single test entry
+  point; before it there was no test suite at all, so rule 19's blocking gate had
+  nowhere to mount.
+
+Rule 10 dependency scan (before any push)
+  command: osv__osv_map_dependencies path=/data/imagegen
+  observed: {"manifests_scanned":1,"packages_scanned":155,"vulnerable_packages":0,
+  "findings":[]} at 2026-09-22T09:24:43Z against osv.dev. 155 packages is up from
+  the previous scan's 115, because the port adds ureq, rustls, ring and their
+  transitive dependencies.
+
+Rule 5 canonical build
+  command: bash /data/build/linux/build.sh -p /data/imagegen -b convrot-verify
+           bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
+  observed: both binaries land in bin/ (convrot-verify 3,318,616 bytes;
+  imagegen-bridge 5,311,720 bytes, up from 5,303,304). One operational finding,
+  recorded because it cost a build: the builder cannot copy over a RUNNING
+  binary - "cp: cannot create regular file '/data/imagegen/bin/imagegen-bridge':
+  Text file busy" - and it deletes target/ afterwards, so the freshly built
+  binary is discarded. The bridge must be stopped before rebuilding it.
+
+Defects found and fixed during this pass
+  1. The bridge advertised a 1536 maximum while the deployed pinned layout cannot
+     serve anything above 1152. A 1344-square request was accepted and then failed
+     in the backend. Fixed: the ceiling is now max_edge in imagegen.toml (default
+     1152, the measured value) and the rejection names the reason. This is the
+     same defect class as the silently dead backend fixed in Unit 6: a limit that
+     the service cannot honour.
+  2. docs/architecture.md quoted three host-RSS figures in decimal GB while
+     labelling them GiB (6.7, 10.2, 5.4 where the logs say 6.40, 9.71, 5.11 GiB).
+     Found by tracing every figure back to its log, fixed, and worth noting
+     because this repository has been bitten by exactly this unit confusion
+     before (the Q4_K_M 4.6 GB / GiB note in the same file).
+  3. The doc claimed a "12-step schedule fails identically" in a way that
+     conflated the step count with the separate --max-vram probe. Reworded to the
+     accurate statement: the failure happens during weight preparation before any
+     step runs, so step count is irrelevant by construction.
+  4. The new tests/qa-gate.sh over-extracted surfaces on its first real run: its
+     first version treated every workspace member appearing in a changed
+     `members` array as a new binary, so adding the second crate also demanded QA
+     evidence for the pre-existing bridge binary. Found by running the gate for
+     real against the committed unit rather than trusting it, fixed to surface
+     only members whose Cargo.toml did not exist at the base ref. After the fix
+     the gate extracts exactly BINARY convrot-verify and CONFIG KEY max_edge, both
+     covered above, and exits 0.
+
+NOT verified in this pass, stated plainly
+  - 1536 square was never measured. The ceiling now rejects it, and the pinned
+    layout cannot serve it, but the offload layout's behaviour at 1536 is unknown.
+  - The exact pinned ceiling between 1152 (works) and 1344 (fails) was not
+    bisected; 1152 is the largest VERIFIED tier, not necessarily the true maximum.
+  - The corrected RSS figures come from /usr/bin/time -v; they were re-read from
+    the logs, not re-measured.
+  - The verdict threshold cannot catch a systematic weight error below about 1
+    percent, which is the tool's stated resolution, not a defect.
+  - bin/convrot-verify needs network access to huggingface.co for the BF16 ground
+    truth. Its offline behaviour was not exercised; the file-missing and
+    short-read paths were, and both exit 1 with a clear message.
+  - Image QUALITY at 1344 square was not compared against 1024 square; only fit,
+    time and memory were measured.
+  - The tiling comparison used the GGUF encoder and the --offload-to-cpu layout.
+    The encoder does not affect the decode path, but that is reasoning, not a
+    measurement, so it is stated rather than claimed as verified.
+  - Measurements ran with the bridge stopped (required: it pins 5.6 GB of VRAM),
+    so behaviour under concurrent load was not exercised.
+
+Evidence artifacts committed with this report
+  - qa-evidence/qa-gen-1152-8steps-seed5.png: the 1152-square image the deployed
+    bridge returned (PNG 1152x1152 RGBA, 2,297,223 bytes), i.e. the new ceiling's
+    acceptance proven by its own output.
+  - qa-evidence/qa-tiling-1024-untiled-vs-tiled.png: the Phase 2 comparison, the
+    untiled decode on the left and the forced-tiled decode on the right, same
+    seed, from which the pixel differences above were computed.
+  The raw sd-cli logs behind every measurement figure stay outside the repository
+  at /data/build-sd/te-split/unit7/ (this repository gitignores *.log), and the
+  measurement harness is /data/build-sd/te-split/measure-unit7.sh.
 
 verdict: overall PASS

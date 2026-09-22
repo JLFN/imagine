@@ -1,7 +1,9 @@
 # Workspace root for the imagegen Rust deliverables.
-# The bridge (crates/bridge) is a thin OpenAI image API server that
-# supervises stable-diffusion.cpp's sd-server backend.
+# crates/bridge is a thin OpenAI image API server that supervises
+# stable-diffusion.cpp's sd-server backend.
+# crates/convrot-verify checks the int8 convrot text encoder's dequantization
+# against the upstream BF16 weights (the experiment's verifier, ported to Rust).
 
 [workspace]
 resolver = "2"
-members = ["crates/bridge"]
+members = ["crates/bridge", "crates/convrot-verify"]

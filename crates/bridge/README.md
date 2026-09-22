@@ -28,9 +28,14 @@ adds:
 - `POST /v1/images/generations` — OpenAI shape, returns
   `{"created":...,"data":[{"b64_json":"..."}]}`
 - `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>}`
-- Request limits: width and height must be divisible by 32 and at most 1536 on
-  either edge. Larger sizes are rejected with HTTP 400 rather than forwarded,
-  because they cannot fit this card and would abort the backend.
+- Request limits: width and height must be divisible by 32, and no edge may
+  exceed `max_edge` (default 1152, the measured ceiling of the pinned layout).
+  Larger sizes are rejected with HTTP 400 naming the ceiling and the reason
+  rather than forwarded, because the pinned layout cannot allocate its sampling
+  graph above 1152 square and the request would otherwise fail inside the backend
+  after about 35 s. 1344 square runs only under `--offload-to-cpu`, which cannot
+  coexist with the warm pinned backend, so it stays a direct sd-cli job. See
+  docs/architecture.md.
 ## Configuration (environment, with repo-defaults shown)
 
 | Variable | Default |
@@ -44,6 +49,8 @@ adds:
 | `IMAGEGEN_BACKEND_PORT` | `8788` (internal sd-server listener) |
 | `IMAGEGEN_STEPS` | `28` |
 | `IMAGEGEN_CFG_SCALE` | `6.0` |
+| `IMAGEGEN_MAX_EDGE` | `1152` (measured ceiling of the pinned layout) |
+| `IMAGEGEN_BACKEND_ARGS` | the pinned placement, see imagegen.toml |
 
 Run it from the repository root so the default model/sd-server paths resolve.
 The `IMAGEGEN_DIFFUSION` default is `models/diffusion_models/qwen-image-2.1-Q6_K.gguf`;

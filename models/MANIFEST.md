@@ -105,9 +105,14 @@ SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
   peak VRAM 9,426 MiB, with the VAE decode falling back to spatial tiling at
   that resolution. The earlier --offload-to-cpu figures (about 11.5 s/it at
   1344x1344 with weights RAM-resident, peak 11.1 GB) still apply to that
-  arrangement; resolution up to ~1344 (or ~1536 on one axis) is UNVERIFIED
-  under the pinned default. Q8_0 also exists on disk but is reserved for when
-  the VRAM/RAM budget allows; it is not the default.
+  arrangement. Resolution under the pinned default is now MEASURED (2026-09-22,
+  docs/architecture.md): 1152 square works (sampling 269.29 s for 40 steps,
+  peak VRAM 10,060 MiB), and 1344 square does not fit at all - the sampling
+  graph fails during weight preparation, short by about 0.2 MB, for both text
+  encoders and with an explicit --max-vram budget. 1344 square runs only under
+  --offload-to-cpu (502.54 s, 16.1 GiB host RSS). The bridge therefore rejects
+  any edge above 1152 with a clear 400. Q8_0 also exists on disk but is reserved
+  for when the VRAM/RAM budget allows; it is not the default.
 
 Note: an initial curl for the diffusion model hit a flaky HTTP/2 stream
 (exit 92) and left a truncated 4,240,669,189-byte file, which FAILED the

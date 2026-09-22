@@ -78,6 +78,7 @@ struct Config {
     steps: u32,
     cfg_scale: f64,
     backend_args: Vec<String>,
+    max_edge: u32,
 }
 
 /// What the TOML configuration file may contain.
@@ -99,6 +100,7 @@ struct FileConfig {
     backend_port: Option<u16>,
     steps: Option<u32>,
     cfg_scale: Option<f64>,
+    max_edge: Option<u32>,
 }
 
 /// Environment wins, then the file, then the built-in fallback.
@@ -185,10 +187,11 @@ impl Config {
                 .map(|s| s.split_whitespace().map(str::to_string).collect())
                 .or(file.backend_args)
                 .unwrap_or_else(default_backend_args),
+            max_edge: pick("IMAGEGEN_MAX_EDGE", file.max_edge, Some(DEFAULT_MAX_EDGE)).unwrap(),
         };
         info!(
             "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
-             steps={} cfg_scale={} placement={}",
+             steps={} cfg_scale={} max_edge={} placement={}",
             cfg.diffusion,
             cfg.llm,
             cfg.vae,
@@ -197,6 +200,7 @@ impl Config {
             cfg.backend_port,
             cfg.steps,
             cfg.cfg_scale,
+            cfg.max_edge,
             cfg.backend_args.join(" ")
         );
         cfg
@@ -444,21 +448,35 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
             size
         ));
     }
-    check_edge_limit(w, h)?;
     Ok((w, h))
 }
 
-/// The largest edge this card is documented to cover at this precision. A hard
-/// ceiling keeps one caller from asking for a size that cannot fit and failing
-/// the generation or aborting the backend; a clear rejection is better than
-/// either. Applied to the final size from both request paths.
-const MAX_EDGE: u32 = 1536;
+/// The largest edge the default layout can actually serve, measured on this
+/// workstation rather than assumed. The deployed placement pins the Q6_K
+/// diffusion model in VRAM (5.6 GB of the 12 GB card), which leaves room for
+/// 1152 square (peak 10,060 MiB, sampling 269 s for 40 steps) but not for 1344:
+/// at 1344 square the sampling graph fails during weight preparation, short by
+/// about 0.2 MB of a 6,658 MB budget, for both text encoders and with an
+/// explicit --max-vram budget. 1344 square does run under --offload-to-cpu
+/// (502 s, 16.1 GB host RAM), which is what a direct sd-cli run should use.
+///
+/// A ceiling keeps one caller from asking for a size that cannot fit and
+/// failing the generation or aborting the backend; a clear rejection is better
+/// than either. It is configurable because it is a property of the layout in
+/// backend_args, not of the card: raise it together with a layout that can
+/// serve the larger size. See docs/architecture.md.
+const DEFAULT_MAX_EDGE: u32 = 1152;
 
-fn check_edge_limit(w: u32, h: u32) -> Result<(), String> {
-    if w > MAX_EDGE || h > MAX_EDGE {
+fn check_edge_limit(w: u32, h: u32, max_edge: u32) -> Result<(), String> {
+    if w > max_edge || h > max_edge {
         return Err(format!(
-            "size {}x{} exceeds the supported maximum of {}x{} on this 12 GB GPU",
-            w, h, MAX_EDGE, MAX_EDGE
+            "size {}x{} exceeds the maximum {}x{} supported by the configured layout \
+             (diffusion parameters pinned in VRAM): at larger sizes the sampling graph \
+             cannot be allocated on this 12 GB GPU and the request fails during weight \
+             preparation. Raise max_edge in the configuration only together with a layout \
+             that can serve it; for a one-off large image run sd-cli directly with \
+             --offload-to-cpu. See docs/architecture.md.",
+            w, h, max_edge, max_edge
         ));
     }
     Ok(())
@@ -561,7 +579,7 @@ async fn create_generation(
     // The ceiling has to be applied to the final size, not inside parse_size:
     // the aspect_ratio + resolution path is the one open-grok actually uses, and
     // it would otherwise forward 2048x2048 for "2k" straight past the limit.
-    if let Err(msg) = check_edge_limit(width, height) {
+    if let Err(msg) = check_edge_limit(width, height, st.cfg.max_edge) {
         return err(StatusCode::BAD_REQUEST, &msg);
     }
 
@@ -774,4 +792,68 @@ async fn main() {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// The request-size rules are the part of the bridge that a live generation
+// cannot cheaply re-check at every boundary (each one costs minutes of GPU
+// time), so they are pinned here instead.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceiling_allows_the_measured_working_size() {
+        assert!(check_edge_limit(1024, 1024, DEFAULT_MAX_EDGE).is_ok());
+        assert!(check_edge_limit(1152, 1152, DEFAULT_MAX_EDGE).is_ok());
+        assert!(check_edge_limit(1152, 1024, DEFAULT_MAX_EDGE).is_ok());
+    }
+
+    #[test]
+    fn ceiling_rejects_the_size_the_layout_cannot_serve() {
+        // Measured: 1344 square fails during sampling weight preparation under
+        // the pinned layout, for both text encoders.
+        let e = check_edge_limit(1344, 1344, DEFAULT_MAX_EDGE).unwrap_err();
+        assert!(e.contains("1344x1344"), "message must name the size: {e}");
+        assert!(e.contains("1152"), "message must name the ceiling: {e}");
+        assert!(e.contains("--offload-to-cpu"), "message must name the way out: {e}");
+    }
+
+    #[test]
+    fn ceiling_is_symmetric_and_configurable() {
+        // Either edge over the limit is rejected, not just the width.
+        assert!(check_edge_limit(1152, 1344, DEFAULT_MAX_EDGE).is_err());
+        assert!(check_edge_limit(1344, 1152, DEFAULT_MAX_EDGE).is_err());
+        // A layout that can serve more may raise it (config-driven, not compiled in).
+        assert!(check_edge_limit(1536, 1536, 1536).is_ok());
+        assert!(check_edge_limit(1536, 1536, DEFAULT_MAX_EDGE).is_err());
+    }
+
+    #[test]
+    fn size_parsing_rejects_non_multiples_of_32() {
+        assert_eq!(parse_size("1024x1024").unwrap(), (1024, 1024));
+        assert_eq!(parse_size("1152x896").unwrap(), (1152, 896));
+        for bad in ["1000x1024", "1024x1000", "0x1024", "abc", "1024", "1024x"] {
+            assert!(parse_size(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn aspect_path_stays_inside_the_ceiling() {
+        // 1:1 at the 1k tier is the common open-grok request.
+        let (w, h) = dims_from_aspect("1:1", "1k");
+        assert_eq!((w, h), (1024, 1024));
+        assert!(check_edge_limit(w, h, DEFAULT_MAX_EDGE).is_ok());
+        // A 2k tier produces 2048, which the ceiling rejects rather than silently clamping.
+        let (w2, h2) = dims_from_aspect("1:1", "2k");
+        assert_eq!((w2, h2), (2048, 2048));
+        assert!(check_edge_limit(w2, h2, DEFAULT_MAX_EDGE).is_err());
+        // Wide aspect ratios are larger on the long edge and still bounded.
+        let (w3, h3) = dims_from_aspect("16:9", "1k");
+        assert!(check_edge_limit(w3, h3, DEFAULT_MAX_EDGE).is_ok());
+    }
 }

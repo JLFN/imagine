@@ -55,3 +55,14 @@ backend_port = 8788
 # Request defaults when the client does not send them.
 steps     = 28
 cfg_scale = 6.0
+
+# The largest edge a request may ask for. This is a property of the layout in
+# backend_args, not of the card. Measured 2026-09-22 under the pinned default:
+# 1152 square works (peak 10,060 MiB, sampling 269 s for 40 steps); 1344 square
+# fails during sampling weight preparation, short by about 0.2 MB of a 6,658 MB
+# budget, for BOTH text encoders and also with an explicit --max-vram budget.
+# 1344 square does run under --offload-to-cpu (502 s, 16.1 GB host RAM), which is
+# a direct sd-cli job rather than a bridge request: the pinned backend holds
+# 5.6 GB of VRAM, and the offload layout needs the whole card, so the two cannot
+# run at once. Raise max_edge only together with a layout that can serve it.
+max_edge = 1152
