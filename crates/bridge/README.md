@@ -27,16 +27,18 @@ adds:
 - `GET /v1/models` — `{"data":[{"id":"Qwen-Image-2.1",...}]}`
 - `POST /v1/images/generations` — OpenAI shape, returns
   `{"created":...,"data":[{"b64_json":"..."}]}`
-- `GET /health` — `{"status":"ok","backend":<bool>}`
-
+- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>}`
+- Request limits: width and height must be divisible by 32 and at most 1536 on
+  either edge. Larger sizes are rejected with HTTP 400 rather than forwarded,
+  because they cannot fit this card and would abort the backend.
 ## Configuration (environment, with repo-defaults shown)
 
 | Variable | Default |
 | --- | --- |
 | `IMAGEGEN_SD_SERVER` | `bin/sd-server` |
-| `IMAGEGEN_DIFFUSION` | `models/qwen-image-2.1-Q4_K_M.gguf` |
-| `IMAGEGEN_VAE` | `models/qwen_image_2.1_vae_bf16.safetensors` |
-| `IMAGEGEN_LLM` | `models/Qwen3VL-8B-Instruct-Q4_K_M.gguf` |
+| `IMAGEGEN_DIFFUSION` | `models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf` |
+| `IMAGEGEN_VAE` | `models/vae/qwen_image_2.1_vae_bf16.safetensors` |
+| `IMAGEGEN_LLM` | `models/text_encoders/qwen3vl_8b_int8_convrot.safetensors` |
 | `IMAGEGEN_LISTEN_IP` | `127.0.0.1` |
 | `IMAGEGEN_LISTEN_PORT` | `8787` |
 | `IMAGEGEN_BACKEND_PORT` | `8788` (internal sd-server listener) |
@@ -44,9 +46,30 @@ adds:
 | `IMAGEGEN_CFG_SCALE` | `6.0` |
 
 Run it from the repository root so the default model/sd-server paths resolve.
-The `IMAGEGEN_DIFFUSION` default is `models/qwen-image-2.1-Q4_K_M.gguf`; set
-it to `models/qwen-image-2.1-Q6_K.gguf` for the higher-fidelity option used
-in the proof below.
+The `IMAGEGEN_DIFFUSION` default is `models/diffusion_models/qwen-image-2.1-Q6_K.gguf`;
+`models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf` is the smaller, lower-precision
+alternative recommended by the upstream model card.
+
+Model files follow the upstream card's layout, one directory per component:
+
+    models/diffusion_models/   the GGUF diffusion models
+    models/text_encoders/      the int8 convrot safetensors encoder (default) and the
+                               Q4_K_M GGUF encoder, which needs no patched sd.cpp
+    models/vae/                qwen_image_2.1_vae_bf16.safetensors
+
+The default text encoder is the ComfyUI int8 convrot file. It needs the patched
+sd-server from patches/0001 and patches/0002 in this repository: stock sd.cpp
+aborts on that file, because its config inference misreads the geometry and its
+token-embedding loader cannot dequantize int8 weights. Against the GGUF encoder
+it replaces, the measured cost is about 5.8 GB more host RAM (10,104.77 MB of
+parameters against 4,302.33 MB) for the same VRAM peak, a somewhat higher
+conditioning time, and a tie on image quality. Set `IMAGEGEN_LLM` to
+`models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf` to use the GGUF encoder
+with a stock sd-server.
+
+The bridge reaps and restarts its sd-server backend if it dies. `backend_restarts`
+in `/health` counts those restarts, so a restarted backend is visible rather than
+silent.
 
 ## Measured behavior (2026-09-21, RTX 4070 SUPER)
 

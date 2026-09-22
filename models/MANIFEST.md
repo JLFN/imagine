@@ -7,7 +7,7 @@ source repo; always recompute and compare, never trust the sizes alone.
 
 ## 1. Diffusion model (the image generator)
 
-- File:         models/qwen-image-2.1-Q4_K_M.gguf
+- File:         models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
 - Size:         4.6 GiB
 - Source:       https://huggingface.co/abenzerps/Qwen-Image-2.1-GGUF
                 (same bytes also at KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF)
@@ -17,7 +17,7 @@ source repo; always recompute and compare, never trust the sizes alone.
 
 ## 2. Text encoder (fixed architectural component)
 
-- File:         models/Qwen3VL-8B-Instruct-Q4_K_M.gguf
+- File:         models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
 - Size:         5.03 GB
 - Source:       https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF
 - Checksums:    repo page
@@ -28,7 +28,7 @@ source repo; always recompute and compare, never trust the sizes alone.
 
 ## 3. VAE (decoder)
 
-- File:         models/qwen_image_2.1_vae_bf16.safetensors
+- File:         models/vae/qwen_image_2.1_vae_bf16.safetensors
 - Size:         0.64 GiB
 - Source:       https://huggingface.co/Comfy-Org/Qwen-Image-2.1 (vae/)
                 also hosted in the abenzerps/KasugaiSakura repos
@@ -49,39 +49,52 @@ Preferred tool: the hf CLI (huggingface_hub, resumable). Example per file:
 curl fallback (identical bytes):
 
   mkdir -p models out
-  curl -L -o models/qwen-image-2.1-Q4_K_M.gguf \
+  curl -L -o models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf \
     https://huggingface.co/abenzerps/Qwen-Image-2.1-GGUF/resolve/main/qwen-image-2.1-Q4_K_M.gguf
-  curl -L -o models/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
+  curl -L -o models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
     https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q4_K_M.gguf
-  curl -L -o models/qwen_image_2.1_vae_bf16.safetensors \
+  curl -L -o models/vae/qwen_image_2.1_vae_bf16.safetensors \
     https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors
 
 ## Total
 
-About 10.3 GiB on disk. Runtime: diffusion model in VRAM (fits 12 GB),
-encoder in system RAM (~5 GB), VAE small.
+About 10.3 GiB for the Q6_K stack, or 15.9 GiB if the int8 convrot encoder is used
+instead of the GGUF one. Runtime: diffusion model pinned in VRAM (fits 12 GB),
+encoder in system RAM (4.3 GB as GGUF, 10.1 GB as int8 convrot), VAE small.
 
 ## Verified downloads (2026-09-21, this workstation)
 
 Downloaded with the curl commands above and verified against the published
 SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
 
-- models/qwen-image-2.1-Q4_K_M.gguf
+- models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
   size    4604557984
   sha256  833439e91bc1152d28f37aa198c7f6f4218b7de95754c2f7a318a2422ab4b2f8
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
-- models/Qwen3VL-8B-Instruct-Q4_K_M.gguf
+- models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
   size    5027784800
   sha256  67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
   (source: Qwen/Qwen3-VL-8B-Instruct-GGUF HF LFS oid)
-- models/qwen_image_2.1_vae_bf16.safetensors
+- models/vae/qwen_image_2.1_vae_bf16.safetensors
   size    675509688
   sha256  bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
-- models/qwen-image-2.1-Q6_K.gguf   (higher-quality diffusion option)
+- models/diffusion_models/qwen-image-2.1-Q6_K.gguf   (higher-quality diffusion option)
   size    5876556448
   sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
+- models/text_encoders/qwen3vl_8b_int8_convrot.safetensors   (deployed default TE)
+  size    9350798360
+  sha256  8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
+  (source: Comfy-Org/Qwen-Image-2.1 text_encoders/ HF LFS oid; the same bytes are
+  published as KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF
+  text_encoders/qwen3vl_8b_int8_convrot.safetensors, verified against both)
+  REQUIRES the patched sd-server built from patches/0001 and patches/0002: stock
+  sd.cpp misreads this file's geometry at load and then cannot dequantize its
+  int8 token embedding. See docs/convrot-encoder-experiment.md. Reports
+  10,104.77 MB of parameters at load against the GGUF encoder's 4,302.33 MB, so it
+  costs about 5.8 GB more host RAM for the same VRAM peak; the GGUF encoder above
+  remains the lighter option and needs no patches.
   The Q6_K diffusion model (~28% larger than Q4_K_M) is the practical
   higher-fidelity default on the 12 GB GPU and is the deployed default in
   the bridge. Its parameters are pinned in VRAM (not RAM-staged): updated
