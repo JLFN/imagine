@@ -1,7 +1,7 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 1e51bcd
+last_updated_commit: 92c7e02
 branch: dev
 remote: none
 handoff_written_at_context_usage: 59% (estimated: chat_history bytes / 4; this session had no signals.json)
@@ -70,73 +70,91 @@ stable-diffusion.cpp entirely. Verified against this repo's reference at
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before
 changing anything that affects the model stack.
 
-2. Current state (2026-09-22 — Units 1-5 complete; QA passed on Unit 5)
+2. Current state (2026-09-22 — Unit 6 complete on its branch, not yet merged)
 
-- Unit 5 (4e8f1a0, merged c3b8b26): the bridge starts sd-server with an explicit
-  placement instead of --offload-to-cpu — diffusion parameters pinned in VRAM,
-  encoder executing on CPU with parameters in RAM, VAE parameters in RAM with GPU
-  compute — and defaults to Q6_K; override with IMAGEGEN_BACKEND_ARGS. Measured
-  table and caveats in docs/architecture.md (Parameter placement).
-- RUNNING: bridge pid 2124252 on 127.0.0.1:8787, sd-server 2124282; start with
-  cd /data/imagegen && ./bin/imagegen-bridge. /health reports backend true; a
-  1024x1024/28-step request returned a PNG in 143.6 s (open-grok limit 240 s).
-  config.toml wiring unchanged.
-- Known cost: with the DiT pinned the VAE decode OOMs at 1024 square and tiles
-  (4.4-4.7 s against 2.1 s); 1344 square is unverified under this layout.
-- The recommended int8 convrot encoder (models/text_encoders/
-  qwen3vl_8b_int8_convrot.safetensors) CANNOT load as --llm: the loader misreads
-  its geometry and aborts on a GGML_ASSERT. Only the GGUF encoder runs.
-- Verified: QA PASS (qwen38-flash-next-ds4, 21 surfaces, evidence at 1fbe512),
-  osv clean (115 packages, 0 vulnerabilities), graphify-rs graph rebuilt.
+- Unit 6 (e0e9030 on feat/supervision-and-layout): the bridge is configured from
+  imagegen.toml — no model path is compiled in, and a missing path is a startup
+  error (exit 2); it supervises its sd-server backend, reaping it and restarting
+  it with backoff, and /health reports backend_process_alive and
+  backend_restarts; the model files follow the upstream card's layout
+  (models/diffusion_models/, models/text_encoders/, models/vae/); and the
+  deployed text encoder is the int8 convrot file, which needs the patched
+  sd-server now installed as bin/sd-server (rollback: bin/sd-server.stock,
+  bin/sd-cli.stock).
+- Proven live: 1024x1024/28 steps with the convrot encoder returned a PNG in
+  158.6 s (open-grok read limit 240 s); kill -9 on the sd-server child produced a
+  restart with backend_restarts 0 to 1, and the next request returned a PNG in
+  26.9 s.
+- patches/0002 now reads the int8 embedding's row scales through mmap as well as
+  a plain file. sd-server mmaps its weights and sd-cli does not, so the first
+  version worked under sd-cli and aborted the server with "type i8 unsupported
+  for integer quantization" on a real request. A CLI run is not proof that a
+  deployed service works.
+- Known costs, unchanged by the decision: the convrot encoder is about 5.8 GB
+  more host RAM than the GGUF encoder for the same VRAM peak, image quality a
+  measured tie, conditioning somewhat slower; the VAE decode still tiles at 1024
+  square (+2.5 to 3 s); 1344 square is unverified.
+- Open: rule 14 requires tools/verify-convrot-dequant.py (Python) to be ported to
+  Rust or removed before delivery.
+- Unit 6 is QA-gated: qa-evidence/qa-report.md, verdict overall PASS, from three
+  independent-capable passes (the first two by qwen38-flash-next-ds4, the third
+  self-verified by the primary agent deepseek-flash at operator request). The
+  gates found five defects, all fixed: the manifest lacked the shipped encoder,
+  a bad sd_server path panicked with exit 101, the size ceiling was bypassable
+  through the aspect path, the restart counter counted attempts rather than
+  healthy replacements, and a startup that waited for the backend before binding
+  made /health unreachable exactly when it was needed. The evidence includes a
+  production-quality 1024-square artifact that is byte-identical to the earlier
+  deployment proof at the same seed.
 
-3. Next unit plan — Unit 6: resolution headroom, backend supervision, delivery
+3. Next unit plan — Unit 7: resolution headroom, delivery, and the Python port
 
-Status: Units 1-5 are complete and verified (section 2); the QA gate passed and
-the osv scan is clean. Three items are open, in priority order. dev is the
-working branch; every code phase below needs a feature/ branch off dev (rule
-23), and every measurement needs the bridge STOPPED first, because the bridge
-holds 5.6 GB of Q6_K weights pinned in VRAM and a second sd-cli run at 1024
-square or above will fight it for the card.
+Status: Unit 6 is complete on its branch (section 2). This unit is small and
+mostly verification. Measurements need the bridge STOPPED first, because it pins
+5.6 GB of weights in VRAM and a second run at 1024 square or above fights it for
+the card; code phases need a feature branch off dev (rule 23).
 
-- Phase 1, resolution headroom (code, feature branch). The pinned layout was
-  measured only at 512 and 1024 square; the Q6_K quality tier the project used
-  before is 1344 square and is now unverified. Measure it:
+- Phase 1, resolution headroom (measurement). 1344 square is the quality tier the
+  project used before the pinned layout, and it is unverified under it:
     cd /data/imagegen && kill -INT <bridge pid> && \
-    ./bin/sd-cli --diffusion-model models/qwen-image-2.1-Q6_K.gguf \
-      --vae models/qwen_image_2.1_vae_bf16.safetensors \
-      --llm models/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
+    ./bin/sd-cli --diffusion-model models/diffusion_models/qwen-image-2.1-Q6_K.gguf \
+      --vae models/vae/qwen_image_2.1_vae_bf16.safetensors \
+      --llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
       -p "<prompt>" --cfg-scale 6.0 --sampling-method euler -v \
       --backend te=cpu,diffusion=cuda0,vae=cuda0 \
       --params-backend te=cpu,diffusion=cuda0,vae=cpu \
       -W 1344 -H 1344 --steps 40 --seed 42 -o out/res1344.png
-  then restart the bridge. If it OOMs, choose between a --max-vram budget,
-  keeping --offload-to-cpu for sizes above 1024, or documenting the cap.
-  Acceptance: a measured 1344-square number recorded in docs/architecture.md
-  (Parameter placement), with the mitigation if it fails.
+  then restart the bridge. Acceptance: a measured number in docs/architecture.md
+  (Parameter placement), with the mitigation if it fails (a --max-vram budget, or
+  --offload-to-cpu above 1024).
 
-- Phase 2, backend supervision (code, feature branch; the user has not asked
-  for this yet, so confirm before spending the unit). The bridge spawns
-  sd-server once, never waits on it and never respawns it: observed
-  2026-09-22 after 8h51m of uptime with a zombie sd-server child, port 8788
-  dead, /health reporting backend false, so every image request failed until
-  the bridge was restarted by hand. Reproduce by killing the sd-server child
-  and watching the bridge keep answering /v1/models. Fix by reaping the child
-  and respawning a backend that died, or by failing loudly.
-  Acceptance: killing the backend produces a respawn or a clear error,
-  verified live, with the QA gate re-run.
+- Phase 2, the true tiling comparison (measurement). The 768-square run showed
+  the decode is insensitive to tile count (0.15 of 255 mean difference), but both
+  sides tiled there. Compare 1024 square with --vae-tiling forced against an
+  untiled decode of the same seed, which needs the DiT not pinned for the untiled
+  side. Acceptance: a recorded mean and max pixel difference, or an explicit
+  statement that it cannot be isolated on this card.
 
-- Phase 3, delivery state and the remote decision (carried over from the old
-  Unit 4 plan, still open). No remote exists. If the user wants one: pick host
-  and visibility first, run
+- Phase 3, rule 14 (code, feature branch). Port tools/verify-convrot-dequant.py to
+  Rust — ranged HTTP fetch of the BF16 ground truth, safetensors header parse, the
+  same dequantize plus rotation-undo, and the correlation check — or remove it and
+  inline the method in docs/convrot-encoder-experiment.md. Acceptance: no Python
+  source left in the repository.
+
+- Phase 4, delivery and the remote decision (still open). No remote exists. If one
+  is wanted: pick host and visibility, run
     gh repo view OWNER/REPO --json isPrivate,visibility   (rule 6)
   before any push, re-run the osv scan (rule 10; last clean 2026-09-22, 115
-  packages), then git remote add origin <url> and push dev. main stays behind
-  a reviewed PR (rule 23). If the user declines a remote, record the decision
-  here: the repo is deliverable on dev alone.
+  packages), then push dev; main stays behind a reviewed PR (rule 23). If the user
+  declines, record that and the repo is deliverable on dev alone.
 
-- Phase 4, wrap. Fold this unit's outcome into section 2, replace section 3
-  wholesale with the next plan, refresh the memory entry
-  (imagegen-e61a3c5c), and close with the trailer "Unit: 6 complete".
+- Phase 5, upstream the patches. Patch 0001 fixes a genuine sd.cpp defect: any
+  safetensors text encoder carrying a weight_scale tensor gets its geometry
+  misread. Patch 0002 is the int8 embedding dequantization. Both are on their own
+  branch today and would need re-applying on every upstream update otherwise.
+
+- Phase 6, wrap. Fold this unit into section 2, replace section 3, refresh the
+  memory entry (imagegen-e61a3c5c), and close with "Unit: 7 complete".
 
 4. Project facts a fresh session cannot re-derive
 
