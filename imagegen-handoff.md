@@ -1,7 +1,7 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 1fbe512555466f2e70a89341309276c8ff330ee1
+last_updated_commit: 1e51bcd
 branch: dev
 remote: none
 handoff_written_at_context_usage: 59% (estimated: chat_history bytes / 4; this session had no signals.json)
@@ -152,6 +152,13 @@ square or above will fight it for the card.
   semantics. The layout measurement logs and scripts are under
   /data/build-sd/te-split (prod/ has the 1024 runs A/B/C, q6/ the pinned Q6_K
   run, refined/ the VAE-in-RAM variant, and measure*.sh the harnesses).
+- Stray model downloads: on 2026-09-22 an hf download run with the repo root as
+  its working directory dropped an identical 9.35 GB copy of the int8 convrot
+  encoder at /data/imagegen/text_encoders/ (plus ./.cache/huggingface). Its
+  origin is unattributed - it is not this session's download (mine landed in
+  models/) and not the QA subagent's. It was left in place for the operator to
+  remove; .gitignore now covers *.safetensors, *.gguf, *.ckpt and .cache/, so
+  no model file can be staged from anywhere in the tree.
 - Machine facts: this workstation (where open-grok runs) is x86-64, Intel
   i7-14700F, 31 GB RAM, RTX 4070 SUPER 12 GB, ~411 GB free on /. The NVIDIA
   driver works (nvidia-smi reports the GPU). A secret-free local API key
