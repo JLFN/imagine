@@ -1,22 +1,32 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 6b17eee28922021763223e78c780bd07e3931831
+last_updated_commit: 1fbe512555466f2e70a89341309276c8ff330ee1
 branch: dev
 remote: none
-handoff_written_at_context_usage: 0%
-handoff_written_at: 2026-09-21T20:15:00Z
-session_id: 01a0c4e0-21e1-7312-ac5d-48e842962cdf
+handoff_written_at_context_usage: 59% (estimated: chat_history bytes / 4; this session had no signals.json)
+handoff_written_at: 2026-09-22T05:36:00Z
+session_id: 01a0c775-65e6-7e73-8df2-6220db99459f
 ---
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
 --- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
-  (none)
+9169fed feat(bridge): on-demand OpenAI image API bridge over sd-server
+347ed52 docs(handoff): mark Unit 1 complete and plan Unit 2 (Rust bridge)
+6b17eee feat(recipe): first real Qwen-Image-2.1 image on the workstation
 --- progress diff stat:
-imagegen-handoff.md | 162 ++++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 162 insertions(+)
---- staleness (last_updated_commit 7443adfcd22374ddaa3e2139287e83a78d431367 .. HEAD):
-f0b85a0 docs(handoff): record the imagegen plan and launch point
+.gitignore                |    4 +-
+ Cargo.lock                | 1146 +++++++++++++++++++++++++++++++++++++++++++++
+ Cargo.toml                |    7 +
+ crates/bridge/Cargo.toml  |   15 +
+ crates/bridge/README.md   |   64 +++
+ crates/bridge/src/main.rs |  443 ++++++++++++++++++
+ docs/architecture.md      |   62 ++-
+ imagegen-handoff.md       |  162 +++++++
+ models/MANIFEST.md        |   94 ++++
+ 9 files changed, 1988 insertions(+), 9 deletions(-)
+--- staleness (last_updated_commit 341bc8d4bb3a4c7bb61c28806e51ac77002e73a8e .. HEAD):
+  (clean: handoff is current)
 --- end handoff probe ---
 
 
@@ -51,58 +61,82 @@ signals.json (sessions/<percent-encoded-cwd>/<session-id>/ under
 The final commit of each unit carries the trailer "Unit: <N> complete" as
 its last body line (git log --grep "Unit: .* complete").
 
-2. Current state (2026-09-21 — Unit 1 complete, verified)
+PARALLEL WORK (2026-09-21): a sibling repo /data/imagegen-rs now contains a
+pure-Rust port of the whole generation stack (candle: tokenizer, Qwen3-VL text
+tower, 32-block DiT, Wan VAE, sampler, CLI, OpenAI server), replacing
+stable-diffusion.cpp entirely. Verified against this repo's reference at
+1024x1024 / 28 steps: identical noise and token ids, conditioning correlation
+0.995, PSNR 26.87 dB against the sd.cpp image. Read
+/data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before
+changing anything that affects the model stack.
 
-- Unit 1 landed on dev at 6b17eee. sd-cli built from source (CUDA 13.3,
-  -DSD_CUDA=ON, sm_89); the three model files are downloaded and sha256-
-  verified (diffusion 833439e9..., encoder 67d1659b..., vae bb21f747...);
-  the first 1024x1024 image generated coherently, exit 0. Measured numbers
-  are in that commit body and docs/architecture.md (Measured performance).
-- Runner installed at bin/sd-cli (gitignored); source build area
-  /data/build-sd (sd-server is also built there). nvcc is NOT on PATH —
-  it is /usr/local/cuda/bin/nvcc; set CUDACXX or CMAKE_CUDA_COMPILER.
-- Machine re-verified: RTX 4070 SUPER 12 GB (peak VRAM 11.5 GB at 1024 sq),
-  31 GB RAM, 411 GB free. Wiring/runner constraints unchanged.
-- Current unit: Unit 2 (Rust bridge), plan in section 3.
+2. Current state (2026-09-22 — Units 1-5 complete; QA passed on Unit 5)
 
-3. Next unit plan — Unit 2: Rust bridge (OpenAI image API)
+- Unit 5 (4e8f1a0, merged c3b8b26): the bridge starts sd-server with an explicit
+  placement instead of --offload-to-cpu — diffusion parameters pinned in VRAM,
+  encoder executing on CPU with parameters in RAM, VAE parameters in RAM with GPU
+  compute — and defaults to Q6_K; override with IMAGEGEN_BACKEND_ARGS. Measured
+  table and caveats in docs/architecture.md (Parameter placement).
+- RUNNING: bridge pid 2124252 on 127.0.0.1:8787, sd-server 2124282; start with
+  cd /data/imagegen && ./bin/imagegen-bridge. /health reports backend true; a
+  1024x1024/28-step request returned a PNG in 143.6 s (open-grok limit 240 s).
+  config.toml wiring unchanged.
+- Known cost: with the DiT pinned the VAE decode OOMs at 1024 square and tiles
+  (4.4-4.7 s against 2.1 s); 1344 square is unverified under this layout.
+- The recommended int8 convrot encoder (models/text_encoders/
+  qwen3vl_8b_int8_convrot.safetensors) CANNOT load as --llm: the loader misreads
+  its geometry and aborts on a GGML_ASSERT. Only the GGUF encoder runs.
+- Verified: QA PASS (qwen38-flash-next-ds4, 21 surfaces, evidence at 1fbe512),
+  osv clean (115 packages, 0 vulnerabilities), graphify-rs graph rebuilt.
 
-Status: not yet started. Goal: a small Rust HTTP server on 127.0.0.1:8787
-that speaks the OpenAI image API and manages the sd-cli child process, so
-open-grok's [toolset.image_gen] can call it. Ground truth:
-docs/architecture.md (Bridge design), the built bin/sd-cli, and Unit 1's
-measured numbers. Branch: feature/bridge off dev (rule 23); canonical
-builder /data/build (rule 5); osv scan before push (rule 10); qa-model is a
-user parameter, ask before the QA gate (rule 19).
+3. Next unit plan — Unit 6: resolution headroom, backend supervision, delivery
 
-- Phase 1, design confirm. Confirm sd-cli is one-shot (generates one image
-  and exits) vs persistent; check whether sd-server already serves
-  /v1/images/generations with b64 (reference-implementation rule). Fix the
-  process model: likely per-request spawn, so each request pays cold start
-  (~30 s load + generation) unless a persistent mode is available; carry
-  the measured peak-VRAM/load costs from Unit 1 into the decision.
-- Phase 2, implement the bridge. Rust HTTP server exposing:
-    GET  /v1/models              -> {"data":[{"id":"Qwen-Image-2.1"}]}
-    POST /v1/images/generations  -> {"data":[{"b64_json": "..."}]}
-  Request fields: prompt, size ("1024x1024" -> -W -H, divisible by 32),
-  n (1), num_inference_steps (default 40 -> --steps), seed (optional ->
-  --seed), cfg_scale (default 6.0). Write sd-cli output to a temp path
-  under out/, read it, base64 it into the response, delete the temp. Map
-  badly-formed size / n>1 to an OpenAI-style error body + non-2xx status
-  (or support n via --batch-count). Use the measured invocation verbatim
-  as the spawn arguments.
-- Phase 3, verify end-to-end. With the bridge listening on 127.0.0.1:8787,
-  curl POST /v1/images/generations {"prompt":...,"size":"1024x1024"} and
-  confirm exit 0, a b64_json that decodes to a valid PNG, and the writer
-  file exists; curl GET /v1/models. Measure a request wall time. Run the
-  QA gate with a user-chosen qa-model before the commit.
-- Verify, package, handoff: run acceptance checks; osv-mcp scan the new
-  crate; commit on feature/bridge with a conventional message carrying the
-  measured request time and the trailer "Unit: 2 complete"; merge to dev;
-  graphify AST graph rebuilt at commit time (rule 12); fold outcome here.
-- Open items carried forward: cold-start vs the open-grok image-tool client
-  timeout (telemeter at wiring, Unit 3); bridge port 8787 free (confirm ss
-  -tlnp at wiring); remote/push still pending a visibility check.
+Status: Units 1-5 are complete and verified (section 2); the QA gate passed and
+the osv scan is clean. Three items are open, in priority order. dev is the
+working branch; every code phase below needs a feature/ branch off dev (rule
+23), and every measurement needs the bridge STOPPED first, because the bridge
+holds 5.6 GB of Q6_K weights pinned in VRAM and a second sd-cli run at 1024
+square or above will fight it for the card.
+
+- Phase 1, resolution headroom (code, feature branch). The pinned layout was
+  measured only at 512 and 1024 square; the Q6_K quality tier the project used
+  before is 1344 square and is now unverified. Measure it:
+    cd /data/imagegen && kill -INT <bridge pid> && \
+    ./bin/sd-cli --diffusion-model models/qwen-image-2.1-Q6_K.gguf \
+      --vae models/qwen_image_2.1_vae_bf16.safetensors \
+      --llm models/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
+      -p "<prompt>" --cfg-scale 6.0 --sampling-method euler -v \
+      --backend te=cpu,diffusion=cuda0,vae=cuda0 \
+      --params-backend te=cpu,diffusion=cuda0,vae=cpu \
+      -W 1344 -H 1344 --steps 40 --seed 42 -o out/res1344.png
+  then restart the bridge. If it OOMs, choose between a --max-vram budget,
+  keeping --offload-to-cpu for sizes above 1024, or documenting the cap.
+  Acceptance: a measured 1344-square number recorded in docs/architecture.md
+  (Parameter placement), with the mitigation if it fails.
+
+- Phase 2, backend supervision (code, feature branch; the user has not asked
+  for this yet, so confirm before spending the unit). The bridge spawns
+  sd-server once, never waits on it and never respawns it: observed
+  2026-09-22 after 8h51m of uptime with a zombie sd-server child, port 8788
+  dead, /health reporting backend false, so every image request failed until
+  the bridge was restarted by hand. Reproduce by killing the sd-server child
+  and watching the bridge keep answering /v1/models. Fix by reaping the child
+  and respawning a backend that died, or by failing loudly.
+  Acceptance: killing the backend produces a respawn or a clear error,
+  verified live, with the QA gate re-run.
+
+- Phase 3, delivery state and the remote decision (carried over from the old
+  Unit 4 plan, still open). No remote exists. If the user wants one: pick host
+  and visibility first, run
+    gh repo view OWNER/REPO --json isPrivate,visibility   (rule 6)
+  before any push, re-run the osv scan (rule 10; last clean 2026-09-22, 115
+  packages), then git remote add origin <url> and push dev. main stays behind
+  a reviewed PR (rule 23). If the user declines a remote, record the decision
+  here: the repo is deliverable on dev alone.
+
+- Phase 4, wrap. Fold this unit's outcome into section 2, replace section 3
+  wholesale with the next plan, refresh the memory entry
+  (imagegen-e61a3c5c), and close with the trailer "Unit: 6 complete".
 
 4. Project facts a fresh session cannot re-derive
 
@@ -110,6 +144,14 @@ user parameter, ask before the QA gate (rule 19).
   Model files go to /data/imagegen/models/ (gitignored). Runner to
   /data/imagegen/bin/sd-cli (gitignored). Test images to /data/imagegen/out/
   (gitignored).
+- sd.cpp sources and measurements live OUTSIDE the repo, at /data/build-sd:
+  stable-diffusion.cpp is the source tree matching the installed sd-cli and
+  sd-server (upstream master 6dcb5bb, built with SD_CUDA=ON, SD_USE_UPSTREAM_GGML
+  OFF, i.e. the patched ggml that accepts int8 convrot files). Its docs/
+  (qwen_image_2.1.md, backend.md, int8_convrot.md) are the authority for flag
+  semantics. The layout measurement logs and scripts are under
+  /data/build-sd/te-split (prod/ has the 1024 runs A/B/C, q6/ the pinned Q6_K
+  run, refined/ the VAE-in-RAM variant, and measure*.sh the harnesses).
 - Machine facts: this workstation (where open-grok runs) is x86-64, Intel
   i7-14700F, 31 GB RAM, RTX 4070 SUPER 12 GB, ~411 GB free on /. The NVIDIA
   driver works (nvidia-smi reports the GPU). A secret-free local API key
