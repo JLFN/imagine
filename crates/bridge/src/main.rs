@@ -13,14 +13,34 @@
 // Configuration is read from the environment (defaults match this repo's
 // layout and the measured Unit 1 invocation):
 //   IMAGEGEN_SD_SERVER       path to sd-server           (bin/sd-server)
-//   IMAGEGEN_DIFFUSION       path to diffusion model     (models/qwen-image-2.1-Q4_K_M.gguf)
+//   IMAGEGEN_DIFFUSION       path to diffusion model     (models/qwen-image-2.1-Q6_K.gguf)
 //   IMAGEGEN_VAE             path to vae                 (models/qwen_image_2.1_vae_bf16.safetensors)
 //   IMAGEGEN_LLM             path to text encoder        (models/Qwen3VL-8B-Instruct-Q4_K_M.gguf)
+//   IMAGEGEN_BACKEND_ARGS    sd-server placement flags   (--backend te=cpu,diffusion=cuda0,vae=cuda0
+//                                                         --params-backend te=cpu,diffusion=cuda0,vae=cpu)
 //   IMAGEGEN_LISTEN_IP       bridge listen IP            (127.0.0.1)
 //   IMAGEGEN_LISTEN_PORT     bridge port                 (8787)
 //   IMAGEGEN_BACKEND_PORT    internal sd-server port     (8788)
 //   IMAGEGEN_STEPS           default sampling steps      (28)
 //   IMAGEGEN_CFG_SCALE       default CFG scale           (6.0)
+//
+// Placement rationale (measured 2026-09-22 on this box, 1024x1024 / 28 steps /
+// seed 42, same prompt throughout, RTX 4070 SUPER 12 GB; peak VRAM from a 1 s
+// nvidia-smi poll, host RSS from /usr/bin/time -v):
+//   --offload-to-cpu, Q4_K_M: sampling 131.5 s, VAE decode 2.1 s untiled,
+//     peak VRAM 11,572 MiB, host RSS 10.6 GiB
+//   DiT pinned + encoder on CPU, Q4_K_M: sampling 132.9 s, decode 4.4 s tiled,
+//     peak VRAM 8,172 MiB, host RSS 6.2 GiB
+//   everything pinned including the encoder: cannot complete a generation at
+//     all (the diffusion model runs out of memory during sampling)
+//   this default (Q6_K pinned, encoder on CPU, VAE parameters in RAM):
+//     sampling 146.5 s, decode 4.7 s tiled, total 153.9 s, peak VRAM 9,426 MiB
+// So the split holds ~4.4 GiB less host RAM and ~3.4 GiB less of the VRAM peak
+// at the same sampling speed, at the cost of the VAE decode falling back to
+// spatial tiling above a small resolution (4.4-4.7 s at 1024 square; at 512
+// square the same layout decoded untiled in 1.43 s): the pinned DiT weights
+// are what starve it, not the VAE's own (keeping them in RAM does not avoid
+// the fallback). See docs/architecture.md.
 
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,10 +67,20 @@ struct Config {
     backend_port: u16,
     steps: u32,
     cfg_scale: f64,
+    backend_args: Vec<String>,
 }
 
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Whitespace-separated argument list, so one env var can carry a flag pair
+/// such as `--backend te=cpu,diffusion=cuda0` (each token stays one argv entry).
+fn env_args(key: &str, default: &str) -> Vec<String> {
+    env_str(key, default)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 fn env_u16(key: &str, default: u16) -> u16 {
@@ -80,7 +110,7 @@ impl Config {
             sd_server: env_str("IMAGEGEN_SD_SERVER", "bin/sd-server"),
             diffusion: env_str(
                 "IMAGEGEN_DIFFUSION",
-                "models/qwen-image-2.1-Q4_K_M.gguf",
+                "models/qwen-image-2.1-Q6_K.gguf",
             ),
             vae: env_str("IMAGEGEN_VAE", "models/qwen_image_2.1_vae_bf16.safetensors"),
             llm: env_str(
@@ -92,6 +122,11 @@ impl Config {
             backend_port: env_u16("IMAGEGEN_BACKEND_PORT", 8788),
             steps: env_u32("IMAGEGEN_STEPS", 28),
             cfg_scale: env_f64("IMAGEGEN_CFG_SCALE", 6.0),
+            backend_args: env_args(
+                "IMAGEGEN_BACKEND_ARGS",
+                "--backend te=cpu,diffusion=cuda0,vae=cuda0 \
+                 --params-backend te=cpu,diffusion=cuda0,vae=cpu",
+            ),
         }
     }
 }
@@ -105,6 +140,10 @@ fn spawn_backend(cfg: &Config) -> Child {
         "starting sd-server backend on 127.0.0.1:{} ({} / {} / {})",
         cfg.backend_port, cfg.diffusion, cfg.llm, cfg.vae
     );
+    info!(
+        "backend placement args: {}",
+        cfg.backend_args.join(" ")
+    );
     Command::new(&cfg.sd_server)
         .arg("--diffusion-model")
         .arg(&cfg.diffusion)
@@ -116,7 +155,7 @@ fn spawn_backend(cfg: &Config) -> Child {
         .arg("127.0.0.1")
         .arg("--listen-port")
         .arg(cfg.backend_port.to_string())
-        .arg("--offload-to-cpu")
+        .args(&cfg.backend_args)
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
 }

@@ -83,10 +83,18 @@ SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
   sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
   The Q6_K diffusion model (~28% larger than Q4_K_M) is the practical
-  higher-fidelity default on the 12 GB GPU: weights stay in system RAM via
-  --offload-to-cpu, GPU compute is ~11.5 s/it, and resolution up to ~1344
-  (or ~1536 on one axis) fits in 12 GB. Q8_0 also exists on disk but is
-  reserved for when VRAM/RAM budget allows; it is not the default.
+  higher-fidelity default on the 12 GB GPU and is the deployed default in
+  the bridge. Its parameters are pinned in VRAM (not RAM-staged): updated
+  2026-09-22, see docs/architecture.md, Parameter placement. Earlier text
+  here described it as RAM-resident via --offload-to-cpu, which is no longer
+  how the bridge runs it. Measured 2026-09-22 with the pinned arrangement at
+  1024x1024 / 28 steps: sampling 146.5 s (about 5.2 s/it), total 153.9 s,
+  peak VRAM 9,426 MiB, with the VAE decode falling back to spatial tiling at
+  that resolution. The earlier --offload-to-cpu figures (about 11.5 s/it at
+  1344x1344 with weights RAM-resident, peak 11.1 GB) still apply to that
+  arrangement; resolution up to ~1344 (or ~1536 on one axis) is UNVERIFIED
+  under the pinned default. Q8_0 also exists on disk but is reserved for when
+  the VRAM/RAM budget allows; it is not the default.
 
 Note: an initial curl for the diffusion model hit a flaky HTTP/2 stream
 (exit 92) and left a truncated 4,240,669,189-byte file, which FAILED the
