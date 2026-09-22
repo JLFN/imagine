@@ -10,8 +10,12 @@ in this file must be re-verified before being trusted.
      2026-09-20). Prebuilt binaries on the releases page, or build from
      source with cmake (requires a CUDA toolkit for the CUDA backend).
    - Backends: CPU (AVX/AVX2/AVX512), CUDA, Vulkan, Metal, OpenCL, SYCL.
-2. Model files (see models/MANIFEST.md): diffusion Q4_K_M GGUF 4.6 GiB,
-   encoder Qwen3-VL-8B-Instruct Q4_K_M GGUF 5.03 GB, VAE 0.64 GiB.
+2. Model files (see models/MANIFEST.md): diffusion Q6_K GGUF 5.47 GiB
+   (the deployed default; Q4_K_M at 4.29 GiB is also on disk), encoder
+   Qwen3-VL-8B-Instruct Q4_K_M GGUF 4.68 GiB, VAE 0.63 GiB. Note: earlier
+   revisions of this file and of MANIFEST.md quoted Q4_K_M as "4.6 GiB" and
+   the encoder as "5.03 GB" - those are decimal GB, not GiB (4.60 GB and
+   5.03 GB respectively).
 3. Bridge (not yet written): a small Rust HTTP server that speaks the
    OpenAI image API and manages the sd-cli child process.
 4. Wiring: [toolset.image_gen] in ~/.opengrok/config.toml.
@@ -54,13 +58,62 @@ Verified invocation: the text-to-image command above with -W 1024 -H 1024,
 - Model load ~12.7 s (encoder), ~10.7 s (diffusion), ~1.2 s (VAE);
   condition forward ~13.9 s.
 
+## Parameter placement (measured 2026-09-22)
+
+sd.cpp's `--backend` selects the module that executes a module's graphs and
+`--params-backend` selects where its parameters live (module names: `te`,
+`diffusion`, `vae`). Measured on this box at 1024x1024 / 28 steps / seed 42,
+same prompt, peak VRAM from a 1 s nvidia-smi poll, host RSS from
+/usr/bin/time -v. Times are sd-cli `generate_image` (includes the load).
+
+  layout                          sampling   VAE decode   total    peak VRAM   host RSS
+  --offload-to-cpu, Q4_K_M        131.5 s    2.1 s        135.2 s  11,572 MiB  10.6 GiB
+  DiT pinned, encoder CPU, Q4_K_M 132.9 s    4.4 s tiled  139.4 s   8,172 MiB   6.2 GiB
+  all pinned, encoder on GPU      -          -            failed       -           -
+  Q6_K pinned, encoder CPU, VAE
+    parameters in RAM (deployed)  146.5 s    4.7 s tiled  153.9 s   9,426 MiB      -
+
+What the measurements establish:
+
+- Pinning the diffusion model costs nothing in sampling time at this
+  resolution (131.5 s to 132.9 s). The staging it removes is hidden by
+  prefetch once a run is long enough; at 4 steps the same change took a
+  512-square run from 25.2 s to 10.7 s.
+- The text encoder must not be pinned: with all three modules in VRAM the
+  diffusion model fails during weight preparation at block 28 of 34 and the
+  run dies. Its parameters in RAM with the graph on the CPU costs 0.5-1.1 s
+  more conditioning (1.38-2.62 s, once per prompt).
+- The VAE decode falls back to spatial tiling (9 tiles, ~2.4 s per tile) at
+  1024 square when the DiT is pinned: 4.4-4.7 s instead of 2.1 s. This is
+  resolution dependent - at 512 square the same layout decoded untiled in
+  1.43 s with no tile passes - and it is the pinned DiT weights starving the
+  decode, not the VAE's own parameters: moving those to RAM does not avoid
+  the fallback. Budget ~2.5 s per 1024-square request for it, and treat the
+  tiled output as visually unverified against the untiled decode.
+- The bridge passes `--backend te=cpu,diffusion=cuda0,vae=cuda0
+  --params-backend te=cpu,diffusion=cuda0,vae=cpu` (overridable with
+  IMAGEGEN_BACKEND_ARGS). Through the bridge, a first 1024-square/28-step
+  request returned HTTP 200 with a 1024x1024 PNG in 143.6 s, inside
+  open-grok's 240 s read timeout.
+- 1344-square was measured earlier only with --offload-to-cpu (peak 11.1 GB).
+  With the DiT pinned permanently the same tier is UNVERIFIED and expected to
+  be too tight; measure before claiming it.
+
+Layout is not bit-reproducible: the same seed and prompt under two layouts
+differed on 90% of channel bytes (mean absolute difference 6.07 of 255).
+Structurally identical images, but do not expect byte equality across
+placement changes.
+
 ## Quality and open-grok on-demand (Unit 2 findings)
 
 - Quality on a 12 GB card is bounded by VRAM. Q4_K_M @ 1024 peaks ~11.5 GB.
   The practical higher-quality point is the Q6_K diffusion model (5.88 GB,
-  near-lossless) with GPU compute and weights RAM-resident
-  (--offload-to-cpu): Q6_K @ 1344x1344, 40 steps fits (peak 11.1 GB) at
-  ~11.5 s/it (~8.3 min) and gives a clear quality step over 1024/Q4.
+  near-lossless), which is the deployed default: parameters pinned in VRAM
+  with the arrangement described under Parameter placement above. The
+  figures in the next sentence were measured with --offload-to-cpu (weights
+  RAM-resident, staged on demand): Q6_K @ 1344x1344, 40 steps fits (peak
+  11.1 GB) at ~11.5 s/it (~8.3 min) and gives a clear quality step over
+  1024/Q4. That 1344 tier is unverified under the pinned default.
 - Pure CPU compute is a dead end for on-demand: it frees VRAM (~5 GB peak)
   but runs the 7B DiT at ~375 s/it, so higher resolution via full CPU is
   not usable.
