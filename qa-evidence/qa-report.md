@@ -116,6 +116,27 @@ CONFIG KEY max_edge (imagegen.toml; the bridge's new request ceiling)
   1152x1152 steps=8 cfg=6 seed=5" then "generated 1 image(s) in
   72.478421964s". 1152 square is accepted AND served end to end.
 
+  That acceptance run used 8 steps deliberately, to keep the check short, and it
+  is a FIT probe rather than a quality sample. Following an operator question
+  about the image's appearance, the same request was repeated at the production
+  step count for a like-for-like artifact, same prompt / size / seed 5:
+  command: curl -X POST ... -d '{...,"size":"1152x1152",
+           "num_inference_steps":28,"seed":5}'
+  observed: http_code=200 total_time=198.35s; PNG (1152, 1152) RGBA 2,826,304
+  bytes, committed as qa-gen-1152-28steps-seed5.png. Measured difference between
+  the two, same seed and size, computed from the two artifacts:
+    high-frequency energy   mean gradient 1.242 -> 3.678 (2.96x)
+                            laplacian mean 3.754 -> 9.254, std 4.629 -> 16.981
+    pixels differing by more than 32 of 255   46.6 percent
+  An independent visual read (agy/Gemini, because the primary model cannot see
+  images) described the 8-step frame as soft and hazy throughout with an
+  illegible sign, a placard detached from the cat, and malformed paws, against a
+  sharp 28-step frame with legible "qwen2.1.cpp" lettering and coherent paws.
+  The 8-step image is therefore what an under-converged sampler looks like, not
+  evidence about the deployed default: the bridge defaults to 28 steps, and this
+  was the one check that bypassed that default. Nothing in this unit changes the
+  step count or the sampling path.
+
   ENDPOINT POST /v1/images/generations, regression at the documented tier
   command: curl -X POST ... -d '{...,"size":"1024x1024","num_inference_steps":8,
            "seed":7}'
@@ -235,7 +256,11 @@ NOT verified in this pass, stated plainly
 Evidence artifacts committed with this report
   - qa-evidence/qa-gen-1152-8steps-seed5.png: the 1152-square image the deployed
     bridge returned (PNG 1152x1152 RGBA, 2,297,223 bytes), i.e. the new ceiling's
-    acceptance proven by its own output.
+    acceptance proven by its own output. An 8-step FIT probe, not a quality
+    sample.
+  - qa-evidence/qa-gen-1152-28steps-seed5.png: the same request at the production
+    28 steps (PNG 1152x1152 RGBA, 2,826,304 bytes), the honest sample of what the
+    deployed default at the new ceiling looks like.
   - qa-evidence/qa-tiling-1024-untiled-vs-tiled.png: the Phase 2 comparison, the
     untiled decode on the left and the forced-tiled decode on the right, same
     seed, from which the pixel differences above were computed.
