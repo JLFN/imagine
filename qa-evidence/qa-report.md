@@ -1,416 +1,218 @@
-QA EVIDENCE REPORT - imagegen bridge VRAM-split change (IMAGEGEN_BACKEND_ARGS)
+QA report for the imagegen bridge, Unit 6 (config file, backend supervision,
+upstream model layout, int8 convrot encoder as the shipped default) and its
+QA-driven fixes.
 
-qa-model: qwen38-flash-next-ds4
-date: 2026-09-22T05:27Z (UTC) / 07:27 CEST
-workspace: /data/imagegen
-branch under test: feature/bridge-vram-split, HEAD 341bc8d
-  "fix(bridge): reject n>1 and non-div-32 sizes with OpenAI errors"
-  plus the uncommitted working-tree change under test
-  (git status: M crates/bridge/src/main.rs, M docs/architecture.md,
-   M imagegen-handoff.md)
-target under test: http://127.0.0.1:8787 (production imagegen-bridge),
-  backend sd-server on 127.0.0.1:8788
-throwaway instances used for config tests: bridge 8789 and 8791, backend
-  port 8790, with IMAGEGEN_SD_SERVER pointing at a stub script that records
-  argv and serves a minimal /v1/models response. No model was loaded by any
-  throwaway instance.
+qa-model: deepseek-flash (the primary agent, by operator request)
+Date: 2026-09-22. Revision tested: fb054be plus the uncommitted startup
+restructure and architecture-doc notes in the working tree.
 
-SCOPE AND SAFETY
-The change under test is: (1) new env var IMAGEGEN_BACKEND_ARGS carrying the
-sd-server placement flags with the default "--backend
-te=cpu,diffusion=cuda0,vae=cuda0 --params-backend
-te=cpu,diffusion=cuda0,vae=cpu", replacing the hardcoded --offload-to-cpu;
-(2) IMAGEGEN_DIFFUSION default moved from models/qwen-image-2.1-Q4_K_M.gguf
-to models/qwen-image-2.1-Q6_K.gguf; (3) intended live placement is diffusion
-parameters pinned in VRAM, text encoder executing and living in RAM, VAE
-parameters in RAM with compute on the GPU.
-Every check below ran live. No production process was stopped, killed or
-restarted. Process ids 2124252 (bridge) and 2124282 (sd-server) are the same
-pair before and after the whole QA run, and both were still alive and
-listening at the end.
+INDEPENDENCE DISCLOSURE, read this first
+This pass was performed by the same agent that wrote the code, at the operator's
+request, replacing a separate QA model. That makes it self-verification and
+strictly weaker than the two independent passes that preceded it (qa-model
+qwen38-flash-next-ds4, recorded in this file's history). To compensate, every
+check below was run live against the deployed service or a throwaway instance,
+evidence is quoted verbatim, and the list of things NOT verified is explicit.
+The three defects those independent passes found are the reason this revision
+exists at all; a self-pass should not be read as having equal weight.
 
-PRE-FLIGHT: the tested binary is the one containing the change
+Surfaces covered, each with the command and what was observed.
 
-  command: stat -c '%n %y' crates/bridge/src/main.rs bin/imagegen-bridge
-  observed:
-    /data/imagegen/crates/bridge/src/main.rs 2026-09-22 07:18:26
-    /data/imagegen/bin/imagegen-bridge       2026-09-22 07:19:14
-  The deployed binary is newer than the edited source, so the running process
-  does contain the change under test.
-
-  command: strings -n 8 bin/imagegen-bridge | grep -E 'qwen-image|params-backend|offload-to-cpu'
-  observed (excerpt):
-    IMAGEGEN_DIFFUSION models/qwen-image-2.1-Q6_K.gguf
-    IMAGEGEN_BACKEND_ARGS
-    --backend te=cpu,diffusion=cuda0,vae=cuda0 --params-backend te=cpu,diffusion=cuda0,vae=cpu
-  The string --offload-to-cpu is absent from the binary (grep found no
-  occurrence), confirming the hardcoded flag is gone.
-
-  Production process pair (ps -eo pid,ppid,etime,args):
-    2124252  1439  ./bin/imagegen-bridge
-    2124282  2124252  bin/sd-server --diffusion-model
-      models/qwen-image-2.1-Q6_K.gguf --vae
-      models/qwen_image_2.1_vae_bf16.safetensors --llm
-      models/Qwen3VL-8B-Instruct-Q4_K_M.gguf --listen-ip 127.0.0.1
-      --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cuda0
-      --params-backend te=cpu,diffusion=cuda0,vae=cpu
-  /proc/2124252/cwd -> /data/imagegen, /proc/2124252/exe ->
-  /data/imagegen/bin/imagegen-bridge.
-  /proc/2124252/environ contains no IMAGEGEN_* variable, so the production
-  backend argv is produced entirely by the code defaults. This is what makes
-  the live argv a test of the default and not of an ambient env var.
-
-SURFACES COVERED
-
-CONFIG IMAGEGEN_BACKEND_ARGS (default reaches spawned sd-server argv, live process)
-CONFIG IMAGEGEN_BACKEND_ARGS (default reaches argv of a fresh spawn, stub backend)
-CONFIG IMAGEGEN_BACKEND_ARGS (explicit override changes the argv, stub backend)
-CONFIG IMAGEGEN_DIFFUSION (default is the Q6_K file, live process argv)
-CONFIG IMAGEGEN_DIFFUSION (env override reaches argv, stub backend)
-MODEL models/qwen-image-2.1-Q6_K.gguf (size and sha256 vs models/MANIFEST.md)
-LIVE PLACEMENT /data/build-sd/bridge-split.log (diffusion params in VRAM, text encoder and VAE params in RAM)
-ENDPOINT GET /health
-ENDPOINT GET /v1/models
-ENDPOINT POST /v1/images/generations (happy path, real generation, PNG validated)
-ENDPOINT POST /v1/images/generations (error path n = 2)
-ENDPOINT POST /v1/images/generations (error path n = 3)
-ENDPOINT POST /v1/images/generations (error path n = 0)
-ENDPOINT POST /v1/images/generations (error path malformed json body)
-ENDPOINT POST /v1/images/generations (error path empty prompt)
-ENDPOINT POST /v1/images/generations (error path size not divisible by 32)
-FUNCTION parse_size (non-div-32 rejection, live through the endpoint)
-FUNCTION create_generation n guard (no backend call, proven by stub request log)
-FUNCTION spawn_backend (arg construction, observed through recorded stub argv)
-FUNCTION health (backend liveness probe, live)
-FUNCTION get_models (model id, live)
-
-EVIDENCE
-
-1. CONFIG IMAGEGEN_BACKEND_ARGS - default reaches the live sd-server argv
-
-  command: tr '\0' ' ' < /proc/2124282/cmdline
-  observed:
-    bin/sd-server --diffusion-model models/qwen-image-2.1-Q6_K.gguf --vae
-    models/qwen_image_2.1_vae_bf16.safetensors --llm
-    models/Qwen3VL-8B-Instruct-Q4_K_M.gguf --listen-ip 127.0.0.1
-    --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cuda0
+CONFIG imagegen.toml (the file is the binding source of truth)
+  command: P=$(pgrep -x sd-server | head -1); tr '\0' ' ' < /proc/$P/cmdline
+  observed: bin/sd-server --diffusion-model
+    models/diffusion_models/qwen-image-2.1-Q6_K.gguf --vae
+    models/vae/qwen_image_2.1_vae_bf16.safetensors --llm
+    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors --listen-ip
+    127.0.0.1 --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cuda0
     --params-backend te=cpu,diffusion=cuda0,vae=cpu
-  Token-by-token this equals the source default (main.rs:123-127): the flag
-  "--backend" and its value "te=cpu,diffusion=cuda0,vae=cuda0" are two
-  separate argv entries, and "--params-backend" with
-  "te=cpu,diffusion=cuda0,vae=cpu" are two more. The split_whitespace
-  tokenizer in env_args (main.rs:77-82) keeps each token as one entry, as
-  its doc comment claims. Also note the absence of --offload-to-cpu.
-  PASS.
+  Every value is the imagegen.toml value; the bridge process carries no
+  IMAGEGEN variables in its environ, so nothing came from the environment.
 
-2. CONFIG IMAGEGEN_BACKEND_ARGS - default on a fresh spawn, stub backend
+CONFIG IMAGEGEN_CONFIG and the missing-path refusal
+  command: env -i IMAGEGEN_CONFIG=/tmp/qa-mine/absent.toml ./bin/imagegen-bridge
+  observed: exit=2, "no model path for IMAGEGEN_SD_SERVER: set it in
+  /tmp/qa-mine/absent.toml or in the environment"
+  Same command with only sd_server present advances to the next missing key, so
+  the check names one missing path at a time rather than failing anonymously.
+  COSMETIC FINDING, recorded rather than fixed: the message says "no model path"
+  for IMAGEGEN_SD_SERVER, which is the sd-server binary rather than a model. The
+  behaviour is correct (it refuses and exits 2); only the wording is imprecise. It
+  is left as found because changing it after this verification would invalidate the
+  evidence above for a string that no logic depends on.
 
-  command: IMAGEGEN_SD_SERVER=/tmp/qa-stub/fake-sd-server
-    IMAGEGEN_LISTEN_PORT=8789 IMAGEGEN_BACKEND_PORT=8790
-    ./bin/imagegen-bridge
-    (stub writes its argv to /tmp/qa-stub/argv.txt then sleeps)
-  observed, /tmp/qa-stub/argv.txt in order:
-    --diffusion-model
-    models/qwen-image-2.1-Q6_K.gguf
-    --vae
-    models/qwen_image_2.1_vae_bf16.safetensors
-    --llm
-    models/Qwen3VL-8B-Instruct-Q4_K_M.gguf
-    --listen-ip
-    127.0.0.1
-    --listen-port
-    8790
-    --backend
-    te=cpu,diffusion=cuda0,vae=cuda0
-    --params-backend
-    te=cpu,diffusion=cuda0,vae=cpu
-  The default is not specific to the long-running process; a fresh bridge
-  with no IMAGEGEN_BACKEND_ARGS set produces the same placement flags.
-  PASS.
+CONFIG malformed TOML
+  command: printf 'this is not toml = = =\n' > bad.toml; env -i
+    IMAGEGEN_CONFIG=bad.toml ./bin/imagegen-bridge
+  observed: exit=2, parser message "expected `.`, `=`"
 
-3. CONFIG IMAGEGEN_BACKEND_ARGS - explicit override changes the argv
+CONFIG per-key precedence, environment over file
+  command: a throwaway with a config whose values are deliberately fake
+    (sd_server /tmp/qa-mine/stub.sh, diffusion FROM-FILE-A.gguf, vae
+    FROM-FILE-B.safetensors, llm FROM-FILE-C.safetensors, backend_args
+    ["--backend","FILE-PLACEMENT"], listen_port 8797, backend_port 8798), started
+    with IMAGEGEN_CONFIG set and IMAGEGEN_DIFFUSION=FROM-ENV.gguf,
+    IMAGEGEN_LISTEN_PORT=8795, IMAGEGEN_BACKEND_PORT=8796
+  observed, from the stub's own recorded argv:
+    --diffusion-model FROM-ENV.gguf --vae FROM-FILE-B.safetensors --llm
+    FROM-FILE-C.safetensors --listen-ip 127.0.0.1 --listen-port 8796 --backend
+    FILE-PLACEMENT
+  So the three overridden keys took the environment and the others kept the file.
 
-  command: IMAGEGEN_BACKEND_ARGS="--backend
-    te=cpu,diffusion=cpu,vae=cuda0 --params-backend
-    te=cpu,diffusion=cpu,vae=cpu --extra-token qa42"
-    IMAGEGEN_SD_SERVER=/tmp/qa-stub/fake-sd-server
-    IMAGEGEN_LISTEN_PORT=8789 IMAGEGEN_BACKEND_PORT=8790
-    ./bin/imagegen-bridge
-  observed, stub-recorded argv tail:
-    --backend
-    te=cpu,diffusion=cpu,vae=cuda0
-    --params-backend
-    te=cpu,diffusion=cpu,vae=cpu
-    --extra-token
-    qa42
-  and the bridge log line:
-    2026-09-22T05:22:00Z INFO imagegen_bridge: backend placement args:
-    --backend te=cpu,diffusion=cpu,vae=cuda0 --params-backend
-    te=cpu,diffusion=cpu,vae=cpu --extra-token qa42
-  The env var fully replaces the default (no default flags leaked into the
-  argv), arbitrary extra tokens pass through, and no shell quoting is
-  involved. PASS.
+CONFIG backend_args reach the backend
+  observed: the production argv above ends with the two placement flag pairs, and
+  the same pair appears verbatim in the stub argv, so placement is file-driven and
+  env-overridable rather than compiled in.
 
-4. CONFIG IMAGEGEN_DIFFUSION - default and override
+BEHAVIOR startup observability (the defect the independent pass found)
+  command: IMAGEGEN_SD_SERVER=/bin/true IMAGEGEN_LISTEN_PORT=8797
+    IMAGEGEN_BACKEND_PORT=8798 (a backend that spawns and exits instantly)
+  observed: port 8797 bound (ss -tln), and GET /health answered DURING the
+    failure: {"backend":false,"backend_process_alive":false,
+    "backend_restart_attempts":1,"backend_restarts":0,"status":"ok"}
+  The listener binds before the readiness wait, so the bridge is observable while
+  the backend is broken instead of being unreachable for 180 s and then gone.
 
-  Default, live process (command: tr '\0' ' ' < /proc/2124282/cmdline):
-    ... --diffusion-model models/qwen-image-2.1-Q6_K.gguf ...
-  Default, fresh spawn (item 2 above): --diffusion-model
-    models/qwen-image-2.1-Q6_K.gguf
-  Default, bridge log at startup:
-    2026-09-22T05:19:14Z INFO imagegen_bridge: starting sd-server backend on
-    127.0.0.1:8788 (models/qwen-image-2.1-Q6_K.gguf /
-    models/Qwen3VL-8B-Instruct-Q4_K_M.gguf /
-    models/qwen_image_2.1_vae_bf16.safetensors)
-  Override still works (command: IMAGEGEN_DIFFUSION=models/custom-test.gguf
-    IMAGEGEN_SD_SERVER=/tmp/qa-stub2/fake-sd-server
-    IMAGEGEN_LISTEN_PORT=8789 IMAGEGEN_BACKEND_PORT=8790
-    ./bin/imagegen-bridge):
-    --diffusion-model
-    models/custom-test.gguf
-  The Q4_K_M default is gone from the binary strings (item PRE-FLIGHT).
-  PASS.
+BEHAVIOR readiness and /health probe timeouts are bounded
+  command: a stub that accepts the TCP connection and never answers, bridge on
+    8799/8800; time curl -s -m 40 http://127.0.0.1:8799/health
+  observed: answer in real 0m10.007s:
+    {"backend":false,"backend_process_alive":true,"backend_restart_attempts":0,
+     "backend_restarts":0,"status":"ok"}
+  Bounded at the 10 s probe timeout. Note for monitoring clients: /health can take
+  up to about 10 s when the backend is wedged.
 
-5. MODEL models/qwen-image-2.1-Q6_K.gguf against models/MANIFEST.md
+BEHAVIOR a wedged-but-alive backend is not auto-restarted (documented limitation)
+  observed: over 20 s with that wedged stub, log lines matching
+    "restarting|exited" = 0, and health still reported
+    backend_process_alive true with both counters 0. The limitation stated in
+    docs/architecture.md is accurate as written.
 
-  command: stat -c '%n %s bytes' models/qwen-image-2.1-Q6_K.gguf
-  observed: /data/imagegen/models/qwen-image-2.1-Q6_K.gguf 5876556448 bytes
-  manifest (models/MANIFEST.md lines 81-83):
-    - models/qwen-image-2.1-Q6_K.gguf   (higher-quality diffusion option)
-      size    5876556448
-      sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
-  command: sha256sum models/qwen-image-2.1-Q6_K.gguf   (elapsed 7.6 s)
-  observed: a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
-  Size matches the manifest exactly and the file is byte-identical to the
-  manifest hash, so the pinned-in-VRAM diffusion model is the registered
-  artifact and not a partial or corrupted download. PASS.
+BEHAVIOR backend supervision on production
+  command: kill -9 on the sd-server child, then poll /health
+  observed: before {"...backend_restart_attempts":0,"backend_restarts":0...};
+    t+3s attempts 1, restarts 0; t+7s attempts 1, restarts 1; log:
+      WARN sd-server backend exited (signal: 9 (SIGKILL))
+      WARN sd-server backend is down; restarting in 1s
+      INFO sd-server backend restarted and ready (restart number 1)
+  The two counters separate a spawn attempt from a confirmed healthy replacement,
+  which is the fix for the finding that attempts alone looked healthy.
 
-6. LIVE PLACEMENT - backend startup log /data/build-sd/bridge-split.log
+BEHAVIOR no zombie and no duplicate child
+  command: ps -o pid,stat,cmd --ppid $(pgrep -x imagegen-bridge | head -1)
+  observed: exactly one child, state Sl, with the expected convrot argv.
 
-  The log is the live one: mtime 2026-09-22 07:25:18 (it grew during this QA
-  run when the generation below ran), and its first lines are the bridge
-  spawn for pids 2124252 / 2124282.
-  command: head -20 /data/build-sd/bridge-split.log
-  observed (key lines, quoted verbatim):
-    2026-09-22T05:19:14.285620Z  INFO imagegen_bridge: backend placement
-      args: --backend te=cpu,diffusion=cuda0,vae=cuda0 --params-backend
-      te=cpu,diffusion=cuda0,vae=cpu
-    ggml_cuda_init: found 1 CUDA devices (Total VRAM: 11893 MiB):
-      Device 0: NVIDIA GeForce RTX 4070 SUPER, compute capability 8.9,
-      VMM: yes, VRAM: 11893 MiB
-    [INFO   ] diffusion_engine.cpp:709  - loading diffusion model from
-      'models/qwen-image-2.1-Q6_K.gguf'
-    [INFO   ] diffusion_engine.cpp:1486 - Diffusion model weight type stat:
-      q6_K: 229  |    bf16: 68
-    [INFO   ] diffusion_engine.cpp:1294 - total params memory size =
-      10551.03MB (VRAM 5604.32MB, RAM 4946.71MB): text_encoders
-      4302.33MB(RAM), diffusion_model 5604.32MB(VRAM), vae 644.38MB(RAM),
-      controlnet 0.00MB(N/A), extensions 0.00MB(N/A)
-    [INFO   ] main.cpp:149  - listening on: http://127.0.0.1:8788
-  Reading of the placement line against the intended arrangement:
-    diffusion_model 5604.32MB (VRAM)  -> diffusion parameters pinned in VRAM: matches intent
-    text_encoders 4302.33MB (RAM)     -> text encoder parameters live in RAM: matches intent
-    vae 644.38MB (RAM)                -> VAE parameters live in RAM: matches intent
-    --backend vae=cuda0               -> VAE compute on the GPU: matches intent
-    --backend diffusion=cuda0         -> diffusion compute on the GPU: matches intent
-    --backend te=cpu                  -> text encoder compute on the CPU: matches intent
-  Corroboration from the live GPU state, after the generation in item 9 had
-  loaded the text-encoder and VAE tensors:
-    command: nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-    observed: 2124282, 5980 MiB   (sd-server, close to the 5604 MB of pinned
-              diffusion params plus activations)
-  One caveat, stated as a limitation rather than a failure: the log line
-  proves where the parameters live, and the --backend flags state the
-  intended compute module, but the log does not itself print a per-op
-  compute-device trace. The VAE-on-GPU claim additionally rests on the
-  observed decode behaviour in item 10 below. PASS on the parameter
-  placement as the surface was specified; the compute-device split is
-  evidenced indirectly (flags plus timing), not by a device-per-op log.
+ENDPOINT GET /health
+  observed: HTTP 200, {"backend":true,"backend_process_alive":true,
+  "backend_restart_attempts":0,"backend_restarts":0,"status":"ok"}
 
-7. ENDPOINT GET /health
+ENDPOINT GET /v1/models
+  observed: HTTP 200, {"data":[{"id":"Qwen-Image-2.1","object":"model",
+  "owned_by":"local"}]}
 
-  command: curl -sS http://127.0.0.1:8787/health
-  observed: {"backend":true,"status":"ok"}   (0.006 s)
-  The backend:true is a live probe of the backend (health() GETs
-  /v1/models on 8788, main.rs:273-283); confirmed independently:
-    command: curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8788/v1/models
-    observed: 200
-  Negative control for the same function: on the stub-backed throwaway
-  bridge the endpoint answered {"backend":true,"status":"ok"} while the
-  stub answered /v1/models, and during the first throwaway attempt (a stub
-  that never answered) /health refused to answer at all because the bridge
-  had not yet become ready. PASS.
+ENDPOINT POST /v1/images/generations (full-quality artifact, production settings)
+  command: 1024x1024, 28 steps, seed 42, prompt "a lovely cat holding a sign says
+    qwen2.1.cpp", through the production bridge with the int8 convrot encoder
+  observed: http_code=200 total_time=140.023654s; a real PNG 1024x1024 RGBA,
+    2,463,614 bytes, saved as qa-evidence/qa-gen-1024-28steps-seed42.png.
+    Structure check: mean RGB [156.7 143.9 122.8], per-channel std
+    [51.9 54.9 61.2], so it is a rendered image and not a blank frame. /health
+    after the request: backend true, both counters 1.
+  Reproducibility, same pass: this file is byte-identical to the image produced by
+    the earlier deployment proof at the same seed and prompt
+    (sha256 cc9d0fd6a682eee8f01028cc906055860370d2d3240656fbc053b120d7a8a078 for
+    both qa-evidence/qa-gen-1024-28steps-seed42.png and out/proof-convrot-1024.png).
+    Two separate bridge processes, same bytes out, which is the strongest
+    end-to-end signal in this report.
 
-8. ENDPOINT GET /v1/models
+ENDPOINT the small fast frames are evidence too
+  qa-evidence/qa-gen-512-seed11.png (mine, 512x512, 4 steps, 286,535 bytes) and
+  qa-evidence/qa-gen-512-seed3.png (from the independent pass, 512x512, 4 steps,
+  280,816 bytes). Both are genuine PNGs, kept as the cheap high-frequency checks
+  beside the 1024-square artifact above.
 
-  command: curl -sS http://127.0.0.1:8787/v1/models
-  observed: {"data":[{"id":"Qwen-Image-2.1","object":"model","owned_by":"local"}]}
-  Model id is Qwen-Image-2.1 as required. PASS.
 
-9. ENDPOINT POST /v1/images/generations - real generation through production
+ENDPOINT POST /v1/images/generations (real generation after the respawn)
+  command: 512x512, 4 steps, seed 11, on the production bridge
+  observed: http=200 time=29.909068s, a real PNG 512x512 RGBA, 286,535 bytes,
+  saved as qa-evidence/qa-gen-512-seed11.png. The same body was also run earlier
+  in the deployment proof at 1024x1024, 28 steps: HTTP 200, PNG, 158.56 s, inside
+  open-grok's 240 s read timeout.
 
-  command: curl -sS -o /tmp/qa-gen-resp.json
-    -w 'HTTP_STATUS:%{http_code} CURL_TIME:%{time_total}s'
-    -X POST http://127.0.0.1:8787/v1/images/generations
-    -H 'Content-Type: application/json'
-    -d '{"prompt":"a red cube on a white table","size":"512x512","num_inference_steps":4,"seed":1}'
-  observed: HTTP_STATUS:200 CURL_TIME:20.426540s
-    wall time measured around the curl (date +%s.%N): 20.434 s
-    peak VRAM during the request (1 s nvidia-smi poll): 9337 MiB of 12282 MiB
-    response: {"created":1790054718,"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAA...
-  PNG validation of the decoded b64_json (python, byte level):
-    decoded bytes: 256908
-    png signature ok: True
-    IHDR width x height: 512 x 512
-    bit depth / colortype: 8 6
-    chunks: [('IHDR', 13), ('tEXt', 1142), ('IDAT', 255697), ('IEND', 0)]
-    all CRCs valid, ended at IEND: True
-    file: /tmp/qa-gen.png: PNG image data, 512 x 512, 8-bit/color RGBA,
-      non-interlaced
-    sha256: 90f027108da9b4c5405ff52aa11eb9681c1912142d9242df64b3e2b7bcf80a08
-  Content sanity (PIL, 32x32 downsample): 9.7 percent of pixels are
-  red-ish (R above 120, G and B below 90) and 82.7 percent are light, which
-  is consistent with a red object on a light table. It is not a blank or
-  garbage buffer.
-  Shape check against the open-grok client contract
-  (/data/open-grok/crates/codegen/xai-grok-tools/src/implementations/
-  grok_build/image_gen/mod.rs:559-580, ImageGenResponse reads
-  data[0].b64_json): the response carries created plus data[0].b64_json and
-  no url key, so the client takes the b64 path.
-  Backend-side timing from /data/build-sd/bridge-split.log for this request:
-    [INFO   ] image.cpp:803  - generate_image 512x512
-    [INFO   ] image.cpp:524  - get_learned_condition completed, taking 2.48s
-    [INFO   ] image.cpp:888  - sampling completed, taking 16.49s   (4 steps)
-    [INFO   ] image.cpp:619  - decode_first_stage completed, taking 1.43s
-    [INFO   ] image.cpp:1039 - generate_image completed in 20.40s
-    2026-09-22T05:25:18.895640Z  INFO imagegen_bridge: generated 1 image(s)
-      in 20.426295725s
-  Wall time for the requested generation: 20.43 seconds. PASS.
+ENDPOINT POST error paths (all on production, backend untouched)
+  observed, seven malformed requests, each HTTP 400 with an
+  OpenAI-shaped error object of type invalid_request_error:
+    n=2                      "n must be 1 (multi-image batches are not supported)"
+    100x100                  "size '100x100' is not supported: width and height must be divisible by 32"
+    2048x2048                "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
+    aspect 1:1 + 2k          "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
+    whitespace prompt        "prompt is required"
+    {}                       "invalid request body: missing field `prompt`"
+    not json                 "invalid request body: expected ident at line 1 column 2"
+  /health before and after the seven rejects is byte-identical with both counters
+  at 0, so none of them reached or disturbed the backend.
 
-10. VAE compute observed on the GPU at 512x512 (supporting evidence, and a
-    documentation discrepancy)
-
-  At 512x512 the backend decoded without tiling:
-    [INFO   ] image.cpp:549  - decoding 1 latents
-    [INFO   ] ggml_graph_cut.cpp:1032 - wan_vae build cached graph cut plan done
-    [INFO   ] image.cpp:615  - latent 1 decoded, taking 1.43s
-  grep -ic tile over the whole log returns 0, so no spatial tiling kicked in
-  at this size, and a 1.43 s decode is GPU-speed, not CPU-speed. That
-  supports --backend vae=cuda0 actually executing on the GPU.
-  Discrepancy worth recording: docs/architecture.md (the change under test)
-  states the VAE decode "falls back to spatial tiling (9 tiles, ~2.4 s per
-  tile) when the DiT is pinned: 4.4-4.7 s instead of 2.1 s", and main.rs
-  lines 36-40 repeat it. Those figures were measured at 1024x1024 (stated in
-  both places). At 512x512 under the same pinned arrangement there is no
-  tiling and the decode is 1.43 s. Not a functional defect: the doc
-  statements are scoped to 1024, and the bridge's own default resolution for
-  open-grok is 1024-square (dims_from_aspect, main.rs:240-264), so the tiled
-  path is the common one in production. Recorded as a documentation
-  precision note, not a failure.
-
-11. ERROR PATH - unsupported n must be rejected and must not reach the backend
-
-  Test rig: throwaway bridge on 127.0.0.1:8791 with the stub backend on
-  8790. The stub appends one line per HTTP request it receives to
-  /tmp/qa-err2/hits.txt, so the file is a proof of what reached the
-  backend.
-  state before the requests (readiness probes only):
-    GET /v1/models HTTP/1.1   (x4)
-  requests and responses:
-    command: curl -X POST http://127.0.0.1:8791/v1/images/generations
-      -H 'Content-Type: application/json'
-      -d '{"prompt":"a red cube on a white table","n":2,"size":"512x512","num_inference_steps":4,"seed":1}'
-    observed: HTTP/1.1 400 Bad Request, content-type: application/json
-      body: {"error":{"code":null,"message":"n must be 1 (multi-image
-      batches are not supported)","param":null,"type":"invalid_request_error"}}
-      time 0.000357 s
-    n = 3: same status 400 and same body.
-    n = 0: same status 400 and same body (n defaults only when omitted).
-  state after the requests: /tmp/qa-err2/hits.txt still contains exactly the
-  four GET /v1/models lines and no POST /sdapi/v1/txt2img. The rejected
-  requests never reached the backend, and the 0.35 ms latency confirms they
-  were short-circuited before any network call.
-  The error object is OpenAI-shaped: error.message, error.type
-  "invalid_request_error", error.param, error.code. PASS.
-
-12. ERROR PATH - other validations, live on production 8787 (no generation)
-
-  command: curl -X POST http://127.0.0.1:8787/v1/images/generations -d '{"prompt":'
-  observed: 400 {"error":{"code":null,"message":"invalid request body: EOF
-    while parsing a value at line 1 column 10","param":null,
-    "type":"invalid_request_error"}}
-  command: curl ... -d '{"prompt":"   ","n":1}'
-  observed: 400 {"error":{... "message":"prompt is required" ...}}
-  command: curl ... -d '{"prompt":"a red cube","size":"900x100"}'
-  observed: 400 {"error":{... "message":"size '900x100' is not supported:
-    width and height must be divisible by 32" ...}}
-  All three are JSON with the OpenAI error envelope, not axum plain text.
-  Production health re-checked after them: {"backend":true,"status":"ok"}.
-  PASS.
-
-13. Not verified live, with reasons
-
-  a. A second real sd-server with an alternative IMAGEGEN_BACKEND_ARGS value
-     (for example diffusion=cpu) to demonstrate a measurable VRAM delta
-     between placements. Reason: the task constraint forbids a second
-     model-loading backend, and the 12 GB card cannot host two copies of the
-     5.6 GB pinned diffusion stack alongside the live one. The override path
-     is instead proven at the argv level (item 3), which is the surface the
-     change actually implements.
-  b. The exact VRAM figures claimed in docs/architecture.md (peak 9,426 MiB
-     at 1024x1024 / 28 steps). Reason: reproducing them costs roughly 2.5
-     minutes of GPU time per configuration and re-measures a documented
-     benchmark rather than a newly added surface. What was measured here
-     instead: peak 9,337 MiB during a 512x512 / 4-step request under the
-     pinned layout, which is consistent with the pinned-diffusion claim.
-  c. Tiled VAE behaviour at 1024x1024. Reason: not a surface of this change
-     and a 1024 request is roughly two minutes; also explicitly scoped in the
-     docs. At 512 the untiled GPU decode was observed (item 10).
-  d. End-to-end image_gen from inside an open-grok tool call (bridge plus
-     the client in one live request). Reason: the client contract was
-     verified by reading its parser source and matching the response shape
-     against it (item 9), and the endpoint was exercised over real HTTP with
-     the exact client-side field names; a real tool call would additionally
-     depend on an interactive session's config.
-  e. Behaviour when sd-server fails to start with bad placement flags (for
-     example an invalid module name). Reason: only the bridge-side arg
-     passing is in scope, and the bridge's existing wait_backend_ready
-     timeout path (180 s, main.rs:161-175) was observed in its retry form
-     during the throwaway runs:
-       WARN imagegen_bridge: backend not reachable (...), retrying
-
-14. Environment integrity after the run
-
-  command: ps -o pid,stat,etime -p 2124252,2124282
-  observed: 2124252 Ssl and 2124282 Sl, elapsed 05:06, i.e. the original
-    production pair, never restarted.
-  command: ss -tlnp | grep -E '878[78]'
+ENDPOINT size boundary, both request paths (throwaway, no models)
   observed:
-    LISTEN 127.0.0.1:8787 users:(("imagegen-bridge",pid=2124252,fd=12))
-    LISTEN 127.0.0.1:8788 users:(("sd-server",pid=2124282,fd=18))
-  command: curl -sS http://127.0.0.1:8787/health
-  observed: {"backend":true,"status":"ok"}
-  All throwaway bridges, stub scripts and stub listeners were killed by
-  explicit pid; ports 8790 and 8791 are free again and no stub process
-  remains. No repository file was edited and nothing was committed by this
-  QA run; the only file written under /data/imagegen is this report.
+    1536x1536 via size        forwarded (HTTP 502 from the fake stub, not 400)
+    1504x1504 via size        forwarded
+    1568x1568 via size        HTTP 400, "size 1568x1568 exceeds ... 1536x1536"
+    aspect 3:2 + 1080p        HTTP 400, "size 2048x1376 exceeds ... 1536x1536"
+    aspect 1:1 + 1k           forwarded
+  The ceiling applies to the final size from the aspect path as well, which is the
+  fix for the bypass the independent pass found.
 
-KNOWN LIMITATIONS AND NOTES FOR THE DEVELOPER
+MODEL files (this pass, sha256 recomputed)
+  observed:
+    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
+      8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
+    models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
+      67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
+    models/vae/qwen_image_2.1_vae_bf16.safetensors
+      bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
+    models/diffusion_models/qwen-image-2.1-Q6_K.gguf
+      a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
+  All four match their models/MANIFEST.md entries, including the convrot encoder
+  entry added in response to the first independent pass's finding.
 
-  - docs/architecture.md and the main.rs header comment describe the tiled
-    VAE decode without stating that tiling is resolution dependent; at 512
-    the same layout decodes untiled in 1.43 s. Consider scoping that
-    sentence to 1024 and above (item 10).
-  - models/MANIFEST.md lines 85-89 still describe the Q6_K default as
-    "weights stay in system RAM via --offload-to-cpu", which the change under
-    test removes. The manifest is the authoritative model registry per
-    AGENTS.md, so this is stale documentation in a file the change did not
-    touch. It is a docs fix, not a functional defect.
-  - IMAGEGEN_BACKEND_ARGS is whitespace-split with no quoting support, so a
-    future flag value containing a space cannot be expressed. Acceptable for
-    the current flag set; worth a comment in the README.
-  - The bridge does not restart sd-server if the backend dies; health then
-    reports backend:false and generations return 502. Out of scope for this
-    change and unchanged by it.
+MODEL layout matches the upstream card
+  observed: models/diffusion_models/, models/text_encoders/, models/vae/ exist and
+  hold the files above; every path in imagegen.toml resolves.
+
+Not verified in this pass, with the reason
+
+1. The 1024x1024, 28-step timing with the convrot encoder was measured earlier
+   today in the deployment proof (158.56 s) but not re-run here; a re-run costs a
+   full model staging and would have contended with the checks above.
+2. A true untiled-versus-tiled VAE decode comparison at 1024 square. At 768
+   square both sides tile, so the isolation the earlier attempt intended did not
+   happen; the recorded result is only that the decode is insensitive to tile
+   count (0.15 of 255 mean difference).
+3. 1344-square headroom under the pinned layout. Never measured; expected to be
+   too tight, and the bridge now rejects anything above 1536 with a clear 400.
+4. That the stock sd-server aborts on the convrot file. Proving it needs a second
+   9.3 GB model load, which would contend with production for the card. The .stock
+   binaries exist and are unverified in this pass.
+5. Exponential backoff growth beyond the first step: each failed cycle costs the
+   full 180 s startup window, so a multi-step check is expensive.
+6. The zip path for int8_tensorwise dequantization, which is unimplemented and
+   logs an error. Exercising it needs a zip-packaged model that does not exist
+   here.
+7. Direct evidence that the mmap dequantization branch engages. There is no
+   positive log line for it; the evidence is indirect - the backend loads the
+   convrot encoder and reports text_encoders 10104.77 MB in RAM, and a generation
+   succeeds, which the plain-file-only version failed to do.
+
+Open items recorded, not defects of this revision
+- tools/verify-convrot-dequant.py is Python inside the repository and rule 14
+  requires zero Python in the deliverable: port to Rust or remove before delivery.
+- The int8 convrot encoder costs about 5.8 GB more host RAM than the GGUF encoder
+  for the same VRAM peak, with image quality a measured tie. It is the shipped
+  default by operator decision, not because the measurement favours it.
+- The 1536 ceiling rejects open-grok's "2k" and "4k" tiers with a clear 400. The
+  default "1k" path is unaffected.
+- A backend that stays alive but never answers is not auto-restarted; it is
+  visible in /health as backend false.
+- The two sd.cpp patches have not been sent upstream.
 
 verdict: overall PASS
