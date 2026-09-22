@@ -232,6 +232,18 @@ a direct sd-cli job.
 
 ## Quality and open-grok on-demand (Unit 2 findings)
 
+- Step count matters more than any other single request field at this size, and
+  the deployed default of 28 exists for that reason. Measured 2026-09-22 at 1152
+  square, same prompt and seed 5, 8 steps against 28: the mean image gradient
+  rises from 1.24 to 3.68 and the Laplacian mean from 3.75 to 9.25 (standard
+  deviation 4.63 to 16.98), i.e. the 8-step image carries roughly a third of the
+  high-frequency detail; 46.6 percent of pixels differ by more than 32 of 255. An
+  independent visual read called the 8-step frame hazy and soft throughout, with
+  an illegible sign, a placard detached from the cat and malformed paws, against
+  a sharp 28-step frame with legible lettering. A short-step request is a fit
+  probe, never a quality sample: qa-evidence/qa-gen-1152-8steps-seed5.png and
+  qa-gen-1152-28steps-seed5.png are that pair. The bridge defaults to 28 steps
+  (imagegen.toml) whenever the client does not send num_inference_steps.
 - Quality on a 12 GB card is bounded by VRAM. Q4_K_M @ 1024 peaks ~11.5 GB.
   The practical higher-quality point is the Q6_K diffusion model (5.88 GB,
   near-lossless), which is the deployed default: parameters pinned in VRAM
