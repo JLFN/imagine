@@ -1,6 +1,15 @@
 # model files are downloads, never committed
 models/*
 !models/MANIFEST.md
+# and no model file may be committed from anywhere else either: an hf download
+# run with the repo root as its working directory has already dropped a
+# 9.35 GB encoder into ./text_encoders/ once (2026-09-22), and it was not
+# ignored at the time
+*.safetensors
+*.gguf
+*.ckpt
+# hf CLI cache, created wherever hf download is invoked
+.cache/
 # runner binary
 bin/
 # generated test images
