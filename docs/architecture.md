@@ -95,14 +95,81 @@ What the measurements establish:
   IMAGEGEN_BACKEND_ARGS). Through the bridge, a first 1024-square/28-step
   request returned HTTP 200 with a 1024x1024 PNG in 143.6 s, inside
   open-grok's 240 s read timeout.
-- 1344-square was measured earlier only with --offload-to-cpu (peak 11.1 GB).
-  With the DiT pinned permanently the same tier is UNVERIFIED and expected to
-  be too tight; measure before claiming it.
+- 1344 square does NOT fit under the pinned layout: the sampling graph fails
+  during weight preparation, short by about 0.2 MB of its budget. 1152 square is
+  the largest verified tier. The tiled decode is now quantified against the
+  untiled one. See Resolution headroom and the VAE decode below.
 
 Layout is not bit-reproducible: the same seed and prompt under two layouts
 differed on 90% of channel bytes (mean absolute difference 6.07 of 255).
 Structurally identical images, but do not expect byte equality across
 placement changes.
+
+## Resolution headroom and the VAE decode (measured 2026-09-22)
+
+Two questions were open: does the pinned layout reach the 1344-square tier at
+all, and is the tiled VAE decode it falls back to at 1024 indistinguishable from
+the untiled decode. Both are now measured with sd-cli (the patched build),
+prompt "a lovely cat holding a sign says 'qwen2.1.cpp'", seed 42, euler, cfg 6.0,
+peak VRAM from a 1 s nvidia-smi poll and host RSS from /usr/bin/time -v - the same
+method as the placement table above.
+
+Resolution headroom, 1344x1344 / 40 steps, one variable per row:
+
+  layout                          encoder  result  sampling  decode      total     peak VRAM  peak RSS
+  1152 sq, pinned (1152x1152)     GGUF     ok      269.29 s  5.13 tiled  275.88 s  10,060 MiB  6.4 GiB
+  1344 sq, pinned                 convrot  FAILED  -         -           exit 1    11,280 MiB  9.7 GiB
+  1344 sq, pinned                 GGUF     FAILED  -         -           exit 1    10,756 MiB  5.1 GiB
+  1344 sq, pinned, max-vram=11    GGUF     FAILED  -         -           exit 1    11,068 MiB  5.1 GiB
+  1344 sq, --offload-to-cpu       convrot  ok      470.59 s  8.16 tiled  502.54 s  11,276 MiB  16.1 GiB
+
+What that establishes:
+
+- The pinned layout's ceiling sits between 1152 and 1344 square. The failure is
+  not a slow path or a partial image: it happens during weight preparation of the
+  sampling graph, before the first step runs, so the step count is irrelevant by
+  construction (a 12-step attempt fails the same way).
+- The failure is razor-thin and encoder-independent. Both encoders fail with the
+  identical allocation demand (need 622.61 MB against 622.44 MB available, a
+  0.17 MB shortfall), because the encoder's parameters live in RAM either way.
+  Do not read the margin as "almost fits": the check leaves a 512 MiB scratch
+  reserve, so the true deficit is larger than the printed one.
+- An explicit --max-vram budget does not rescue it. --max-vram shapes the planner
+  and auto-fit budgets, and an explicit --params-backend disables auto-fit, so
+  the runner's segment-capacity check fails the same way.
+- The documented fallback for 1344 square is the layout the upstream card itself
+  uses: --offload-to-cpu, all 16.4 GB of parameters in RAM. It works and it is
+  slow: 470.59 s of sampling (11.76 s per step) and 16.1 GiB of host RSS. This is
+  a direct sd-cli job, NOT a bridge request: the pinned backend holds 5.6 GB of
+  VRAM, the offload layout peaks at 11.3 GB, and the two cannot run at once.
+- Requests at 1152 square do not fit open-grok's 240 s read timeout at 40 steps
+  (275.88 s here); the practical on-demand tier inside open-grok remains
+  1024 square at 28 steps, measured at 143.6 s through the bridge.
+
+The VAE decode, tiled against untiled, at 1024x1024 / 28 steps / seed 42 under
+--offload-to-cpu (the DiT must NOT be pinned, or the untiled decode cannot be
+allocated at all, which is what made the earlier 768-square attempt inconclusive:
+both sides tiled there, 3x3 by automatic retry against 2x2 forced):
+
+  decode path                decode time  peak VRAM
+  untiled (default)          2.09 s       11,558 MiB
+  --vae-tiling forced (3x3)  4.04 s        8,692 MiB
+
+  pixel differences, untiled against tiled, same seed:
+    mean absolute difference  0.2847 of 255
+    maximum absolute          25
+    pixels differing at all   44.81 percent
+    differing by more than 8  0.03 percent
+    differing by more than 32 0.00 percent
+
+The differences are tile-seam localised, which is what a spatially tiled decode
+should produce: the mean absolute difference inside the 16-pixel bands around the
+tile boundaries is 0.64-0.75 against 0.52 over the whole image, and the single
+largest deviation (25) sits at the seam at column 334. So the tiled decode the
+pinned layout falls back to at 1024 square is a faithful approximation of the
+untiled one, with seam-localised deviations under one part in 250 of the range -
+no longer merely "visually unverified" as the placement section said. It costs
+roughly 2 s more per 1024-square request and saves about 2.9 GB of decode peak.
 
 ## Configuration and supervision (2026-09-22)
 
@@ -146,11 +213,22 @@ than leaving the bridge unreachable. Two limits are worth knowing:
   which happens before weights are loaded. The first request after a restart
   therefore pays the full model staging cost.
 
-Requests are bounded: width and height must be divisible by 32 and at most 1536
-on either edge, checked on the final size from BOTH request paths (an explicit
-size, and open-grok's aspect_ratio plus resolution). A larger request receives
-HTTP 400 naming the limit, because it cannot fit this card and would otherwise
-fail the generation or abort the backend.
+Requests are bounded: width and height must be divisible by 32, and no edge may
+exceed max_edge (imagegen.toml, default 1152), checked on the final size from
+BOTH request paths (an explicit size, and open-grok's aspect_ratio plus
+resolution). A larger request receives HTTP 400 naming the size, the ceiling and
+the reason, because it cannot fit under the configured layout and would otherwise
+fail the generation after ~35 s with an opaque backend error.
+
+The ceiling is a property of the layout in backend_args, not of the card, which
+is why it is a configuration value rather than a compiled constant: it is set to
+the measured pinned-layout ceiling (1152) and must be raised together with a
+layout that can serve more. Before 2026-09-22 the bridge advertised 1536 while the
+deployed layout could not serve anything above 1152, so a 1344-square request was
+accepted and then failed inside the backend - the same class of defect as a
+silently dead backend. Serving 1344 square through the bridge would additionally
+require taking the warm backend down (see Resolution headroom above), so it stays
+a direct sd-cli job.
 
 ## Quality and open-grok on-demand (Unit 2 findings)
 
