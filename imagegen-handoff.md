@@ -1,15 +1,48 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: e7c478f
+last_updated_commit: 0b6f338
 branch: dev
+work_branch: feature/image-edit-probe (in flight, off origin/dev, commit 588ac82)
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~35% (signals.json, session 01a0c84e)
-handoff_written_at: 2026-09-22T10:20:00Z
-session_id: 01a0c84e-dd01-7cc1-a95c-b8c755cc7353
+handoff_written_at_context_usage: 40% (signals.json, session 01a0de48)
+handoff_written_at: 2026-09-26T17:55:00Z
+session_id: 01a0de48-f809-7353-a458-31b3f19d943f
 ---
+--- handoff probe (auto) ---
+=== handoff probe (imagegen) ===
+--- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
+4e8f1a0 feat(bridge): pin Q6_K diffusion in VRAM and run the text encoder on CPU
+9169fed feat(bridge): on-demand OpenAI image API bridge over sd-server
+347ed52 docs(handoff): mark Unit 1 complete and plan Unit 2 (Rust bridge)
+6b17eee feat(recipe): first real Qwen-Image-2.1 image on the workstation
+--- progress diff stat:
+.gitignore                                         |   13 +-
+ Cargo.lock                                        | 1228 ++++++++++++++++++++
+ Cargo.toml                                        |    7 +
+ crates/bridge/Cargo.toml                          |   16 +
+ crates/bridge/README.md                           |   87 ++
+ crates/bridge/src/main.rs                         |  777 +++++++++++++
+ docs/architecture.md                              |  173 ++-
+ docs/convrot-encoder-experiment.md                |  234 ++++
+ imagegen-handoff.md                               |  216 ++++
+ imagegen.toml                                     |   57 +
+ models/MANIFEST.md                                |  115 ++
+ ...01-sd-cpp-llm-te-config-skip-weight-scale.patch |   53 +
+ ...-cpp-dequantize-int8-tensorwise-embedding.patch |  172 +++
+ qa-evidence/qa-gen-1024-28steps-seed42.png         |  Bin 0 -> 2463614 bytes
+ qa-evidence/qa-gen-512-seed11.png                  |  Bin 0 -> 286535 bytes
+ qa-evidence/qa-gen-512-seed3.png                   |  Bin 0 -> 280816 bytes
+ qa-evidence/qa-report.md                           |  218 ++++
+ tools/convrot-te-experiment.sh                     |   72 ++
+ tools/verify-convrot-dequant.py                    |  105 ++
+ 19 files changed, 3529 insertions(+), 14 deletions(-)
+--- staleness (last_updated_commit e7c478f .. HEAD):
+0b6f338 docs(handoff): record Units 7 and 8 as open PRs and plan Unit 9
+--- end handoff probe ---
 
-Handoff + executable plan — imagegen (2026-09-22)
+
+Handoff + executable plan — imagegen (2026-09-26)
 
 0. Rules for writing THIS document (read before editing, not just before reading)
 
@@ -26,8 +59,9 @@ Handoff + executable plan — imagegen (2026-09-22)
 
 1. Session protocol
 
-This project is a sequence of units. Units 1-6 are complete on dev. Units 7 and 8
-are complete but in flight as reviewed PRs (see section 2).
+This project is a sequence of units. Units 1-6 are complete on dev. Units 7
+and 8 are complete but still in flight as reviewed PRs (section 2). Unit 10
+(the image-edit path) is in flight as a probe branch (section 2, section 3).
 
 On completing a unit: do not stop at the boundary. Read the session's
 signals.json (sessions/<percent-encoded-cwd>/<session-id>/ under
@@ -39,10 +73,10 @@ signals.json (sessions/<percent-encoded-cwd>/<session-id>/ under
 The final commit of each unit carries the trailer "Unit: <N> complete" as
 its last body line (git log --grep "Unit: .* complete").
 
-BRANCH MODEL (rule 23, now that a remote exists): dev is the integration
-branch and the local working line. Every unit is a short-lived work branch off
-the dev tip, pushed, and merged through a REVIEWED PR on GitHub; only handoff
-and QA-evidence commits go directly on dev. main does not exist yet (section 3).
+BRANCH MODEL (rule 23): dev is the integration branch and the local working
+line. Every unit is a short-lived work branch off the dev tip, pushed, and
+merged through a REVIEWED PR on GitHub; only handoff and QA-evidence commits
+go directly on dev. main does not exist yet (section 3).
 
 PARALLEL WORK: a sibling repo /data/imagegen-rs contains a pure-Rust port of the
 whole generation stack (candle: tokenizer, Qwen3-VL text tower, 32-block DiT, Wan
@@ -50,92 +84,85 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-22 — Units 7 and 8 done, open PRs awaiting review)
+2. Current state (2026-09-26 — edit path measured; Units 7 and 8 still open PRs)
 
-- dev is at e7c478f and pushed to the private remote JLFN/imagegen. Unit 7 and
-  Unit 8 are NOT on dev yet; they are open PRs, which is the point of the review
-  flow the operator chose.
-- PR 1, branch feature/unit7-resolution-and-port (2 commits): 1344 square measured
-  (does NOT fit the pinned layout; --offload-to-cpu serves it at 502.54 s and
-  16.1 GiB), the tiled-versus-untiled VAE decode isolated at 1024 square (mean
-  0.2847 of 255, deviations at the seams), the rule 14 Python verifier ported to
-  crates/convrot-verify and deleted, the bridge request ceiling added as max_edge
-  (default 1152, the measured value; it used to advertise 1536 while the layout
-  could not serve above 1152), and the project's first test suite (tests/run.sh
-  plus the rule 19 mount tests/qa-gate.sh).
-- PR 2, branch feature/on-demand-lifecycle (STACKED on PR 1, 1 commit):
-  hook-driven lifecycle. PreToolUse on the image tools runs
-  packaging/hooks/ensure-imagegen-bridge (health probe, systemd start, detached
-  fallback, fail-open, logged); SessionEnd runs packaging/hooks/stop-imagegen-bridge
-  (refuses while another session is alive or in_flight > 0, --force overrides);
-  the bridge stops itself after idle_timeout_secs (900 default) and reports
-  in_flight / idle_secs / idle_timeout_secs in /health; it now handles SIGTERM so a
-  systemd stop reaps sd-server; packaging/imagegen-bridge.service is the unit
-  (installed, not enabled).
-- Verified live today: 1152 works pinned (peak 10,060 MiB), 1344 fails pinned for
-  both encoders, offload 1344 works; tiled decode measured against untiled; the
-  Python port reproduces the Python baseline to every printed digit; a fresh
-  headless session started the bridge through the hook and got a 1024x1024 PNG in
-  175.28 s; the idle timer exited at 48 s with a 20 s timeout, leaving no backend.
-- Machine paths for the lifecycle: hook registration ~/.opengrok/hooks/imagegen-bridge.json;
-  scripts symlinked from ~/.opengrok/hooks/bin into /data/imagegen/packaging/hooks/;
-  unit ~/.config/systemd/user/imagegen-bridge.service; lifecycle log
-  ~/.local/state/ensure-imagegen-bridge.log; bridge log /data/build-sd/bridge-split.log.
-- The bridge is currently unit-managed and up (this session restarted it through the
-  ensure hook, so it is the systemd instance, not a detached one).
+- dev is at 0b6f338, pushed to the private remote JLFN/imagegen. Units 7 and 8
+  are STILL NOT on dev: verified 2026-09-26 with gh pr list --state open, which
+  shows PR 1 (feature/unit7-resolution-and-port -> dev) and PR 2
+  (feature/on-demand-lifecycle, stacked on PR 1). Nothing new may merge until
+  PR 1 lands.
+- In flight: feature/image-edit-probe, off origin/dev, commit 588ac82
+  (docs-only). It carries the measured image-edit findings and NO code yet.
+- Image editing WORKS end to end through the runner; the bridge has no route
+  for it. Backend contract and measurements are in docs/architecture.md,
+  "Image editing (measured 2026-09-26)"; model facts in models/MANIFEST.md.
+- Vision weights: the deployed int8 convrot encoder is a COMBINED encoder
+  (1,258 tensors, 351 of them model.visual.*), so it edits with --llm alone.
+  The GGUF encoder is LLM-only and needs the mmproj projector; that file was
+  downloaded, measured, then deleted at the operator's request (re-download is
+  a 30 s hf call; the manifest records its checksum).
+- Measured, 1024 square / 28 steps / seed 42 / DiT pinned / VAE parameters in
+  RAM, one run each: GGUF Q4_K_M plus mmproj 334.26 s, peak VRAM 9,207 MiB,
+  peak RSS 7.4 GiB; convrot alone 426.24 s, peak VRAM 9,304 MiB, peak RSS
+  12.8 GiB. Both exceed open-grok's 240 s read timeout; sampling rates match
+  (7.05 against 7.10 s/it), so the whole gap is conditioning.
+- Machine state verified this session: no bridge and no sd-server running, GPU
+  idle at 331 MiB, no stray probe processes or sampler loops.
+- The rule 18 precondition was met for the memory work: localembed healthy at
+  127.0.0.1:8765 (multilingual-e5-small, 384 dims, loaded true).
 
-3. Next unit plan — Unit 9: land the two PRs, then close the gaps they exposed
+3. Next unit plan — Unit 10: serve image editing through the bridge
 
-Status: two PRs are open and green (QA gate passed on both branches, osv clean at
-155 packages, 0 vulnerable). Nothing new may start until PR 1 merges: rule 23
-allows one in-flight unit at a time, and PR 2 is stacked on PR 1.
+Prerequisite (operator action, unchanged from Unit 9): land the open PR stack —
+review and merge PR 1 into dev, retarget PR 2's base to dev (gh pr edit 2
+--base dev), refresh it with dev, confirm its diff is only Unit 8, then merge.
+Rule 23 allows one in-flight unit, so settle the stack before pushing Unit 10.
 
-- Phase 1, land the stack (operator action, then mine). Review and merge PR 1 into
-  dev; then retarget PR 2's base to dev (gh pr edit 2 --base dev), refresh it with
-  dev (git fetch && git checkout feature/on-demand-lifecycle && git merge origin/dev),
-  confirm its diff is now only Unit 8, self-review the QA gate output, and merge.
-  Acceptance: dev contains Units 7 and 8; git log --oneline origin/dev shows the
-  two unit commits; both branches deleted after merge (git branch -d and
-  git push origin --delete).
+- Phase 1, decide the edit encoder and the latency budget. The measured
+  configurations both miss the 240 s open-grok read timeout, so the budget must
+  be found before the route is written. Candidates, all UNMEASURED: fewer steps
+  (16 steps at 7.05 s/it samples ~113 s, total ~250 s, still marginal); a
+  smaller edit resolution (fewer image tokens, cheaper ViT forward); moving the
+  text-encoder GRAPH to the GPU while its parameters stay in RAM (--backend
+  te=cuda0 with --params-backend te=cpu), which risks OOM on a 12 GB card that
+  already holds the pinned DiT. Also decide the encoder: GGUF plus mmproj is
+  92 s faster per edit but needs the 752 MB file re-downloaded; convrot needs
+  no extra file and is the deployed default. Acceptance: a measured edit under
+  240 s, end to end, with the chosen settings written into imagegen.toml or the
+  bridge defaults.
+- Phase 2, the bridge route. Add POST /v1/images/edits to
+  crates/bridge/src/main.rs (today it registers only /v1/models,
+  /v1/images/generations, /health — lines 753-755). open-grok's client posts
+  JSON to {base_url}/images/edits with model, prompt, n, resolution,
+  response_format, and "image" (one data URL) or "images" (array) plus
+  aspect_ratio; the backend wants multipart (prompt, image[], image, mask, n,
+  size, output_format). So the route must decode base64 data URLs and re-encode
+  multipart toward sd-server, which needs reqwest's multipart feature in
+  crates/bridge/Cargo.toml. Acceptance: a real request from open-grok's own
+  client shape reaches the backend and returns a PNG; a unit test covers the
+  data-URL to multipart translation.
+- Phase 3, the guardrails the edit path currently bypasses: the max_edge
+  ceiling (default 1152) and the generation defaults (28 steps, cfg 6.0) are
+  applied on the generation path only. Note that sd.cpp's own edit examples use
+  cfg-scale 2.5 (docs/qwen_image_edit.md), so edit defaults must be chosen
+  deliberately, not inherited. Acceptance: an over-limit or malformed edit
+  request gets a 400 naming the limit, exactly as generation does.
+- Phase 4, verification and QA under rule 19: run the QA gate, record an edit
+  run in qa-evidence/, write the edit section of crates/bridge/README.md, and
+  rebuild the graphify graph at commit time. Then the PR into dev.
+- Phase 5, wrap: fold the probe outcome into section 2, replace section 3,
+  refresh the memory entry (imagegen-fadeb80d — the LIVE workspace key; the
+  older imagegen-e61a3c5c is orphaned by the 2026-09-22 remote creation, and
+  its content was migrated into the live key on 2026-09-26), and close with
+  "Unit: 10 complete".
 
-- Phase 2, main and protection (rule 23). Create main at the post-merge dev state
-  (or at the last release point the operator prefers), push it, protect dev and
-  main on GitHub (require PR review, block force-push), and record the promotion
-  flow in this handoff. Acceptance: gh api shows the protection rules; a direct
-  push to dev/main is refused.
-
-- Phase 3, register or correct the localembed ensure hook. Found 2026-09-22:
-  ~/.opengrok/memory/MEMORY.md and global rule 18 both describe
-  hooks/bin/ensure-localembed as a SessionStart auto-start hook, but NO hooks json
-  registers it (the three/four registered files are callgraph, handoff,
-  imagegen-bridge, skill-allowlist), and it is absent from a sweep of the project
-  hook dirs. Either register it (mirroring imagegen-bridge.json) or correct the
-  memory and rule text. Acceptance: the docs and the machine agree, verified by
-  listing the registered hooks and by a probe session.
-
-- Phase 4, the docs inaccuracies the review may not catch. crates/bridge/README.md's
-  configuration table lists an IMAGEGEN_DIFFUSION default of Q4_K_M, its own
-  following paragraph says Q6_K, and the binary has no model default at all (a
-  missing path is a startup error, exit 2, verified live in Unit 6). Fix the table
-  to say the value comes from imagegen.toml. Acceptance: the README makes one
-  claim about the default and it is the true one.
-
-- Phase 5, upstream the sd.cpp patches (still open from Unit 7). patches/0001
-  fixes a genuine sd.cpp defect (a safetensors text encoder carrying a weight_scale
-  tensor gets its geometry misread) and 0002 is the int8 embedding
-  dequantization. Both need re-applying on every upstream update otherwise. This
-  is an EXTERNAL, public action: get the operator's go-ahead before opening a PR
-  against leejet/stable-diffusion.cpp.
-
-- Phase 6, optional quality work (operator asked about image quality 2026-09-22).
-  No quality standard exists in this project: every quality statement is relative
-  (precision tiers measured a tie, step count measured dominant). Options: name
-  qa-evidence/qa-gen-1024-28steps-seed42.png as the reference artifact and define
-  what acceptable means; or measure 1024/28 against 1152/28 at the same seed and
-  prompt. Decide with the operator before building anything.
-
-- Phase 7, wrap. Fold Units 7 and 8 into section 2, replace section 3, refresh the
-  memory entry (imagegen-e61a3c5c), and close with "Unit: 9 complete".
+Still open from Unit 9, not yet done anywhere: create main and protect dev and
+main on GitHub; register or correct the ensure-localembed hook (the docs
+describe it, no hooks json registers it); fix crates/bridge/README.md's
+configuration table, which names an IMAGEGEN_DIFFUSION default the binary does
+not have; upstream patches/0001 and 0002 to leejet/stable-diffusion.cpp (an
+EXTERNAL action, needs the operator's go-ahead); define what acceptable image
+quality means (no quality standard exists in this project).
 
 4. Project facts a fresh session cannot re-derive
 
@@ -147,11 +174,18 @@ allows one in-flight unit at a time, and PR 2 is stacked on PR 1.
   stable-diffusion.cpp is the source tree matching the installed sd-cli and
   sd-server (upstream master 6dcb5bb, built with SD_CUDA=ON, SD_USE_UPSTREAM_GGML
   OFF, i.e. the patched ggml that accepts int8 convrot files). Its docs/
-  (qwen_image_2.1.md, backend.md, int8_convrot.md) are the authority for flag
-  semantics. Measurement logs and harnesses: /data/build-sd/te-split (prod/, q6/,
-  refined/, unit7/ with the Unit 7 measurement set and logs, measure-unit7.sh, and
-  e2e-hook-test.sh for the Unit 8 hook test). The bridge's own log is
-  /data/build-sd/bridge-split.log.
+  (qwen_image_2.1.md, qwen_image_edit.md, backend.md, int8_convrot.md) are the
+  authority for flag semantics. Measurement logs and harnesses: /data/build-sd/te-split
+  (prod/, q6/, refined/, unit7/ with the Unit 7 measurement set and logs,
+  measure-unit7.sh, and e2e-hook-test.sh for the Unit 8 hook test). The bridge's
+  own log is /data/build-sd/bridge-split.log.
+- Image-edit facts (measured 2026-09-26, full detail in docs/architecture.md):
+  the backend already serves POST /v1/images/edits as multipart and dispatches
+  the uploads into gen_params.ref_images; vision weights are required and the
+  deployed convrot encoder supplies them; both measured configurations missed
+  the 240 s timeout. Probe artefacts are gitignored under out/:
+  out/probe-edit.* (GGUF plus mmproj), out/probe-a2.* (convrot alone),
+  out/probe-matrix.sh (the harness), out/first.png (the reference image).
 - Lifecycle (Unit 8): the hook registration is global
   (~/.opengrok/hooks/imagegen-bridge.json, events PreToolUse ^(image_gen|image_edit)$
   and SessionEnd); the scripts it runs are versioned in the repo under
@@ -166,16 +200,25 @@ allows one in-flight unit at a time, and PR 2 is stacked on PR 1.
 - Rebuilding: bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
   (and -b convrot-verify for the verifier). The builder deletes target/ each time
   and copies into bin/.
-- Machine facts: x86-64, Intel i7-14700F, 31 GB RAM, RTX 4070 SUPER 12 GB, ~400 GB
-  free on /. A secret-free local API key string is fine for the bridge (endpoint is
-  127.0.0.1). The NVIDIA Spark (192.168.1.91) is NOT involved in image generation.
+- Machine facts: x86-64, Intel i7-14700F, 31 GB RAM, RTX 4070 SUPER 12 GB
+  (12,282 MiB), ~400 GB free on /. A secret-free local API key string is fine for
+  the bridge (endpoint is 127.0.0.1). The NVIDIA Spark (192.168.1.91) is NOT
+  involved in image generation. Another project (/data/ds4) benchmarks models on
+  the same GPU: check nvidia-smi before any generation and never run two sd-cli
+  processes at once.
 - Stray model downloads: an hf download run once dropped an identical 9.35 GB copy
   of the int8 convrot encoder at /data/imagegen/text_encoders/. It is gitignored
   and was left for the operator to remove; check before deleting anything.
+- Model inventory on disk (models/ is gitignored; see models/MANIFEST.md for
+  checksums): Q6_K (deployed diffusion default) and Q4_K_M diffusion GGUFs, the
+  UC uncensored Q4_K_M finetune, the GGUF Q4_K_M encoder, the int8 convrot
+  encoder (deployed default), the VAE. No mmproj (deleted 2026-09-26).
 - open-grok's image tool: ImageGenClient in
   /data/open-grok/crates/codegen/xai-grok-tools/src/implementations/grok_build/image_gen/mod.rs,
   a pure HTTP client (no process spawning) with a 300 s total and 240 s read
-  timeout. That is why the lifecycle is hook-driven rather than tool-driven.
+  timeout; image_edit/mod.rs is the edit client that posts JSON to
+  {base_url}/images/edits. That is why the lifecycle is hook-driven rather than
+  tool-driven.
 
 5. Guardrails and open items
 
@@ -187,13 +230,17 @@ allows one in-flight unit at a time, and PR 2 is stacked on PR 1.
   model is a user-chosen parameter (the operator has asked for self-verification
   by the primary agent for Units 6-8; an independent model was used earlier).
 - OPEN items:
-  1. PR 1 then PR 2 await review and merge (section 3 phase 1).
+  1. PR 1 then PR 2 await review and merge (section 3 prerequisite).
   2. main does not exist and neither dev nor main is protected on GitHub yet.
   3. The ensure-localembed hook described in the docs is not registered anywhere.
   4. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead).
-  5. No quality standard is defined anywhere in the project (section 3 phase 6).
+  5. No quality standard is defined anywhere in the project.
   6. SessionEnd does not fire in headless open-grok runs (measured), so the stop
      hook covers interactive sessions and the idle timer covers headless ones.
+  7. The edit path misses open-grok's 240 s read timeout at 1024 square and 28
+     steps; the budget work is Unit 10 phase 1 and is not yet done.
+  8. The convrot encoder's built-in vision tower is used by editing, but whether
+     it carries the same quality as the separate mmproj is unmeasured.
 
 6. Progress and staleness check (run this first, every session)
 
@@ -204,7 +251,7 @@ Progress meter:
     git log --grep "Unit: .* complete" 7443adfcd22374ddaa3e2139287e83a78d431367..HEAD
 
 Staleness check:
-    cd /data/imagegen && git log --oneline e7c478f..HEAD
+    cd /data/imagegen && git log --oneline 0b6f338..HEAD
 - Any output means this handoff predates newer work: read the log and diffs
   before trusting sections 2-5, then advance last_updated_commit.
 - Branch or remote differing from the frontmatter: stop and reconcile.
