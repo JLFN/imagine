@@ -1,12 +1,12 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 3f3843e
+last_updated_commit: 90618e4
 branch: dev
-work_branch: feature/image-edit-probe (in flight: 588ac82 docs, 8922ae2 edit route)
+work_branch: feature/image-edit-probe (Unit 10, tip 511c061, four commits, only 588ac82 pushed)
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~80% (signals.json, session 01a0de48)
-handoff_written_at: 2026-09-26T18:25:00Z
+handoff_written_at_context_usage: ~65% (signals.json, session 01a0de48)
+handoff_written_at: 2026-09-26T20:20:00Z
 session_id: 01a0de48-f809-7353-a458-31b3f19d943f
 ---
 --- handoff probe (auto) ---
@@ -59,83 +59,75 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-26 — edit path blocked by a backend request limit)
+2. Current state (2026-09-26 — image editing works; Unit 10 complete)
 
-- dev is at 3f3843e and pushed. Units 7 and 8 are STILL open PRs (verified this
-  session with gh pr list --state open): PR 1 feature/unit7-resolution-and-port
-  into dev, PR 2 feature/on-demand-lifecycle stacked on PR 1. Nothing merges
-  until PR 1 lands, and rule 23's one-unit-in-flight rule is currently bent by
-  the probe branch below.
-- feature/image-edit-probe is pushed with two commits: 588ac82 (the measured
-  edit findings) and 8922ae2 (the /v1/images/edits route, seven passing unit
-  tests, README and docs). 8922ae2 is NOT pushed: its QA verdict is FAIL, so it
-  must not go up as a deliverable until the blocker is resolved.
-- THE BLOCKER, measured: sd-server stops answering when the request body is
-  large. With a 64x64 reference held fixed and only the PROMPT padded (so the
-  image, its base64 and the ref_images parsing are all constant), a 495-byte
-  body and an 8,495-byte body both return HTTP 200, while a 64,495-byte body
-  receives NO response for the full 600 s client timeout, returns zero bytes,
-  and leaves the server alive. Suppressing curl's Expect: 100-continue changes
-  nothing and httplib's payload cap is not it (default SIZE_MAX, never
-  lowered). The signature is a HANG, not a rejection, which points at the
-  server's read of a body arriving in several TCP segments rather than at a
-  configured maximum. The boundary is bracketed to 8,495 B .. 64,495 B.
-- Latency, measured with sd-cli at 1024 square, 28 steps, seed 42, convrot
-  encoder, DiT pinned: 426.24 s at the deployed placement (9,304 MiB peak);
-  249.56 s with the text-encoder GRAPH on the GPU and its parameters still in
-  RAM (11,185 MiB peak); 243.35 s at 768 square at the deployed placement
-  (8,069 MiB peak). Nothing measured yet comes in under open-grok's 240 s.
-- Vision weights: the deployed convrot encoder is a combined encoder (351 of its
-  1,258 tensors are model.visual.*), so editing needs no mmproj. The GGUF encoder
-  is LLM-only and does (measured 92 s faster per edit at 334.26 s); the projector
-  was downloaded, measured, and deleted at the operator's request.
-- New on disk: models/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf (the
-  uncensored finetune, hash-verified e79c8a00...). The Uncensored repo rehosts
-  byte-identical copies of this project's Q4_K_M, convrot encoder and VAE.
-- Machine state at handoff: no bridge, no sd-server, no probe processes; GPU
-  idle. localembed healthy (127.0.0.1:8765, multilingual-e5-small, 384 dims).
+- dev is at 90618e4 and pushed. Units 7 and 8 are STILL open PRs, re-verified
+  this session with gh pr list --state open: PR 1 feature/unit7-resolution-and-port
+  into dev, PR 2 feature/on-demand-lifecycle stacked on PR 1. Land PR 1 first.
+- feature/image-edit-probe carries Unit 10 in four commits, pushed only as far as
+  588ac82: 4656299 (body-size bracket), 8922ae2 (first edit route), 72a641f (the
+  multipart fix that made it work) and 511c061 (configurable ceiling, Q4_K_M
+  deployed). The last three are LOCAL until pushed.
+- EDITING WORKS through the tool path, verified end to end with the bridge started
+  by the PreToolUse ensure script: open-grok's JSON shape with a base64 reference
+  in, a 768x768 PNG out. At 28 steps with the encoder graph on the GPU: 768 square
+  in 121 s warm and 180 s fresh at about 8.3 GiB peak; 1024 square in 331 s at
+  11,241 MiB peak, past open-grok's 300 s total request timeout, so 1024 square
+  serves a direct curl client only.
+- The fix was to stop inlining the reference in a JSON body: sd-server hangs on a
+  JSON body above about 8.5 kB (bracketed 8,495 .. 64,495 bytes, and a body of that
+  size with NO extension block hangs identically, so it is the size, not the
+  block). Large bodies now go to the backend's MULTIPART images/edits route, which
+  carried a 628 KiB reference without complaint. The JSON hang is BYPASSED, not
+  explained, and still looks upstream-worthy.
+- Placement: encoder GRAPH on the GPU, its parameters in host RAM. Generation is
+  unaffected, measured same-session in both orders (CPU 181/157 s, GPU 176/160 s;
+  the spread follows run order). This supersedes an earlier wrong claim of a 43 s
+  generation penalty.
+- Diffusion model is Q4_K_M, because the model's size decides whether a 1024-square
+  edit fits at all (pinned Q6_K was 88 MB short). Q4_K_M measured slightly SLOWER
+  than Q6_K at 768 square (180 against 166 s) and its quality is unmeasured; it is
+  deployed for capacity. Q6_K is still on disk and one line is the revert. Edit
+  ceiling: edit_max_pixels = 1,048,576, refused as a 400 in under a millisecond.
+- SYSTEMD IS RETIRED by operator decision: hook-only, nothing autostarts. The unit
+  file is moved aside (imagegen-bridge.service.retired-20260926), disabled and
+  reloaded, LoadState not-found. Verified: nothing running before the hook, then a
+  detached launch. The unit had been breaking the tool path by carrying
+  Environment=IMAGEGEN_LLM pointing at the GGUF encoder deleted earlier, and
+  systemd Environment overrides imagegen.toml.
+- Machine state at handoff: the hook-started bridge may still be up; it exits by
+  itself after idle_timeout_secs (900). No sd-cli and no probe processes.
 
-3. Next unit plan — Unit 10: finish image editing (blocked at the request body)
+3. Next unit plan — Unit 11: land the stack and remove the dead systemd path
 
-Task 1, the blocker (do this first, it is cheap and decisive). The boundary is
-bracketed to between 8,495 and 64,495 bytes, and the failure is a hang, not a
-rejection, so the next step is to narrow it and then read sd.cpp's request-read
-path for how it handles a body that arrives in several TCP segments.
-Reproduction harnesses already in the tree: out/sweep-body-size.sh (the padded
-prompt sweep; fix its harness defect first, it passes the padding through argv
-and the kernel refuses beyond ~128 KB, so write the filler to a file instead)
-and out/iso2-body-size.sh. Acceptance: the threshold is named to within a few
-kB, or a size-independence is proven and the cause is something else. Then pick
-a fix: correct the server's body read if it is a defect worth patching, or route
-the reference around the JSON body (the native /sdcpp/v1/img_gen job API is the
-fallback candidate, since it is a different parser in the same server), or
-shrink what is sent. Record whichever is chosen with its measurement.
+- Task 1, land the PR stack: review and merge PR 1 into dev, retarget PR 2
+  (gh pr edit 2 --base dev), refresh and merge it, then push the three local Unit
+  10 commits and open the Unit 10 PR. Rule 23 wants one unit in flight and three
+  branches are currently carrying work.
+- Task 2, remove the systemd path from the packaged scripts (tracked on the Unit 8
+  branch): delete packaging/imagegen-bridge.service, and drop the systemd branch
+  from packaging/hooks/ensure-imagegen-bridge so the detached launch is the only
+  route; check packaging/hooks/stop-imagegen-bridge, which may still assume
+  systemd for the clean stop. Hook-only start with no autostart is the machine's
+  state now but not yet the repo's.
+- Task 3, the edit ceiling beyond 768 square (operator stopped this line; reopen
+  only on request): the per-step cost nearly doubles between 768 and 1024 square
+  because the card is over-subscribed, with "model manager cannot make enough
+  memory available on CUDA0" and weight shuffling every step. The candidate
+  measurement is letting the DiT offload instead of pinning it, or capping its
+  budget, which Unit 1 measurements suggest costs little for generation.
+- Task 4, cheap and useful: retest 768 square on Q6_K against Q4_K_M at the same
+  warmth to confirm the 166-against-180 s difference, and choose the model on
+  speed rather than on the capacity the 1024 ceiling needs.
+- Task 5, wrap: fold the outcome into section 2, replace section 3, refresh the
+  memory entry, close with "Unit: 11 complete".
 
-Task 2, the live end-to-end, which is Unit 10's acceptance test: a real
-POST /v1/images/edits through the bridge returning a 1024-square PNG, with the
-step/cfg defaults written deliberately (sd.cpp's own edit examples use cfg 2.5,
-unmeasured here). Harness: out/e2e-edit.sh (starts the bridge, waits for the
-backend, posts open-grok's exact shape, decodes the response). The bridge's own
-client has no timeout (reqwest's default), so only open-grok's 240 s read limit
-bounds a request.
-
-Task 3, the latency decision. Both measured levers are documented in
-docs/architecture.md under "Image editing (measured 2026-09-26)": the
-text-encoder graph on the GPU (best latency, 1.1 GiB of VRAM headroom left,
-and NOT yet re-measured for text-only generation) and a smaller edit size
-(safest, costs resolution). Measure the combination before writing any value
-into imagegen.toml, and remember the deployed placement affects generation too.
-
-Task 4, close out: refresh qa-evidence/qa-edit-report.md with a PASS, rebuild
-the graphify graph at commit time, write the edit section of
-crates/bridge/README.md, then the PR into dev (after the open PR stack lands).
-
-Still open from Unit 9, none of it done: create main and protect dev and main on
-GitHub; register or correct the ensure-localembed hook (documented, never
-registered); fix crates/bridge/README.md's configuration table, which names an
-IMAGEGEN_DIFFUSION default the binary does not have; upstream patches/0001 and
-0002 to leejet/stable-diffusion.cpp (EXTERNAL, needs the operator's go-ahead);
-define what acceptable image quality means.
+Still open from earlier units, none of it done: create main and protect dev and
+main on GitHub; register or correct the ensure-localembed hook (documented, never
+registered); upstream patches/0001 and 0002 to leejet/stable-diffusion.cpp
+(EXTERNAL, needs the operator's go-ahead); define what acceptable image quality
+means, which is what blocked scoring Q4_K_M against Q6_K; and the JSON body-size
+hang, bypassed but unexplained.
 
 4. Project facts a fresh session cannot re-derive
 
@@ -168,11 +160,14 @@ define what acceptable image quality means.
   e2e-edit.sh (bridge end-to-end), iso-edit-path.sh and iso2-body-size.sh (the
   backend isolation that found the body-size blocker), direct-server-edit.sh.
   Reference images: out/first.png at 1024 square, out/e2e-edit-ref768.png at 768.
-- Lifecycle (Unit 8): global hook ~/.opengrok/hooks/imagegen-bridge.json runs
-  packaging/hooks/ensure-imagegen-bridge on PreToolUse ^(image_gen|image_edit)$
-  and stop-imagegen-bridge on SessionEnd; scripts symlinked from
-  ~/.opengrok/hooks/bin/; the systemd user unit is packaging/imagegen-bridge.service
-  (installed, NOT enabled); log ~/.local/state/ensure-imagegen-bridge.log. Never
+- Lifecycle: HOOK-ONLY, no systemd, nothing autostarts (operator decision
+  2026-09-26). ~/.opengrok/hooks/imagegen-bridge.json registers a PreToolUse hook
+  (^(image_gen|image_edit)$) running bin/ensure-imagegen-bridge, and a SessionEnd
+  hook running bin/stop-imagegen-bridge; both script files live in the project at
+  packaging/hooks/ and are symlinked from ~/.opengrok/hooks/bin/. The systemd unit
+  is RETIRED (file moved to imagegen-bridge.service.retired-20260926, disabled,
+  reloaded, LoadState not-found), so the ensure script's detached launch is the
+  live path. Lifecycle log: ~/.local/state/ensure-imagegen-bridge.log. Never
   replace bin/imagegen-bridge while it runs: the canonical builder fails with
   "Text file busy" and then deletes target/.
 - Rebuilding: bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
@@ -200,19 +195,26 @@ define what acceptable image quality means.
   the primary agent for Units 6-10; independent passes used qwen38-flash-next-ds4
   earlier).
 - OPEN items:
-  1. The edit request-body blocker (section 3 task 1) — the unit cannot finish.
-  2. 8922ae2 is committed but unpushed, because its QA verdict is FAIL.
-  3. PRs 1 and 2 await review and merge; a third branch is in flight.
+  1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
+     72a641f) are unpushed as of this handoff; push them with the Unit 10 PR.
+  2. PRs 1 and 2 await review and merge; a third branch is in flight, and rule 23
+     wants one unit at a time, so land the stack first.
+  3. The systemd path is dead on this machine but alive in the repo: the Unit 8
+     branch still carries packaging/imagegen-bridge.service and the ensure
+     script's systemd branch, and the unit it carried pointed at a deleted
+     encoder. Remove both when that branch merges (section 3 task 2).
   4. main does not exist and neither dev nor main is protected on GitHub.
   5. The ensure-localembed hook described in the docs is not registered anywhere.
-  6. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead).
-  7. No quality standard is defined anywhere in the project.
+  6. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead), and the
+     JSON body-size hang this session bypassed looks like a third candidate.
+  7. No quality standard is defined anywhere in the project, which is why Q4_K_M
+     could not be scored against Q6_K.
   8. SessionEnd does not fire in headless runs, so the stop hook covers
      interactive sessions and the idle timer covers headless ones.
-  9. Untested and open: whether the OpenAI-family or native sdcpp endpoints
-     accept a reference-sized body; the step count and cfg for edits; whether
-     the convrot encoder's built-in vision tower matches the separate mmproj in
-     quality; generation latency under the text-encoder-on-GPU placement.
+  9. Untested and open: the step count and cfg for edits (sd.cpp's own examples
+     use cfg 2.5, we inherit 6.0); whether the convrot encoder's built-in vision
+     tower matches the separate mmproj in quality; and whether removing the VRAM
+     oversubscription would let 1024 square fit inside the timeout.
 
 6. Progress and staleness check (run this first, every session)
 
