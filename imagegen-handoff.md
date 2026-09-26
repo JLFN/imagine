@@ -70,12 +70,16 @@ anything that affects the model stack.
   edit findings) and 8922ae2 (the /v1/images/edits route, seven passing unit
   tests, README and docs). 8922ae2 is NOT pushed: its QA verdict is FAIL, so it
   must not go up as a deliverable until the blocker is resolved.
-- THE BLOCKER, measured: sd-server drops a request whose body carries a real
-  reference image. A 482-byte body with a 64x64 reference returns HTTP 200 and
-  an image; the same request with a 768x768 reference (855,486 bytes) is dropped
-  with no response, no server log line, and the server still alive. Suppressing
-  curl's Expect: 100-continue does not help. httplib's payload cap is not it
-  (default SIZE_MAX, never lowered), so the cause is located but not identified.
+- THE BLOCKER, measured: sd-server stops answering when the request body is
+  large. With a 64x64 reference held fixed and only the PROMPT padded (so the
+  image, its base64 and the ref_images parsing are all constant), a 495-byte
+  body and an 8,495-byte body both return HTTP 200, while a 64,495-byte body
+  receives NO response for the full 600 s client timeout, returns zero bytes,
+  and leaves the server alive. Suppressing curl's Expect: 100-continue changes
+  nothing and httplib's payload cap is not it (default SIZE_MAX, never
+  lowered). The signature is a HANG, not a rejection, which points at the
+  server's read of a body arriving in several TCP segments rather than at a
+  configured maximum. The boundary is bracketed to 8,495 B .. 64,495 B.
 - Latency, measured with sd-cli at 1024 square, 28 steps, seed 42, convrot
   encoder, DiT pinned: 426.24 s at the deployed placement (9,304 MiB peak);
   249.56 s with the text-encoder GRAPH on the GPU and its parameters still in
@@ -93,18 +97,19 @@ anything that affects the model stack.
 
 3. Next unit plan — Unit 10: finish image editing (blocked at the request body)
 
-Task 1, the blocker (do this first, it is cheap and decisive). Find where
-sd-server stops accepting a body between 482 bytes and 836 KiB. Method: hold the
-reference fixed at the tiny 64x64 image that is known to work and pad the
-PROMPT with filler to raise the body size in steps (8 KiB, 64 KiB, 256 KiB,
-700 KiB), one 2-step 256-square request each, so only size moves. Reproduction
-harness already in the tree: out/iso2-body-size.sh. Acceptance: the failing
-threshold is named, or a size-dependence is ruled out. Then pick a fix: raise the
-limit if sd.cpp exposes one (it does not call set_payload_max_length, so this may
-be a patch), or route the reference around the argv/JSON body (the native
-/sdcpp/v1/img_gen job API, a file path field if one exists, or a second endpoint
-whose parser handles it), or shrink what is sent. Record whichever is chosen with
-its measurement.
+Task 1, the blocker (do this first, it is cheap and decisive). The boundary is
+bracketed to between 8,495 and 64,495 bytes, and the failure is a hang, not a
+rejection, so the next step is to narrow it and then read sd.cpp's request-read
+path for how it handles a body that arrives in several TCP segments.
+Reproduction harnesses already in the tree: out/sweep-body-size.sh (the padded
+prompt sweep; fix its harness defect first, it passes the padding through argv
+and the kernel refuses beyond ~128 KB, so write the filler to a file instead)
+and out/iso2-body-size.sh. Acceptance: the threshold is named to within a few
+kB, or a size-independence is proven and the cause is something else. Then pick
+a fix: correct the server's body read if it is a defect worth patching, or route
+the reference around the JSON body (the native /sdcpp/v1/img_gen job API is the
+fallback candidate, since it is a different parser in the same server), or
+shrink what is sent. Record whichever is chosen with its measurement.
 
 Task 2, the live end-to-end, which is Unit 10's acceptance test: a real
 POST /v1/images/edits through the bridge returning a 1024-square PNG, with the
