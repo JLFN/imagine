@@ -194,6 +194,18 @@ hang, bypassed but unexplained.
   model is a user-chosen parameter (the operator asked for self-verification by
   the primary agent for Units 6-10; independent passes used qwen38-flash-next-ds4
   earlier).
+- DECISIONS taken 2026-09-26, do not silently reverse them:
+  1. No GUI is to be added for now. The operator uses the image tools from chat
+     and, when needed, curl against http://127.0.0.1:8787. The option to build
+     upstream's own Vue frontend (examples/server/frontend, pnpm + Vite, compiled
+     into the binary with SD_SERVER_BUILD_FRONTEND=ON; not built here, no pnpm
+     installed) stays open but unrequested.
+  2. The service stays LOOPBACK ONLY (listen_ip 127.0.0.1). There is no
+     authentication and no TLS, so binding 0.0.0.0 would let anyone on the
+     network occupy the GPU. Anything that needs remote access goes through a
+     tunnel or a proxy with auth, never a direct bind.
+  3. Hook-only start, no systemd, nothing autostarts (section 2 and 4).
+
 - OPEN items:
   1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
      72a641f) are unpushed as of this handoff; push them with the Unit 10 PR.
