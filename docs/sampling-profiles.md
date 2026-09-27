@@ -76,6 +76,16 @@ models/MANIFEST.md and tools/convrot-te-experiment.sh, which is the script that
 measured it), and it needs the patched sd-server built from patches/0001 and
 patches/0002.
 
+The encoder choice does not affect the turbo path, and that was measured rather
+than assumed on 2026-09-27, because the DRAFT and TURBO rows above were taken with
+the convrot encoder. The toggle's gate is the adapter being configured, its
+schedule having at least two nodes and the adapter file being on disk
+(crates/bridge/src/main.rs); the encoder is not part of it. With the GGUF encoder
+in place and the DRAFT deployment configured, POST /v1/turbo reported mode turbo,
+steps 6, cfg_scale 1.0, the six-node schedule and both adapters listed by the
+backend, and a full 672x1024 render completed. So the profiles are unchanged by
+the revert: only what conditions them is.
+
 ## The uncensored layer
 
 The uncensored behaviour is available as the separate 33.6 MB LoRA on the base
