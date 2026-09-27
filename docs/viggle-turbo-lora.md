@@ -237,6 +237,17 @@ verified before it takes effect: the adapter must be on disk and listed by the
 backend, otherwise the switch is refused with HTTP 409 and the mode is left
 alone.
 
+DEPLOYMENT STATE (2026-09-27, after the Q6_K decision): the standing deployment
+is base-only. The adapter keys in imagegen.toml are commented out, the diffusion
+model is Q6_K with default VAE tiling, and the bridge reports `turbo_available:
+false` and refuses the toggle with 409 - the adapter cannot run on Q6_K at 1024
+square on this card, and Q6_K was chosen for stills quality (9 of 10 realism
+against 6 of 10 for Q4_K_M base and 3 of 10 for turbo, measured at 1024 square
+with an independent critic pass). Turbo remains one three-line edit away: the
+Q4_K_M model, the 16x16 VAE tiles, and the four uncommented keys, followed by a
+bridge restart. Everything below in this document remains the verified recipe
+for that turbo deployment.
+
 Two consequences of doing it through the bridge rather than sd-cli:
 
 - The adapter must be applied at runtime, and merged application is refused
