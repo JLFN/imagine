@@ -13,16 +13,17 @@
 # switched at runtime (POST /v1/turbo, or a per-request "turbo" flag), so the
 # adapter is no longer applied to every generation.
 #
-# The STANDING deployment is base-only, on Q6_K with default VAE tiling: the
-# QUALITY profile. Measured 2026-09-27 at 1024 square (same prompt and seed,
-# independent critic pass), QUALITY scores 9/10 realism against 6/10 for DRAFT
-# (Q4_K_M base with the 16x16 tiles) and 3/10 for TURBO, at 183 s against 141 s
-# and 29 s. The turbo keys at the bottom of this file are therefore commented out
-# and the bridge reports turbo unavailable; the note above `diffusion` says
-# exactly what to change to get the DRAFT + TURBO deployment back (it needs the
-# Q4_K_M model plus the small VAE tiles, and a restart). The full recipe for the
-# three profiles, with artifacts and the byte-identity check that DRAFT is the
-# pre-turbo behaviour: docs/sampling-profiles.md.
+# The STANDING deployment is base-only, on the UNCENSORED Q6_K with default VAE
+# tiling: the QUALITY profile. Measured 2026-09-27 at 1024 square (same prompt
+# and seed, independent critic pass), QUALITY scores 9/10 realism against 6/10
+# for DRAFT (Q4_K_M base with the 16x16 tiles) and 3/10 for TURBO, at 183 s
+# against 141 s and 29 s. The turbo keys at the bottom of this file are therefore
+# commented out and the bridge reports turbo unavailable; the note above
+# `diffusion` says exactly what to change to get the DRAFT + TURBO deployment
+# back (the base Q4_K_M model, the small VAE tiles, the four turbo keys and the
+# extra uncensored layer, then a restart). The full recipe for the three
+# profiles, with artifacts and the byte-identity check that DRAFT reproduces the
+# pre-turbo behaviour when no extra layer is configured: docs/sampling-profiles.md.
 #
 # Model paths have no built-in default on purpose: a wrong path that silently
 # loads a different model is worse than a refusal to start.
@@ -34,9 +35,13 @@
 
 # sd-server binary, and the model paths it is given.
 sd_server = "bin/sd-server"
-# Q6_K: the standing deployment is the QUALITY profile - the base model, chosen
-# for stills quality. Measured 2026-09-27 at 1024 square, one prompt and seed,
-# critic pass (agy):
+# Q6_K, UNCENSORED build: the standing deployment is the QUALITY profile, and the
+# uncensored variant was chosen on 2026-09-27 for its content behaviour (the base
+# model refuses or sanitises some prompts; this one does not), not for quality -
+# the measured A/B found no quality difference on an ordinary scene (both 9/10
+# realism at 1024 square). It is the base weights with the repo's 33.6 MB
+# uncensored LoRA merged; provenance and checksums in models/MANIFEST.md.
+# Measured 2026-09-27 at 1024 square, one prompt and seed, critic pass (agy):
 #   QUALITY (this file):      183 s, peak VRAM 9200 MiB, realism 9/10
 #   DRAFT (Q4_K_M + tiles):   141 s, peak VRAM 7272 MiB, realism 6/10
 #   TURBO (Q4_K_M + adapter):  29 s, peak VRAM 7978 MiB, realism 3/10
@@ -45,14 +50,16 @@ sd_server = "bin/sd-server"
 # cannot make enough memory available on CUDA0", then segment 29/34
 # transformer_blocks.27 fails during weight preparation), so the adapter keys at
 # the bottom of this file are commented out and the bridge reports turbo
-# unavailable. To switch to the DRAFT + TURBO deployment, change all three
+# unavailable. To switch to the DRAFT + TURBO deployment, change all four
 # together:
 #   1. diffusion to models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
 #   2. backend_args to add --vae-tiling --vae-tile-size 16x16
 #   3. uncomment lora_dir, lora, lora_multiplier and sigmas below
+#   4. uncomment extra_lora and extra_lora_multiplier below (the uncensored
+#      layer; without it DRAFT runs the plain base weights)
 # then restart the bridge (about 35 s of weight staging) and toggle as
 # documented in docs/sampling-profiles.md and docs/viggle-turbo-lora.md.
-diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
+diffusion = "models/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 
 # The text encoder. The upstream card recommends the ComfyUI int8 convrot file
@@ -139,3 +146,17 @@ turbo_cfg_scale = 1.0
 # lora            = "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"
 # lora_multiplier = 1.0
 # sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
+
+# The EXTRA adapter is a layer, not a mode: when configured it rides on every
+# request, base and turbo alike (a turbo request carries both adapters in the
+# server's structured lora list, verified: 454/454 Viggle tensors plus 256/256
+# uncensored tensors applied in one run). It is used here for the uncensored
+# LoRA on the DRAFT weights, so the base path stays the unmodified base model and
+# the behaviour is a switch with a tunable multiplier rather than a second merged
+# file. Measured cost of the layer at 1024 square: peak VRAM 7571 MiB against
+# 7562 MiB without it, and the run took 187 s (staging noise dominates the
+# difference). When it is configured, the base path is no longer byte-identical
+# to the pre-turbo request - the identity check in docs/sampling-profiles.md
+# holds with this layer unset.
+# extra_lora            = "qwen-image-2.1-uncensored-lora.safetensors"
+# extra_lora_multiplier = 1.0
