@@ -127,10 +127,12 @@ answers HTTP 409 with the reason. The mode is process state; a restart returns t
 
 One caveat stated plainly: the model file and the backend placement flags are
 fixed when sd-server starts, so the toggle changes the sampling profile, not the
-model. The standing deployment therefore picks one: Q6_K with default tiling for
-base quality (turbo disabled, its keys commented out), or Q4_K_M with 16x16 VAE
-tiles for a working turbo switch at a lower base quality. The three-line switch
-between them is documented in imagegen.toml above `diffusion`; either way the
+model. The standing deployment therefore picks one: Q6_K with default tiling
+(QUALITY) for base quality, with turbo disabled and its keys commented out; or
+Q4_K_M with 16x16 VAE tiles (DRAFT in base mode, TURBO with the adapter) for a
+working turbo switch at a lower base quality. The three-line switch between them
+is documented in imagegen.toml above `diffusion`, and the full recipe with the
+measured numbers and artifacts is docs/sampling-profiles.md; either way the
 change takes effect on the next bridge start.
 
 ## Few-step turbo adapter (Viggle Qwen-Image-2.1 turbo)
