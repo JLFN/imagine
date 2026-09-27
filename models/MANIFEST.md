@@ -7,13 +7,62 @@ source repo; always recompute and compare, never trust the sizes alone.
 
 ## 1. Diffusion model (the image generator)
 
+The standing QUALITY model and the DRAFT/TURBO host both come from
+https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF (source revision
+b3179ad355be050328e483a9dfdd9e60cd62adfa, converted with stable-diffusion.cpp
+commit 1330ceb, license Qwen Research License - the same as the base model).
+That repository ships the base weights and, beside them, the same weights with a
+33.6 MB uncensored LoRA merged ("UC" files); the base files are byte-identical to
+the earlier abenzerps/Qwen-Image-2.1-GGUF downloads. All checksums below were
+verified locally against the repository's SHA256SUMS on 2026-09-27.
+
+- File:         models/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf
+- Size:         5,876,556,576 bytes (5.47 GiB)
+- Checksums:    sha256 e14bb312109333b3d73b92ad9b9ac8b29b51f2edca1e7b86d1af1981bf1c4ee3
+- Note:         THE DEPLOYED DEFAULT (QUALITY profile, imagegen.toml). The
+                uncensored build: base weights with the uncensored LoRA merged,
+                chosen for content behaviour, not quality - the measured A/B at
+                1024 square on an ordinary scene put it at 9/10 realism, the same
+                as the base file. It cannot host the Viggle adapter at 1024
+                square on this 12 GB card (measured), so turbo is unavailable in
+                this deployment.
+
+- File:         models/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf
+- Size:         4,604,558,112 bytes (4.29 GiB)
+- Checksums:    sha256 e79c8a009f2ecbdb6c70fd663d9aea9ee304a0d91f347e4169a756b8ad141b41
+- Note:         The uncensored Q4_K_M, tested as the DRAFT host on 2026-09-27
+                (169 s, 7562 MiB peak at 1024 square; critic 5/10 realism against
+                6/10 for the base file - no gain). NOT part of the standing
+                recipe: the DRAFT/TURBO deployment uses the base Q4_K_M below
+                plus the uncensored LoRA as a separate layer, so the base path
+                stays the unmodified base model.
+
+- File:         models/diffusion_models/qwen-image-2.1-Q6_K.gguf
+- Size:         5,876,556,448 bytes (5.47 GiB)
+- Checksums:    sha256 a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
+- Note:         The plain base Q6_K. Byte-identical to the source repository's
+                base file (that hash is the repo's own listing). Kept on disk as
+                the fallback QUALITY model and as the reference for the identity
+                check in docs/sampling-profiles.md.
+
 - File:         models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
-- Size:         4.6 GiB
-- Source:       https://huggingface.co/abenzerps/Qwen-Image-2.1-GGUF
-                (same bytes also at KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF)
-- Checksums:    SHA256SUMS in the source repo
-- Note:         GGUF of the 7B DiT; converted for stable-diffusion.cpp.
-                Q4_K_M recommended by the converter.
+- Size:         4,604,557,984 bytes (4.29 GiB)
+- Checksums:    sha256 833439e91bc1152d28f37aa198c7f6f4218b7de95754c2f7a318a2422ab4b2f8
+- Note:         The plain base Q4_K_M: the DRAFT/TURBO deployment's host model
+                (base mode = DRAFT, with the uncensored LoRA layered on when
+                configured; turbo mode = TURBO, with the Viggle adapter as well).
+
+- File:         models/loras/qwen-image-2.1-uncensored-lora.safetensors
+- Size:         33,586,704 bytes (32 MiB)
+- Source:       same repository (the LoRA the UC files have merged)
+- Checksums:    sha256 00ee2cb7f00a37b097640c1880ed0d17e368e30599f34bb348fee0e8c2cc4ca1
+                (the repository's LFS object id; verified locally 2026-09-27)
+- Note:         Applied as the bridge's EXTRA layer (extra_lora), so it rides on
+                both DRAFT and TURBO requests; verified in one run alongside the
+                Viggle adapter (454/454 plus 256/256 tensors applied). Measured
+                cost at 1024 square: 7571 MiB peak against 7562 MiB without it.
+                The benefit is content behaviour (no refusals/sanitising), not
+                quality - see docs/sampling-profiles.md.
 
 ## 2. Text encoder (fixed architectural component)
 
