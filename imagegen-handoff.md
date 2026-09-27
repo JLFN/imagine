@@ -1,7 +1,7 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 2c96969
+last_updated_commit: 3118732
 branch: dev
 work_branch: none in flight; PRs 5-8 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
