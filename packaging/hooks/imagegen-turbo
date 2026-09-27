@@ -1,0 +1,94 @@
+#!/bin/bash
+# open-grok hook / operator command: report or switch the imagegen bridge's
+# sampling mode.
+#
+#   imagegen-turbo on      -> turbo profile (Viggle adapter + its sigma schedule)
+#   imagegen-turbo off     -> base profile (no adapter, sd.cpp's own scheduler)
+#   imagegen-turbo status  -> the live mode and what the next request will use
+#   imagegen-turbo         -> same as status
+#
+# The mode is process state on the bridge: it survives across generations and
+# resets to imagegen.toml's `turbo` value when the bridge restarts. Switching is
+# instant (no model reload), and switching turbo ON is verified against the
+# backend before it takes effect, so "on" failing is a real failure and not a
+# mode that looks right while the adapter is being dropped.
+#
+# The bridge is started here if it is not up, so this works as the first command
+# of a session; the ensure hook covers the normal tool-call path. Exit status is
+# 0 when the mode is what was asked for, 1 when the bridge did not answer or
+# refused the switch (a hook or a script can branch on it).
+#
+# Log: ~/.local/state/imagegen-turbo.log
+#
+# Handbook: docs/architecture.md, "Sampling modes: base and turbo".
+
+set -u
+
+LOG="$HOME/.local/state/imagegen-turbo.log"
+BASE_URL="http://127.0.0.1:8787"
+PROJECT="/data/imagegen"
+ENSURE="$PROJECT/packaging/hooks/ensure-imagegen-bridge"
+TIMEOUT=20
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+verb="${1:-status}"
+
+case "$verb" in
+  on|turbo|off|base|status) ;;
+  *)
+    echo "usage: $(basename "$0") [on|off|status]" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$verb" = "status" ]; then
+  out=$(curl -sf --max-time 5 "$BASE_URL/v1/turbo" 2>/dev/null)
+  if [ -z "$out" ]; then
+    echo "the bridge is not answering on $BASE_URL (start it with $ENSURE)"
+    log "status: no answer from $BASE_URL/v1/turbo"
+    exit 1
+  fi
+  echo "$out"
+  log "status: $out"
+  exit 0
+fi
+
+case "$verb" in
+  on|turbo) payload='{"enabled":true}' ;;
+  *)        payload='{"enabled":false}' ;;
+esac
+
+# Idempotent and cheap when the bridge is already up: it only probes /health.
+if [ -x "$ENSURE" ]; then
+  "$ENSURE" >/dev/null 2>&1 || true
+fi
+
+resp=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE_URL/v1/turbo" \
+  -H 'Content-Type: application/json' -d "$payload" 2>/dev/null)
+rc=$?
+if [ "$rc" -ne 0 ] || [ -z "$resp" ]; then
+  echo "the bridge did not answer on $BASE_URL/v1/turbo (curl exit $rc); see $LOG" >&2
+  log "$verb: no answer from $BASE_URL/v1/turbo (curl exit $rc)"
+  exit 1
+fi
+
+echo "$resp"
+
+case "$resp" in
+  *'"mode":"turbo"'*) now=turbo ;;
+  *'"mode":"base"'*)  now=base ;;
+  *)                  now=unknown ;;
+esac
+
+case "$verb:$now" in
+  on:turbo|turbo:turbo|off:base|base:base)
+    log "$verb: ok ($resp)"
+    exit 0
+    ;;
+  *)
+    echo "the bridge refused the switch; the mode is $now (see $LOG)" >&2
+    log "$verb: refused, mode is $now ($resp)"
+    exit 1
+    ;;
+esac
