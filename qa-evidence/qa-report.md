@@ -1,87 +1,108 @@
-QA report for the uncensored-model unit: the standing QUALITY model moves to the
-uncensored Q6_K build, and the bridge gains an optional extra adapter layer so
-the DRAFT/TURBO deployment can carry the uncensored LoRA on the base weights.
+# QA report: text encoder reverted to the GGUF file (Unit 16)
 
 qa-model: deepseek-flash (the primary agent, by operator request)
-Date: 2026-09-27. Revision tested: the working tree on feature/uncensored-model-trial,
-cut from origin/dev 7b8d9e5, with the bridge rebuilt by the canonical builder
-(bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge, release).
-The live bridge was restarted from the edited imagegen.toml, so every live claim
-below is about the running service.
+date: 2026-09-27
+branch: fix/text-encoder-gguf-revert
+unit commit under QA: ff9a724 fix(config): stand on the base Q6_K and the GGUF text encoder
+surfaces extracted by tests/qa-gate.sh relative to dev: CONFIG KEY diffusion, CONFIG KEY llm
 
-INDEPENDENCE DISCLOSURE, read this first
-This pass was performed by the same agent that made the change, at the operator's
-standing request, so it is self-verification and strictly weaker than an
-independent QA model's pass. Quality verdicts quoted here come from an
-independent vision route (agy/Gemini via rustcv-mcp describe_image); timings,
-VRAM peaks, checksums and HTTP responses were measured live in this session.
+## Coverage
 
-Surfaces covered, each with the command and what was observed.
+FUNCTION / ENDPOINT / CLIENT METHOD: none added by this unit; the diff touches
+imagegen.toml and four documents, and the gate's extraction agrees (two config
+keys, no new routes, no new binaries).
 
-CONFIG KEY diffusion (the standing model becomes the uncensored Q6_K build)
-  Live after the restart, three independent checks:
-    /health -> {"status":"ok","backend":true,"mode":"base","turbo_available":false,
-                "lora":"(none)","lora_visible":null,"steps":28,"cfg_scale":6.0}
-    ps -C sd-server -> --diffusion-model models/diffusion_models/
-      qwen-image-2.1-UC-Q6_K.gguf ...
-    startup log -> effective configuration: diffusion=models/diffusion_models/
-      qwen-image-2.1-UC-Q6_K.gguf ... extra_lora=(none) sigmas=(none)
-      placement=--backend te=cpu,diffusion=cuda0,vae=cuda0 --params-backend
-      te=cpu,diffusion=cuda0,vae=cpu
-  Provenance, verified against the source repository's own SHA256SUMS:
-    qwen-image-2.1-UC-Q6_K.gguf    e14bb312109333b3d73b92ad9b9ac8b29b51f2edca1e7b86d1af1981bf1c4ee3
-    qwen-image-2.1-UC-Q4_K_M.gguf  e79c8a009f2ecbdb6c70fd663d9aea9ee304a0d91f347e4169a756b8ad141b41
-    qwen-image-2.1-uncensored-lora.safetensors
-                                   00ee2cb7f00a37b097640c1880ed0d17e368e30599f34bb348fee0e8c2cc4ca1
-    (the LoRA hash is the repository's LFS object id; the SHA256SUMS file does
-    not list it)
-  Quality A/B, 1024 square, one prompt and seed, independent critic pass:
-    base Q6_K (previous standing model) 183.3 s, 9200 MiB, 9/10, "yes" to DSLR
-    UC-Q6_K (new standing model)        159.8 s, 9281 MiB, 9/10, "yes" to DSLR
-  Artifact: qa-evidence/qa-playground-uncensored-q6k-1024.png (the base file's
-  frame stays as qa-playground-q6k-1024.png). No quality difference measured;
-  the change is content behaviour, stated as such in the config and docs.
+CONFIG KEY diffusion. Verified live: the running sd-server carries
+--diffusion-model models/diffusion_models/qwen-image-2.1-Q6_K.gguf, the file is
+present at 5,876,556,448 bytes with sha256 a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9,
+which is the value models/MANIFEST.md records for it, and a generation completes
+through it on the deployment stack (probe 7 below).
 
-BRIDGE FEATURE: the extra adapter layer (no gate surface; unit-tested and run live)
-  cargo test -p imagegen-bridge: 10 passed, 0 failed, including the new
-  the_extra_layer_rides_on_both_modes_and_after_the_turbo_adapter.
-  Live, one bridge with both adapters configured (base Q4_K_M + 16x16 tiles +
-  Viggle + the uncensored layer):
-    /v1/turbo in base mode -> lora "qwen-image-2.1-uncensored-lora.safetensors",
-      lora_visible true (the cache check verifies every configured adapter)
-    /v1/turbo in turbo mode -> lora "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-
-      lora-r128.safetensors,qwen-image-2.1-uncensored-lora.safetensors"
-    DRAFT run (base mode, layer applied): HTTP 200 in 187.5 s, peak VRAM
-      7571 MiB, backend "(256 / 256) LoRA tensors have been applied ... 
-      uncensored-lora"
-    TURBO run (both adapters): HTTP 200 in 32.7 s, peak VRAM 8230 MiB, backend
-      "(454 / 454) LoRA tensors ... viggle-turbo" AND "(256 / 256) LoRA tensors
-      ... uncensored-lora" in the same request
-    toggle off -> mode base again
-  Artifacts: qa-evidence/qa-playground-draft-uncensored-layer-1024.png and
-  qa-evidence/qa-playground-turbo-both-adapters-1024.png.
-  Cost of the layer, same prompt and seed at 1024 square: 7571 MiB peak against
-  7562 MiB for the merged UC-Q4_K_M route, i.e. no measurable VRAM cost; the
-  tensor application itself takes 0.03 s.
+CONFIG KEY llm. Verified live: the running sd-server carries
+--llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf, the file is present
+at 5,027,784,800 bytes with sha256
+67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2, which is the
+upstream Hugging Face LFS object id for that path; the int8 convrot file the key
+previously named is gone from disk; and the conditioning path is exercised end to
+end by a probe whose only sensitive surface is prompt adherence and text
+rendering (probe 8 below).
 
-Docs updated in the same change, each checked against the live state above:
-  imagegen.toml (standing model, the four-edit switch to DRAFT/TURBO, the layer
-  note), models/MANIFEST.md (all five files with sizes, hashes, sources and the
-  role each plays), docs/sampling-profiles.md (the profiles table, the
-  uncensored-layer section, the identity-check caveat), crates/bridge/README.md
-  (config table and the layer paragraph), docs/architecture.md (standing
-  deployment and the layer).
+## Live evidence
 
-NOT verified live, and why
-- The uncensored behaviour itself (no refusals, no sanitising): NOT exercised.
-  No restricted prompt was run, so the claim in the docs is attributed to the
-  source repository, not measured here. What is measured is that the layer
-  applies cleanly on top of the base weights and alongside the Viggle adapter.
-- Quality of the layer on TURBO: the playground frame scored 3/10, the same
-  class as TURBO without the layer; no broader scene set was run.
-- Resolutions above 1024 square on UC-Q6_K: not run (about 2.4 GiB of the card
-  free at the 9281 MiB peak).
-- The identity check in docs/sampling-profiles.md holds with extra_lora unset;
-  it was not re-run with the layer configured (the docs say so).
+1. Configuration parses and carries the intended effective values
+   (python3 tomllib on imagegen.toml): diffusion qwen-image-2.1-Q6_K.gguf,
+   llm Qwen3VL-8B-Instruct-Q4_K_M.gguf, steps 28, cfg_scale 6.0, turbo false,
+   backend_args vae=cpu in both the --backend and --params-backend lines.
+
+2. Live backend command line, read from /proc/<pid>/cmdline of the running
+   sd-server:
+   bin/sd-server --diffusion-model models/diffusion_models/qwen-image-2.1-Q6_K.gguf --vae models/vae/qwen_image_2.1_vae_bf16.safetensors --llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf --listen-ip 127.0.0.1 --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cpu --params-backend te=cpu,diffusion=cuda0,vae=cpu
+
+3. Target for the change, captured in the session that produced the retained
+   reference images (2026-09-26, session 01a0ddef, chat_history.jsonl): the same
+   line, character for character. The revert is therefore a reproduction of a
+   recorded configuration, not an invention.
+
+4. Diffusion file on disk: models/diffusion_models/qwen-image-2.1-Q6_K.gguf,
+   5,876,556,448 bytes, mtime 2026-09-21 22:15, sha256 as above. It has not been
+   touched since before the artifacts were reported, which is what rules it out
+   as the cause.
+
+5. Encoder file on disk: models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf,
+   5,027,784,800 bytes, mtime 2026-09-27 22:25, sha256 as above. Re-fetched from
+   the official Qwen repository during the unit and hash-checked against the
+   upstream object id, not taken on trust.
+
+6. Convrot removal verified: ls of
+   models/text_encoders/qwen3vl_8b_int8_convrot.safetensors fails with "No such
+   file or directory"; the directory holds the GGUF encoder only; 9,350,798,360
+   bytes were freed. Recovery path (size, sha256, public sources) is recorded in
+   models/MANIFEST.md.
+
+7. End-to-end generation through the bridge's OpenAI route with a fixed request
+   (512 square, 8 steps, seed 42, cfg 6.0): HTTP 200, artifact
+   qa-evidence/qa-encoder-revert-probe-512.png, 477,408 bytes, sha256
+   e8140be90d72e035c9fbaf0bfb331d8f59b2289863a8c0c431796930eec650fa, PNG 512x512,
+   IEND chunk present, pixel statistics mean 87.05 / stddev 119.73 over 190
+   distinct byte values, i.e. a real image rather than a blank, uniform or
+   truncated one.
+
+8. Independent legibility check on that artifact (rustcv_describe_image,
+   provider agy, model gemini-3.6-flash-low): the sign in the image transcribes
+   exactly as requested, "qwen2.1.cpp", the animal is coherent with recognized
+   eyes, nose, ears, mouth and fur, and the critic named only soft detail on the
+   paws and whiskers plus a faint smudge on the nose bridge. Text rendering and
+   prompt adherence are the conditioning surfaces this unit is about, so this is
+   the check that the encoder swap had to pass; the softness is what an 8-step
+   sample gives and is not a quality measurement of the 28-step deployment.
+
+9. Documentation consistency: no file in the repository still describes the
+   convrot file as the deployed default (grep for "deployed default TE" returns
+   no match), and the four documents updated here state the revert, the deletion
+   and the limits of the attribution.
+
+10. Bridge-binary neutrality was measured, not assumed: one fixed request through
+    today's bridge build and through a build of the 2026-09-26 dev tip (a9e35b6)
+    produced byte-identical output, sha256
+    e9d27abcfd8e660d725ff95c75835e3c9741959874275edbc3ef55e9f95a614f on both.
+    This is why the binary is not part of the unit's scope, and it removes the
+    binary as a competing explanation for the artifacts.
+
+## Accepted risks and what this pass does not cover
+
+- The encoder defect is not reproduced. The 2026-09-22 comparison of the two
+  encoders recorded a quality tie, and the artifact-bearing prompt was never run
+  as a fixed-seed A/B across both encoders. This report verifies that the
+  configuration does what it claims; it does not prove the causal claim.
+- The probe runs at 8 steps for speed, so its softness says nothing about the
+  28-step production path, and no 1024-square QUALITY run was made in this QA
+  pass. The production-size end-to-end evidence for the unit is the operator's
+  accepted render (session 01a0e467, images/7.jpg, 672x1024, 28 steps).
+- Sensitivity to the VAE compute placement (--backend vae=cpu here against the
+  committed 2026-09-22 value vae=cuda0) is unmeasured; it moved to match the
+  captured process.
+- The deleted encoder cannot be compared again on this machine without
+  re-downloading 9,350,798,360 bytes from the public sources named in the
+  manifest.
 
 verdict: overall PASS
