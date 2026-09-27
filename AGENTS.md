@@ -5,7 +5,10 @@
 ## Read first
 
 1. imagegen-handoff.md — the hook-managed handoff and executable plan. This is the source of truth for what to do next. Follow its section 1 session protocol: at every completed unit, read the session's signals.json and continue while below 40% context usage.
-2. Project memory: ~/.opengrok/memory/imagegen-e61a3c5c/MEMORY.md
+2. Project memory: ~/.opengrok/memory/imagegen-fadeb80d/MEMORY.md
+   (the live workspace key; imagegen-e61a3c5c is orphaned, see that file's
+   migration note. The key follows the origin remote, so it changes if the
+   remote does.)
 3. README.md and docs/architecture.md for verified constraints (re-verify anything you rely on: source-of-truth rule).
 
 ## Repo layout

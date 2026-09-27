@@ -2,7 +2,8 @@
 #
 # The bridge reads this file from its working directory by default; set
 # IMAGEGEN_CONFIG to use a different path. Every value here can be overridden by
-# the matching environment variable (IMAGEGEN_DIFFUSION, IMAGEGEN_LLM, ...),
+# the matching environment variable (IMAGEGEN_DIFFUSION, IMAGEGEN_LLM, ...,
+# IMAGEGEN_LORA_DIR, IMAGEGEN_LORA, IMAGEGEN_LORA_MULTIPLIER, IMAGEGEN_SIGMAS),
 # which is how a test points one value elsewhere without editing this file.
 #
 # Model paths have no built-in default on purpose: a wrong path that silently
@@ -15,7 +16,16 @@
 
 # sd-server binary, and the model paths it is given.
 sd_server = "bin/sd-server"
-diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
+# Q4_K_M, not the higher-quality Q6_K default, because of the adapter below:
+# with a runtime LoRA applied, Q6_K does not fit a 1024-square generation on this
+# 12 GB card. Measured 2026-09-27 with the turbo adapter and this placement:
+# "model manager cannot make enough memory available on CUDA0: need 767.11 MB
+# device / available 733.12 MB", then "qwen_image_2_1 segment 29/34
+# (qwen_image_2_1.transformer_blocks.27) failed during weight preparation" and a
+# 500 from the backend. Q4_K_M runs the same request in about 61 s. Without an
+# adapter, swap Q6_K back in: it is the better generator, and it is what the
+# 28-step base path was measured on.
+diffusion = "models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 
 # The text encoder. The upstream card recommends the ComfyUI int8 convrot file
@@ -42,9 +52,21 @@ llm = "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
 # and ~3.4 GiB less of the VRAM peak than sd.cpp's --offload-to-cpu. Pinning the
 # text encoder's parameters as well cannot complete a 1024-square generation on
 # this 12 GB card. See docs/architecture.md.
+#
+# The VAE tile size is here because of the adapter. A runtime LoRA adds about
+# 2.4 GB of per-segment tables on the device, and that is the same budget the VAE
+# decode needs. Measured 2026-09-27, 1024 square, turbo adapter, 6 steps:
+#   default tiling (32x32 latent, 9 tiles): decode needs 512.00 MB with 508.69 MB
+#     free -> "vae decode compute failed while processing a tile", then a 500
+#   VAE on the CPU instead: fits, but the decode costs about 116 s (147 s total)
+#   16x16 latent tiles (49 tiles): no memory warnings at all, decode about 32 s,
+#     62.9 s for the whole image
+# Smaller tiles are not slower here: the pressure of the large tiles cost more
+# than the extra tile count. Without an adapter, the default is fine.
 backend_args = [
   "--backend", "te=cpu,diffusion=cuda0,vae=cuda0",
   "--params-backend", "te=cpu,diffusion=cuda0,vae=cpu",
+  "--vae-tiling", "--vae-tile-size", "16x16",
 ]
 
 # Where the bridge listens, and where its sd-server backend listens.
@@ -53,28 +75,40 @@ listen_port  = 8787
 backend_port = 8788
 
 # Request defaults when the client does not send them.
-steps     = 28
-cfg_scale = 6.0
+#
+# These are the few-step turbo values, and they belong with the adapter below:
+# with a LoRA configured and sigmas set, the schedule decides the step count, so
+# a steps value that disagrees is ignored (and logged). To go back to the base
+# model, blank the lora value, comment out sigmas, and set steps = 28 and
+# cfg_scale = 6.0; without an adapter the bridge behaves exactly as it did
+# before the turbo path existed.
+steps     = 6
+cfg_scale = 1.0
 
-# The largest edge a request may ask for. This is a property of the layout in
-# backend_args, not of the card. Measured 2026-09-22 under the pinned default:
-# 1152 square works (peak 10,060 MiB, sampling 269 s for 40 steps); 1344 square
-# fails during sampling weight preparation, short by about 0.2 MB of a 6,658 MB
-# budget, for BOTH text encoders and also with an explicit --max-vram budget.
-# 1344 square does run under --offload-to-cpu (502 s, 16.1 GB host RAM), which is
-# a direct sd-cli job rather than a bridge request: the pinned backend holds
-# 5.6 GB of VRAM, and the offload layout needs the whole card, so the two cannot
-# run at once. Raise max_edge only together with a layout that can serve it.
-max_edge = 1152
+# Few-step turbo adapter (optional). With `lora` set, every generation carries
+# the adapter, and with `sigmas` set it carries that schedule too.
+#
+# The path is relative to lora_dir on purpose: sd-server builds its LoRA cache
+# from a recursive scan of the directory handed to it as --lora-model-dir and
+# rejects any path that is not an exact cache entry, so an absolute path here
+# would fail with "invalid lora path". The bridge passes lora_dir to the backend
+# itself. A configured adapter that is not on disk is a startup error, not a
+# silent fallback to the base model.
+#
+# The Viggle Qwen-Image-2.1 turbo distillation: six transformer passes with no
+# classifier-free guidance, 1024-square in about 61 s against 169 s for the
+# 28-step base model. Recipe, checksums and the measured numbers:
+# docs/viggle-turbo-lora.md. To go back to the base model without editing this
+# file, set all four of IMAGEGEN_LORA="", IMAGEGEN_SIGMAS=none,
+# IMAGEGEN_STEPS=28 and IMAGEGEN_CFG_SCALE=6.0; clearing the adapter alone would
+# leave the turbo sampling pair in place, and the base model is not trained for
+# it.
+lora_dir        = "models/loras"
+lora            = "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"
+lora_multiplier = 1.0
 
-# Seconds without a generation request before the bridge stops itself and
-# releases the backend, and 0 to disable that. The deployment is started on
-# demand (an open-grok PreToolUse hook runs hooks/bin/ensure-imagegen-bridge when
-# an image tool is called), so something has to stop it again: after the first
-# request the backend holds about 11 GB of host RSS and 5.6 GB of pinned VRAM,
-# and before the first request it holds almost nothing (6 MiB bridge, 337 MiB
-# backend, 475 MiB VRAM). 900 s is generous on purpose, because the next request
-# after a shutdown pays 35 to 40 s of weight staging. The timer never fires while
-# a request is in flight, and /health reports in_flight, idle_secs and
-# idle_timeout_secs so a stop can tell a busy bridge from an idle one.
-idle_timeout_secs = 900
+# The published schedule: the six nodes Viggle ships plus the trailing 0.0 that
+# makes it six steps rather than five (sd.cpp derives steps = sigmas.len() - 1).
+# Comment this out, or set IMAGEGEN_SIGMAS to "none", to let sd.cpp's own
+# scheduler run; the base model is the case where that is correct.
+sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
