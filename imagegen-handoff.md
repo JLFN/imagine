@@ -1,7 +1,7 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 80e89eb
+last_updated_commit: 2c96969
 branch: dev
 work_branch: none in flight; PRs 5-8 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
@@ -12,8 +12,8 @@ session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
 --- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
-4ef1ac1 feat(bridge): make turbo a runtime mode, with the base model as the default
-6e718d2 feat(repo): measure the resolution headroom, port the verifier to Rust, bound the bridge
+31c7ed2 feat(bridge): make turbo a runtime mode, with the base model as the default
+d5fcfe0 feat(repo): measure the resolution headroom, port the verifier to Rust, bound the bridge
 4e8f1a0 feat(bridge): pin Q6_K diffusion in VRAM and run the text encoder on CPU
 9169fed feat(bridge): on-demand OpenAI image API bridge over sd-server
 347ed52 docs(handoff): mark Unit 1 complete and plan Unit 2 (Rust bridge)
@@ -55,17 +55,17 @@ session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
  tests/run.sh                                       |   34 +
  tools/convrot-te-experiment.sh                     |   72 +
  35 files changed, 6558 insertions(+), 15 deletions(-)
---- staleness (last_updated_commit 4ef1ac1 .. HEAD):
-ef8a570 merge: bring the merged turbo-toggle unit (PR 5) into local dev
-cf99ac9 Merge pull request #5 from JLFN/feature/turbo-toggle
-8b75029 docs(handoff): record the manual-toggle decision
-3bac404 docs(handoff): correct the PR state recorded in the Unit 13 plan
-ebc8403 docs(handoff): record Unit 12 (turbo toggle) and plan Unit 13
-282d380 docs(handoff): refresh the progress and staleness probe blocks
-bf76419 docs(handoff): record the turbo adapter units and plan Unit 12
-6aaa31f test(qa): self-verified QA pass over the bridge turbo LoRA unit
-21e61a8 test(qa): self-verified QA pass over the Viggle turbo LoRA recipe unit
-639a098 docs(handoff): refresh the session probe block on dev
+--- staleness (last_updated_commit 31c7ed2 .. HEAD):
+bf50597 merge: bring the merged turbo-toggle unit (PR 5) into local dev
+7b8d9e5 Merge pull request #5 from JLFN/feature/turbo-toggle
+8ceda83 docs(handoff): record the manual-toggle decision
+04d4ca6 docs(handoff): correct the PR state recorded in the Unit 13 plan
+013912c docs(handoff): record Unit 12 (turbo toggle) and plan Unit 13
+cca52dc docs(handoff): refresh the progress and staleness probe blocks
+f8ac371 docs(handoff): record the turbo adapter units and plan Unit 12
+a9d499a test(qa): self-verified QA pass over the bridge turbo LoRA unit
+4df710e test(qa): self-verified QA pass over the Viggle turbo LoRA recipe unit
+88ad5b4 docs(handoff): refresh the session probe block on dev
 --- end handoff probe ---
 
 
@@ -114,16 +114,32 @@ anything that affects the model stack.
 
 2. Current state (2026-09-27 — the standing deployment is the UNCENSORED Q6_K; the bridge can layer adapters)
 
-- dev LOCAL is 73fdb63, fifteen commits ahead of origin/dev and unpushed
-  (handoff probes, QA evidence and merge commits only). Rule 23 forbids pushing
-  dev directly.
+- dev is IN SYNC with origin/dev (4859061 as of the purge below); the earlier
+  local-only handoff/docs commits were rewritten by the purge and landed in the
+  same force-push, so the old "unpushed dev" problem is gone. Rule 23's
+  "dev merges only via PR" still stands for everything that follows.
+- HISTORY PURGED 2026-09-27, on the operator's explicit request: every
+  qa-evidence/*.png was removed from the ENTIRE repository history with
+  git filter-repo, and the rewritten branches were force-pushed (dev and
+  feature/image-edit-probe; the four merged stale branches were deleted from the
+  remote). Consequences a fresh session must know:
+  * every commit hash from the first image onwards changed; the docs' commit
+    references were remapped from .git/filter-repo/commit-map (saved at
+    /data/imagegen-commit-map.txt), and the full pre-purge bundle of every ref is
+    at /data/imagegen-pre-purge.bundle - keep it, it is the only copy of the old
+    history;
+  * the images themselves still exist locally under qa-evidence/ (gitignored,
+    restored from the bundle) and inside the bundle;
+  * LIMIT: GitHub still keeps the old commits reachable through the merged pull
+    requests' pages (PRs 1-9) and its own object store until GC or a
+    support-side purge; the branch refs themselves now carry no images.
 - LANDED on origin/dev this session: PR 5 (turbo toggle), PR 6 (Q6_K
   deployment), PR 7 (the QUALITY/DRAFT/TURBO recipe), PR 8
-  (feature/uncensored-model-trial, 80e89eb): the standing model is now
+  (feature/uncensored-model-trial, 2c96969): the standing model is now
   qwen-image-2.1-UC-Q6_K.gguf (base weights + the 33.6 MB uncensored LoRA
   merged; chosen for content behaviour, NOT quality - the A/B measured 9/10
   realism on both), and the bridge gained an optional EXTRA adapter layer
-  (extra_lora) applied in every mode. All four branches are deleted; no PR is
+  (extra_lora) applied in every mode; PR 9 untracked the QA images. No PR is
   open.
 - THE LAYER: `extra_lora` rides on base and turbo alike, so one process serves
   uncensored DRAFT and uncensored TURBO; a turbo request carries two adapters
@@ -138,23 +154,23 @@ anything that affects the model stack.
   / 7978-8230 MiB / 3 of 10). Recipe and switch procedure:
   docs/sampling-profiles.md; all five model files with verified checksums:
   models/MANIFEST.md.
-- IDENTITY CHECKED: the pre-LoRA bridge (98ffc4a) and the current code, both on
+- IDENTITY CHECKED: the pre-LoRA bridge (8c5b808) and the current code, both on
   Q4_K_M with default tiling and no extra layer, produced byte-identical images
   for one request (1024 square, seed 4242, sha256 436f3a96...); artifact
   qa-evidence/qa-q4km-identity-1024.png.
 - LIVE SERVICE: UC-Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
   POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason.
   183 s per 1024-square image against open-grok's 240 s read timeout.
-- Unit 10 (edits) unchanged at 511c061 on feature/image-edit-probe, no PR yet.
+- Unit 10 (edits) unchanged at 2f07671 on feature/image-edit-probe, no PR yet.
 - UNEXPLAINED, watch it: four tracked QA artifacts (qa-playground-turbo-1024,
   qa-q4km-identity-1024, qa-gen-1152-8steps-seed5, qa-gen-512-seed11) were found
   missing from disk once this session, along with the session images 1.jpg and
   2.jpg; the tracked ones were restored from git. Cause unknown - check
   `git status` before committing anything that touches qa-evidence/.
 - FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
-  code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
+  code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that c018d2e
   added and that architecture.md and stop-imagegen-bridge still assume - the
-  merge af4e6c9 resolved main.rs to the turbo side, and guard 2 of the stop hook
+  merge fc9b9f9 resolved main.rs to the turbo side, and guard 2 of the stop hook
   reads an in_flight field that no longer exists. Reconcile with
   feature/on-demand-lifecycle.
 
@@ -170,7 +186,7 @@ and it must not disturb the turbo toggle or the Q6_K deployment (the same file
 and the same config carry them).
 
 Task 2, land Unit 10 (the image-edit path). feature/image-edit-probe carries
-three unpushed commits (tip 511c061) and has no PR; push it and open one against
+three unpushed commits (tip 2f07671) and has no PR; push it and open one against
 dev, or fold the unit into a fresh branch off the current dev tip. Then wire the
 adapter into the edit route: the edit body is a multipart POST to the backend's
 /v1/images/edits, that route is OpenAI-shaped (no lora field, prompt tags
@@ -286,10 +302,10 @@ three-way deployment comparison had to be argued from a critic pass.
      plus a bridge restart. Do not "helpfully" re-enable the adapter.
 
 - OPEN items:
-  1. feature/image-edit-probe (Unit 10, tip 511c061) carries three unpushed
+  1. feature/image-edit-probe (Unit 10, tip 2f07671) carries three unpushed
      commits and has no PR; land it (section 3 task 2).
   2. No PR is open as of this handoff: PRs 2-6 are merged and PR 1 is closed.
-  3. dev's bridge source lost the on-demand lifecycle code in the af4e6c9 merge
+  3. dev's bridge source lost the on-demand lifecycle code in the fc9b9f9 merge
      (in_flight, idle_secs, idle_timeout_secs, the idle shutdown); the stop hook
      and architecture.md still assume it. See section 3 task 1.
   4. The systemd path is dead on this machine but alive in the repo: the Unit 8
@@ -323,7 +339,7 @@ Progress meter:
     git log --grep "Unit: .* complete" 7443adfcd22374ddaa3e2139287e83a78d431367..HEAD
 
 Staleness check:
-    cd /data/imagegen && git log --oneline 3f3843e..HEAD
+    cd /data/imagegen && git log --oneline 6e699b1..HEAD
 - Any output means this handoff predates newer work: read the log and diffs
   before trusting sections 2-5, then advance last_updated_commit.
 - Branch or remote differing from the frontmatter: stop and reconcile.
