@@ -6,7 +6,7 @@ via POST /v1/turbo, the packaging/hooks/imagegen-turbo script, or a per-request
 
 qa-model: deepseek-flash (the primary agent, by operator request)
 Date: 2026-09-27. Revision tested: the working tree on feature/turbo-toggle, cut
-from origin/dev 86171d7. Binary: bin/imagegen-bridge, rebuilt with the canonical
+from origin/dev 40f3c2b. Binary: bin/imagegen-bridge, rebuilt with the canonical
 builder (bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge,
 release). The bridge that had been left running by the previous session was
 stopped first (packaging/hooks/stop-imagegen-bridge --force) and the rebuilt

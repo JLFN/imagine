@@ -4,7 +4,7 @@ the DRAFT/TURBO deployment can carry the uncensored LoRA on the base weights.
 
 qa-model: deepseek-flash (the primary agent, by operator request)
 Date: 2026-09-27. Revision tested: the working tree on feature/uncensored-model-trial,
-cut from origin/dev cf99ac9, with the bridge rebuilt by the canonical builder
+cut from origin/dev 7b8d9e5, with the bridge rebuilt by the canonical builder
 (bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge, release).
 The live bridge was restarted from the edited imagegen.toml, so every live claim
 below is about the running service.

@@ -5,7 +5,7 @@ that the headroom measurement made necessary.
 
 qa-model: deepseek-flash (the primary agent, by operator request)
 Date: 2026-09-22. Revision tested: the working tree on
-feature/unit7-resolution-and-port, on top of dev e7c478f, with the bridge
+feature/unit7-resolution-and-port, on top of dev 88ad12e, with the bridge
 running the newly built bin/imagegen-bridge (5,311,720 bytes).
 
 INDEPENDENCE DISCLOSURE, read this first
