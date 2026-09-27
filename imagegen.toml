@@ -13,6 +13,14 @@
 # switched at runtime (POST /v1/turbo, or a per-request "turbo" flag), so the
 # adapter is no longer applied to every generation.
 #
+# The STANDING deployment is base-only, on Q6_K with default VAE tiling: measured
+# 2026-09-27 at 1024 square (same prompt and seed, independent critic pass), Q6_K
+# scores 9/10 realism against 6/10 for Q4_K_M with the 16x16 tiles and 3/10 for
+# turbo, at 183 s against 141 s and 29 s. The turbo keys at the bottom of this
+# file are therefore commented out and the bridge reports turbo unavailable; the
+# note above `diffusion` says exactly what to change to bring turbo back (it
+# needs the Q4_K_M model plus the small VAE tiles, and a restart).
+#
 # Model paths have no built-in default on purpose: a wrong path that silently
 # loads a different model is worse than a refusal to start.
 #
@@ -23,23 +31,23 @@
 
 # sd-server binary, and the model paths it is given.
 sd_server = "bin/sd-server"
-# Q4_K_M, not the higher-quality Q6_K default, because of the adapter below:
-# with a runtime LoRA applied, Q6_K does not fit a 1024-square generation on this
-# 12 GB card. Measured 2026-09-27 with the turbo adapter and this placement:
-# "model manager cannot make enough memory available on CUDA0: need 767.11 MB
-# device / available 733.12 MB", then "qwen_image_2_1 segment 29/34
-# (qwen_image_2_1.transformer_blocks.27) failed during weight preparation" and a
-# 500 from the backend. Q4_K_M runs the same request in about 61 s.
+# Q6_K: the standing deployment is the base model, chosen for stills quality.
+# Measured 2026-09-27 at 1024 square, one prompt and seed, critic pass (agy):
+#   Q6_K, default tiling:     183 s, peak VRAM 9200 MiB, realism 9/10
+#   Q4_K_M, 16x16 VAE tiles:  141 s, peak VRAM 7272 MiB, realism 6/10
+#   turbo (Q4_K_M + adapter):  29 s, peak VRAM 7978 MiB, realism 3/10
 #
-# The mode toggle does NOT swap models or tile sizes: the file and the placement
-# flags are fixed when sd-server starts, and switching them means a restart (about
-# 35 s of weights staging). So base mode now runs on the turbo-tuned setup -
-# Q4_K_M and 16x16 VAE tiles - which is a little below the best base
-# configuration (Q6_K, default tiling; that is what the 28-step base path was
-# measured on, 169 s for a 1024-square image). Deploy base-only by swapping Q6_K
-# back in and dropping --vae-tiling; keep Q4_K_M and the small tiles to be able
-# to switch turbo on without a restart.
-diffusion = "models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf"
+# The turbo adapter cannot run on Q6_K at 1024 square (measured: "model manager
+# cannot make enough memory available on CUDA0", then segment 29/34
+# transformer_blocks.27 fails during weight preparation), so the adapter keys at
+# the bottom of this file are commented out and the bridge reports turbo
+# unavailable. To use turbo again, change all three together:
+#   1. diffusion to models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
+#   2. backend_args to add --vae-tiling --vae-tile-size 16x16
+#   3. uncomment lora_dir, lora, lora_multiplier and sigmas below
+# then restart the bridge (about 35 s of weight staging) and toggle as
+# documented in docs/viggle-turbo-lora.md.
+diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 
 # The text encoder. The upstream card recommends the ComfyUI int8 convrot file
@@ -67,20 +75,13 @@ llm = "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
 # text encoder's parameters as well cannot complete a 1024-square generation on
 # this 12 GB card. See docs/architecture.md.
 #
-# The VAE tile size is here because of the adapter. A runtime LoRA adds about
-# 2.4 GB of per-segment tables on the device, and that is the same budget the VAE
-# decode needs. Measured 2026-09-27, 1024 square, turbo adapter, 6 steps:
-#   default tiling (32x32 latent, 9 tiles): decode needs 512.00 MB with 508.69 MB
-#     free -> "vae decode compute failed while processing a tile", then a 500
-#   VAE on the CPU instead: fits, but the decode costs about 116 s (147 s total)
-#   16x16 latent tiles (49 tiles): no memory warnings at all, decode about 32 s,
-#     62.9 s for the whole image
-# Smaller tiles are not slower here: the pressure of the large tiles cost more
-# than the extra tile count. Without an adapter, the default is fine.
+# Default VAE tiling (no --vae-tiling): with Q6_K and no adapter the 1024-square
+# decode fits, and the small tiles were only ever needed for the turbo adapter's
+# 2.4 GB of runtime tables. The turbo deployment needs
+# --vae-tiling --vae-tile-size 16x16 instead; see the note above `diffusion`.
 backend_args = [
   "--backend", "te=cpu,diffusion=cuda0,vae=cuda0",
   "--params-backend", "te=cpu,diffusion=cuda0,vae=cpu",
-  "--vae-tiling", "--vae-tile-size", "16x16",
 ]
 
 # Where the bridge listens, and where its sd-server backend listens.
@@ -92,10 +93,9 @@ backend_port = 8788
 #
 # These are the BASE profile's values, and the bridge starts in base mode
 # (turbo = false below), so a request that sends neither steps nor cfg_scale runs
-# the 28-step base model at cfg 6.0 - the behaviour that existed before the turbo
-# path. In turbo mode the values come from the schedule and turbo_cfg_scale below
-# instead, and a steps value that disagrees with the schedule is ignored (and
-# logged).
+# the 28-step base model at cfg 6.0. Turbo mode would take its step count from
+# the sigma schedule and its cfg from turbo_cfg_scale instead, but turbo is
+# disabled in this deployment (see the note above `diffusion`).
 steps     = 28
 cfg_scale = 6.0
 
@@ -115,28 +115,21 @@ turbo = false
 # turbo request sends when the client does not send cfg_scale itself.
 turbo_cfg_scale = 1.0
 
-# Few-step turbo adapter. This is the TURBO profile: adapter and schedule are used
-# only when turbo is on, and never mixed into a base request.
+# Few-step turbo adapter: DISABLED in the standing deployment. The keys are kept
+# for reference and to make the switch back a three-line edit (see the note above
+# `diffusion`); uncomment all four together with the Q4_K_M model and the 16x16
+# VAE tiles, or turbo stays unavailable (the bridge reports turbo_available false
+# and refuses POST /v1/turbo with 409).
 #
-# The path is relative to lora_dir on purpose: sd-server builds its LoRA cache
-# from a recursive scan of the directory handed to it as --lora-model-dir and
-# rejects any path that is not an exact cache entry, so an absolute path here
-# would fail with "invalid lora path". The bridge passes lora_dir to the backend
-# itself. An adapter that is not on disk is now a startup WARNING rather than a
-# refusal to start (base mode does not need it), and enabling turbo against a
-# missing file is refused loudly instead of silently generating without it.
-#
-# The Viggle Qwen-Image-2.1 turbo distillation: six transformer passes with no
-# classifier-free guidance, 1024-square in about 61 s against 169 s for the
-# 28-step base model. Recipe, checksums and the measured numbers:
-# docs/viggle-turbo-lora.md.
-lora_dir        = "models/loras"
-lora            = "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"
-lora_multiplier = 1.0
-
-# The published schedule: the six nodes Viggle ships plus the trailing 0.0 that
-# makes it six steps rather than five (sd.cpp derives steps = sigmas.len() - 1).
-# Turbo mode needs it: with no schedule configured, turbo is unavailable rather
-# than silently sampled on the base scheduler, which the distillation was not
-# trained for.
-sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
+# With the keys active, the path is relative to lora_dir on purpose: sd-server
+# builds its LoRA cache from a recursive scan of the directory handed to it as
+# --lora-model-dir and rejects any path that is not an exact cache entry, so an
+# absolute path would fail with "invalid lora path". The Viggle Qwen-Image-2.1
+# turbo distillation is six transformer passes with no classifier-free guidance;
+# recipe, checksums and measured numbers in docs/viggle-turbo-lora.md. The sigma
+# list is the six nodes Viggle ships plus the trailing 0.0 that makes it six
+# steps rather than five (sd.cpp derives steps = sigmas.len() - 1).
+# lora_dir        = "models/loras"
+# lora            = "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"
+# lora_multiplier = 1.0
+# sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
