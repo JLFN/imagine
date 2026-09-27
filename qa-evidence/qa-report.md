@@ -1,218 +1,160 @@
-QA report for the imagegen bridge, Unit 6 (config file, backend supervision,
-upstream model layout, int8 convrot encoder as the shipped default) and its
-QA-driven fixes.
+QA report for imagegen Unit 8: the hook-driven on-demand lifecycle (start on an
+image request, stop on session end, and the bridge's own idle shutdown), plus
+re-verification of the Unit 7 surfaces this branch also carries.
 
 qa-model: deepseek-flash (the primary agent, by operator request)
-Date: 2026-09-22. Revision tested: fb054be plus the uncommitted startup
-restructure and architecture-doc notes in the working tree.
+Date: 2026-09-22. Revision tested: the working tree on
+feature/on-demand-lifecycle, which is STACKED on feature/unit7-resolution-and-port
+(d36eb68), so the diff against dev contains both units. Rebuilt binaries:
+bin/imagegen-bridge 5,348,760 bytes (this unit) and bin/convrot-verify (Unit 7).
 
 INDEPENDENCE DISCLOSURE, read this first
 This pass was performed by the same agent that wrote the code, at the operator's
-request, replacing a separate QA model. That makes it self-verification and
-strictly weaker than the two independent passes that preceded it (qa-model
-qwen38-flash-next-ds4, recorded in this file's history). To compensate, every
-check below was run live against the deployed service or a throwaway instance,
-evidence is quoted verbatim, and the list of things NOT verified is explicit.
-The three defects those independent passes found are the reason this revision
-exists at all; a self-pass should not be read as having equal weight.
+request, so it is self-verification and strictly weaker than an independent QA
+model's pass. Every claim below was exercised live - a real headless open-grok
+session, the real systemd unit, the real hook scripts through their installed
+symlinks - and the output is quoted verbatim. Nothing was verified by reading the
+code alone. The explicit "NOT verified" list at the end is part of the evidence.
 
 Surfaces covered, each with the command and what was observed.
 
-CONFIG imagegen.toml (the file is the binding source of truth)
-  command: P=$(pgrep -x sd-server | head -1); tr '\0' ' ' < /proc/$P/cmdline
-  observed: bin/sd-server --diffusion-model
-    models/diffusion_models/qwen-image-2.1-Q6_K.gguf --vae
-    models/vae/qwen_image_2.1_vae_bf16.safetensors --llm
-    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors --listen-ip
-    127.0.0.1 --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cuda0
-    --params-backend te=cpu,diffusion=cuda0,vae=cpu
-  Every value is the imagegen.toml value; the bridge process carries no
-  IMAGEGEN variables in its environ, so nothing came from the environment.
+CONFIG KEY idle_timeout_secs (the bridge's own stop, imagegen.toml)
+  Unit tests: cargo test -p imagegen-bridge
+  observed: 8 passed; 0 failed, including the four new ones -
+  idle_timer_fires_only_after_the_timeout,
+  idle_timer_never_fires_mid_request_or_when_disabled,
+  activity_guard_counts_and_refreshes, plus the five pre-existing size/ceiling
+  tests.
+  Live, the running bridge reports and logs the value:
+  - effective configuration: ... max_edge=1152 idle_timeout_secs=900 placement=...
+  - GET /health -> {"status":"ok","backend":true,"backend_process_alive":true,
+    "backend_restarts":0,"backend_restart_attempts":0,"in_flight":0,
+    "idle_secs":126,"idle_timeout_secs":900}
+  The shutdown itself, with the timeout shortened to 20 s so the test fits in a
+  session:
+  command: IMAGEGEN_IDLE_TIMEOUT_SECS=20 setsid nohup env
+           IMAGEGEN_IDLE_TIMEOUT_SECS=20 LD_LIBRARY_PATH=... ./bin/imagegen-bridge
+  observed: up after 1s, health idle_timeout_secs 20; the bridge exited BY ITSELF
+  after 48 s (the timer polls every 30 s, so the exit lands within one poll of the
+  timeout), with the log line "idle for 30s (timeout 20s), releasing the backend;
+  the next request restages the model stack", and pgrep -x sd-server afterwards
+  returned 0, so the backend was reaped rather than orphaned.
 
-CONFIG IMAGEGEN_CONFIG and the missing-path refusal
-  command: env -i IMAGEGEN_CONFIG=/tmp/qa-mine/absent.toml ./bin/imagegen-bridge
-  observed: exit=2, "no model path for IMAGEGEN_SD_SERVER: set it in
-  /tmp/qa-mine/absent.toml or in the environment"
-  Same command with only sd_server present advances to the next missing key, so
-  the check names one missing path at a time rather than failing anonymously.
-  COSMETIC FINDING, recorded rather than fixed: the message says "no model path"
-  for IMAGEGEN_SD_SERVER, which is the sd-server binary rather than a model. The
-  behaviour is correct (it refuses and exits 2); only the wording is imprecise. It
-  is left as found because changing it after this verification would invalidate the
-  evidence above for a string that no logic depends on.
+CONFIG KEY max_edge (inherited from the Unit 7 branch, re-verified here)
+  command: curl -X POST http://127.0.0.1:8787/v1/images/generations -d
+           '{"prompt":"x","size":"1344x1344"}'
+  observed: http_code=400 with "size 1344x1344 exceeds the maximum 1152x1152
+  supported by the configured layout (diffusion parameters pinned in VRAM) ..." and
+  the same run's config line showing max_edge=1152. Full Unit 7 coverage, with the
+  measurements behind the value, is in qa-evidence/unit7-qa-report.md.
 
-CONFIG malformed TOML
-  command: printf 'this is not toml = = =\n' > bad.toml; env -i
-    IMAGEGEN_CONFIG=bad.toml ./bin/imagegen-bridge
-  observed: exit=2, parser message "expected `.`, `=`"
+BINARY convrot-verify (inherited from the Unit 7 branch, re-verified here)
+  commands and observed exit codes, captured without a pipeline to avoid masking:
+    bin/convrot-verify                                  exit=0
+      verdict: PASS (pearson >= 0.99, rel_l2 <= 0.02 on every tensor checked)
+      embed_tokens pearson=0.999961 rel_l2=0.0089 max_abs=0.0010 control 1.3746
+    bin/convrot-verify /tmp/fake-weights.safetensors     exit=1
+      verdict: FAIL (a tensor disagreed with its BF16 ground truth)
+    bin/convrot-verify /tmp/nope.safetensors             exit=1
+      error: open /tmp/nope.safetensors: No such file or directory (os error 2)
 
-CONFIG per-key precedence, environment over file
-  command: a throwaway with a config whose values are deliberately fake
-    (sd_server /tmp/qa-mine/stub.sh, diffusion FROM-FILE-A.gguf, vae
-    FROM-FILE-B.safetensors, llm FROM-FILE-C.safetensors, backend_args
-    ["--backend","FILE-PLACEMENT"], listen_port 8797, backend_port 8798), started
-    with IMAGEGEN_CONFIG set and IMAGEGEN_DIFFUSION=FROM-ENV.gguf,
-    IMAGEGEN_LISTEN_PORT=8795, IMAGEGEN_BACKEND_PORT=8796
-  observed, from the stub's own recorded argv:
-    --diffusion-model FROM-ENV.gguf --vae FROM-FILE-B.safetensors --llm
-    FROM-FILE-C.safetensors --listen-ip 127.0.0.1 --listen-port 8796 --backend
-    FILE-PLACEMENT
-  So the three overridden keys took the environment and the others kept the file.
+The hook-driven lifecycle (the unit's actual subject)
 
-CONFIG backend_args reach the backend
-  observed: the production argv above ends with the two placement flag pairs, and
-  the same pair appears verbatim in the stub argv, so placement is file-driven and
-  env-overridable rather than compiled in.
+Two hook scripts, installed as symlinks from this repository so the repo is the
+source of truth (verified: ls -la ~/.opengrok/hooks/bin shows
+ensure-imagegen-bridge and stop-imagegen-bridge pointing at
+/data/imagegen/packaging/hooks/*, and both run through the symlink).
 
-BEHAVIOR startup observability (the defect the independent pass found)
-  command: IMAGEGEN_SD_SERVER=/bin/true IMAGEGEN_LISTEN_PORT=8797
-    IMAGEGEN_BACKEND_PORT=8798 (a backend that spawns and exits instantly)
-  observed: port 8797 bound (ss -tln), and GET /health answered DURING the
-    failure: {"backend":false,"backend_process_alive":false,
-    "backend_restart_attempts":1,"backend_restarts":0,"status":"ok"}
-  The listener binds before the readiness wait, so the bridge is observable while
-  the backend is broken instead of being unreachable for 180 s and then gone.
+  END-TO-END START, through a real session
+  command: bash /data/build-sd/e2e-hook-test.sh
+    (stop --force, confirm the bridge is down, then run
+     open-grok --cwd /data/imagegen -p "Use the image_gen tool to generate one
+     image of a red cube on a white table...")
+  observed: the headless session exit=0 and reported the tool result: a PNG at
+  .../images/1.jpg, 1,154,861 bytes, 1024x1024. The lifecycle log proves the hook
+  did the start, nobody else:
+    12:02:29 stop: stopping the bridge (sessions=2 in_flight=0 force=1)
+    12:02:29 stop: systemctl --user stop imagegen-bridge.service issued
+    12:02:38 started imagegen-bridge.service
+    12:02:39 healthy (foreground wait 10s)
+  and the bridge log shows the request it then served:
+    "generating 1 image(s) at 1024x1024 steps=28 cfg=6 seed=-1" at 12:02:39
+    "generated 1 image(s) in 175.280632557s"
+  175.28 s is inside open-grok's 240 s read timeout with the cold staging cost
+  included, which is the number that matters for on-demand use.
 
-BEHAVIOR readiness and /health probe timeouts are bounded
-  command: a stub that accepts the TCP connection and never answers, bridge on
-    8799/8800; time curl -s -m 40 http://127.0.0.1:8799/health
-  observed: answer in real 0m10.007s:
-    {"backend":false,"backend_process_alive":true,"backend_restart_attempts":0,
-     "backend_restarts":0,"status":"ok"}
-  Bounded at the 10 s probe timeout. Note for monitoring clients: /health can take
-  up to about 10 s when the backend is wedged.
+  START FALLBACK, with the systemd unit not installed
+  command: mv the unit away; systemctl --user daemon-reload; ensure-imagegen-bridge
+  observed: "unit load state: not-found"; the script launched the binary detached,
+  logged "detached launch attempted (pid 2335456)", the pid file matched the real
+  process (pgrep -x imagegen-bridge -> 2335456), and /health answered with
+  idle_timeout_secs 900. The unit was then restored and the deployment returned to
+  unit management (active, MainPID 2335572, health ok).
 
-BEHAVIOR a wedged-but-alive backend is not auto-restarted (documented limitation)
-  observed: over 20 s with that wedged stub, log lines matching
-    "restarting|exited" = 0, and health still reported
-    backend_process_alive true with both counters 0. The limitation stated in
-    docs/architecture.md is accurate as written.
+  STOP, guarded (three paths exercised)
+  command: stop-imagegen-bridge            -> observed "stop: skipped, 2 open-grok
+    sessions are alive (use --force to override)" and the bridge stayed up.
+  command: stop-imagegen-bridge --force    -> observed "stop: systemctl --user stop
+    imagegen-bridge.service issued" then "bridge is down, ports released".
+  command: stop-imagegen-bridge (bridge already down) -> observed "nothing to do,
+    /health does not answer".
+  The in-flight guard was NOT exercised against a live generation (see NOT
+  verified); it reads the in_flight field, which /health reports as 0 when idle and
+  which the unit test covers as a counter.
 
-BEHAVIOR backend supervision on production
-  command: kill -9 on the sd-server child, then poll /health
-  observed: before {"...backend_restart_attempts":0,"backend_restarts":0...};
-    t+3s attempts 1, restarts 0; t+7s attempts 1, restarts 1; log:
-      WARN sd-server backend exited (signal: 9 (SIGKILL))
-      WARN sd-server backend is down; restarting in 1s
-      INFO sd-server backend restarted and ready (restart number 1)
-  The two counters separate a spawn attempt from a confirmed healthy replacement,
-  which is the fix for the finding that attempts alone looked healthy.
+  CLEAN STOP THROUGH SYSTEMD (the new SIGTERM handler)
+  command: systemctl --user stop imagegen-bridge.service
+  observed: bridge process 0, sd-server 0, ports 8787/8788 free, and the bridge's
+  own log carries "SIGTERM received" followed by "shutdown signal received,
+  stopping sd-server" - i.e. the bridge reaped its own backend rather than relying
+  on systemd killing the whole cgroup. (The same test on the previous binary passed
+  only because of the cgroup kill, which is why it was re-run after the rebuild.)
 
-BEHAVIOR no zombie and no duplicate child
-  command: ps -o pid,stat,cmd --ppid $(pgrep -x imagegen-bridge | head -1)
-  observed: exactly one child, state Sl, with the expected convrot argv.
+  WHICH EVENTS FIRE, measured with a temporary probe hook
+  A throwaway hook logger recorded, for a headless run:
+    session_start, pre_tool_use, stop (reason end_turn)
+  and no session_end. The probe files were removed afterwards (verified: the only
+  hook json files left are callgraph, handoff, imagegen-bridge, skill-allowlist).
+  So the start half fires in headless and interactive runs, while the SessionEnd
+  stop applies to interactive sessions only and the idle timer is the backstop for
+  headless ones. This is recorded in docs/architecture.md rather than papered over.
 
-ENDPOINT GET /health
-  observed: HTTP 200, {"backend":true,"backend_process_alive":true,
-  "backend_restart_attempts":0,"backend_restarts":0,"status":"ok"}
+Rule 19 gate and the test entry point
+  command: bash tests/run.sh   (cargo test --workspace, then tests/qa-gate.sh)
+  observed: the gate extracts BINARY convrot-verify, CONFIG KEY max_edge and
+  CONFIG KEY idle_timeout_secs for this branch and requires a fresh report naming
+  each of them with the operative verdict as the last non-empty line.
 
-ENDPOINT GET /v1/models
-  observed: HTTP 200, {"data":[{"id":"Qwen-Image-2.1","object":"model",
-  "owned_by":"local"}]}
+Rule 10 dependency scan (before any push)
+  command: osv__osv_map_dependencies path=/data/imagegen
+  observed: no new dependencies were added by this unit (no Cargo.toml dependency
+  change), so the lockfile is the one scanned for Unit 7: 1 manifest, 155 packages,
+  0 vulnerable. Re-scanned at push time.
 
-ENDPOINT POST /v1/images/generations (full-quality artifact, production settings)
-  command: 1024x1024, 28 steps, seed 42, prompt "a lovely cat holding a sign says
-    qwen2.1.cpp", through the production bridge with the int8 convrot encoder
-  observed: http_code=200 total_time=140.023654s; a real PNG 1024x1024 RGBA,
-    2,463,614 bytes, saved as qa-evidence/qa-gen-1024-28steps-seed42.png.
-    Structure check: mean RGB [156.7 143.9 122.8], per-channel std
-    [51.9 54.9 61.2], so it is a rendered image and not a blank frame. /health
-    after the request: backend true, both counters 1.
-  Reproducibility, same pass: this file is byte-identical to the image produced by
-    the earlier deployment proof at the same seed and prompt
-    (sha256 cc9d0fd6a682eee8f01028cc906055860370d2d3240656fbc053b120d7a8a078 for
-    both qa-evidence/qa-gen-1024-28steps-seed42.png and out/proof-convrot-1024.png).
-    Two separate bridge processes, same bytes out, which is the strongest
-    end-to-end signal in this report.
+Rule 5 canonical build
+  command: bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
+  observed: built and copied to bin/imagegen-bridge (5,348,760 bytes). The bridge
+  was stopped first: the builder cannot replace a running binary ("Text file busy")
+  and deletes target/ afterwards, so a build against a live bridge silently
+  discards its output.
 
-ENDPOINT the small fast frames are evidence too
-  qa-evidence/qa-gen-512-seed11.png (mine, 512x512, 4 steps, 286,535 bytes) and
-  qa-evidence/qa-gen-512-seed3.png (from the independent pass, 512x512, 4 steps,
-  280,816 bytes). Both are genuine PNGs, kept as the cheap high-frequency checks
-  beside the 1024-square artifact above.
-
-
-ENDPOINT POST /v1/images/generations (real generation after the respawn)
-  command: 512x512, 4 steps, seed 11, on the production bridge
-  observed: http=200 time=29.909068s, a real PNG 512x512 RGBA, 286,535 bytes,
-  saved as qa-evidence/qa-gen-512-seed11.png. The same body was also run earlier
-  in the deployment proof at 1024x1024, 28 steps: HTTP 200, PNG, 158.56 s, inside
-  open-grok's 240 s read timeout.
-
-ENDPOINT POST error paths (all on production, backend untouched)
-  observed, seven malformed requests, each HTTP 400 with an
-  OpenAI-shaped error object of type invalid_request_error:
-    n=2                      "n must be 1 (multi-image batches are not supported)"
-    100x100                  "size '100x100' is not supported: width and height must be divisible by 32"
-    2048x2048                "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
-    aspect 1:1 + 2k          "size 2048x2048 exceeds the supported maximum of 1536x1536 on this 12 GB GPU"
-    whitespace prompt        "prompt is required"
-    {}                       "invalid request body: missing field `prompt`"
-    not json                 "invalid request body: expected ident at line 1 column 2"
-  /health before and after the seven rejects is byte-identical with both counters
-  at 0, so none of them reached or disturbed the backend.
-
-ENDPOINT size boundary, both request paths (throwaway, no models)
-  observed:
-    1536x1536 via size        forwarded (HTTP 502 from the fake stub, not 400)
-    1504x1504 via size        forwarded
-    1568x1568 via size        HTTP 400, "size 1568x1568 exceeds ... 1536x1536"
-    aspect 3:2 + 1080p        HTTP 400, "size 2048x1376 exceeds ... 1536x1536"
-    aspect 1:1 + 1k           forwarded
-  The ceiling applies to the final size from the aspect path as well, which is the
-  fix for the bypass the independent pass found.
-
-MODEL files (this pass, sha256 recomputed)
-  observed:
-    models/text_encoders/qwen3vl_8b_int8_convrot.safetensors
-      8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
-    models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
-      67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
-    models/vae/qwen_image_2.1_vae_bf16.safetensors
-      bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
-    models/diffusion_models/qwen-image-2.1-Q6_K.gguf
-      a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
-  All four match their models/MANIFEST.md entries, including the convrot encoder
-  entry added in response to the first independent pass's finding.
-
-MODEL layout matches the upstream card
-  observed: models/diffusion_models/, models/text_encoders/, models/vae/ exist and
-  hold the files above; every path in imagegen.toml resolves.
-
-Not verified in this pass, with the reason
-
-1. The 1024x1024, 28-step timing with the convrot encoder was measured earlier
-   today in the deployment proof (158.56 s) but not re-run here; a re-run costs a
-   full model staging and would have contended with the checks above.
-2. A true untiled-versus-tiled VAE decode comparison at 1024 square. At 768
-   square both sides tile, so the isolation the earlier attempt intended did not
-   happen; the recorded result is only that the decode is insensitive to tile
-   count (0.15 of 255 mean difference).
-3. 1344-square headroom under the pinned layout. Never measured; expected to be
-   too tight, and the bridge now rejects anything above 1536 with a clear 400.
-4. That the stock sd-server aborts on the convrot file. Proving it needs a second
-   9.3 GB model load, which would contend with production for the card. The .stock
-   binaries exist and are unverified in this pass.
-5. Exponential backoff growth beyond the first step: each failed cycle costs the
-   full 180 s startup window, so a multi-step check is expensive.
-6. The zip path for int8_tensorwise dequantization, which is unimplemented and
-   logs an error. Exercising it needs a zip-packaged model that does not exist
-   here.
-7. Direct evidence that the mmap dequantization branch engages. There is no
-   positive log line for it; the evidence is indirect - the backend loads the
-   convrot encoder and reports text_encoders 10104.77 MB in RAM, and a generation
-   succeeds, which the plain-file-only version failed to do.
-
-Open items recorded, not defects of this revision
-- tools/verify-convrot-dequant.py is Python inside the repository and rule 14
-  requires zero Python in the deliverable: port to Rust or remove before delivery.
-- The int8 convrot encoder costs about 5.8 GB more host RAM than the GGUF encoder
-  for the same VRAM peak, with image quality a measured tie. It is the shipped
-  default by operator decision, not because the measurement favours it.
-- The 1536 ceiling rejects open-grok's "2k" and "4k" tiers with a clear 400. The
-  default "1k" path is unaffected.
-- A backend that stays alive but never answers is not auto-restarted; it is
-  visible in /health as backend false.
-- The two sd.cpp patches have not been sent upstream.
+NOT verified in this pass, stated plainly
+  - The SessionEnd stop hook has never been observed firing. Headless runs do not
+    emit session_end on this build (measured), so it could only be exercised by an
+    interactive session ending, which this pass did not do. The script itself, its
+    guards and its systemd/SIGINT stop paths are verified by direct invocation.
+  - The in-flight guard was not tested against a real generation in progress; only
+    the counter and the /health field were verified.
+  - The unit's Restart=on-failure behavior was not exercised by killing the bridge
+    with a nonzero exit or an unhandled signal.
+  - The hooks were verified in a headless session and by direct invocation, not in
+    an interactive TUI session: the PreToolUse start is proven end to end, the
+    SessionEnd registration is proven only by inspection of the loaded hook files.
+  - The bridge's own idle shutdown was tested with a 20 s timeout; the shipped
+    900 s default was not waited out.
+  - No concurrency test was run: two sessions requesting images at once, and the
+    stop hook racing a starting request, are both untested.
+  - The hook scripts are bash; they were run with bash on this machine only (no
+    other shell, no other host).
 
 verdict: overall PASS

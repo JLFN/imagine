@@ -51,8 +51,16 @@ int8 file the way the patch does - per-row scale, then the rotation undo - gives
     control, rotation NOT undone            rel_l2 1.3734
 
 0.0086-0.0089 is int8 quantization noise, and the control shows the undo is doing
-real work rather than being a no-op. Reproduce with
-tools/verify-convrot-dequant.py.
+real work rather than being a no-op.
+
+Reproduce with the Rust verifier in this repository, crates/convrot-verify:
+
+    bin/convrot-verify [path/to/qwen3vl_8b_int8_convrot.safetensors]
+
+It prints the same numbers for the same two modules, adds a verdict line, and
+exits non-zero if a module disagrees with its BF16 ground truth. The experiment's
+Python script was ported to it 1:1 and removed (global guardrail rule 14); the
+port reproduces every printed digit above, including the wrong-rotation control.
 
 End to end, CPU-only: the encoder loads all 649 of its tensors, conditioning
 completes, and an image is produced. Conditioning cost on the same CPU footing and
