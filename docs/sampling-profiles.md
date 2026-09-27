@@ -10,24 +10,31 @@ in that session; the quality verdicts come from an independent critic pass
 
 | Profile | Diffusion model | VAE tiles | Adapters | Steps | CFG | Wall (1024 square) | Peak VRAM | Critic realism |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| QUALITY | UC-Q6_K | default | none | 28 | 6.0 | 183.3 s | 9200 MiB | 9/10 |
+| QUALITY | Q6_K | default | none | 28 | 6.0 | 183.3 s | 9200 MiB | 9/10 |
 | DRAFT | Q4_K_M | 16x16 | uncensored layer | 28 | 6.0 | 187.5 s | 7571 MiB | (see below) |
 | TURBO | Q4_K_M | 16x16 | uncensored layer + Viggle r128 | 6 | 1.0 | 32.7 s | 8230 MiB | 3/10 |
 
 All three: 1024x1024, one prompt (the neighbourhood playground), one seed (4242),
-through the bridge's OpenAI endpoint. Artifacts beside this recipe's QA evidence:
-qa-evidence/qa-playground-uncensored-q6k-1024.png (QUALITY, the standing model),
-qa-evidence/qa-playground-q6k-1024.png (the base Q6_K, the A/B reference),
+through the bridge's OpenAI endpoint. Every profile conditions on the same text
+encoder, the GGUF Qwen3VL-8B-Instruct-Q4_K_M file (models/MANIFEST.md section 2,
+the fixed architectural component). The int8 convrot encoder that shipped with
+the uncensored adoption was reverted and then deleted from disk on 2026-09-27;
+see "The text encoder" below. Artifacts beside this recipe's QA evidence:
+qa-evidence/qa-playground-uncensored-q6k-1024.png (the uncensored Q6_K, the
+QUALITY measurement above), qa-evidence/qa-playground-q6k-1024.png (the base
+Q6_K, the A/B reference),
 qa-evidence/qa-playground-q4km-base-1024.png (DRAFT without the layer),
 qa-evidence/qa-playground-turbo-1024.png (TURBO without the layer).
 
 ## What each one is for
 
-- QUALITY: final stills. The standing model is the UNCENSORED Q6_K build (base
-  weights with the 33.6 MB uncensored LoRA merged): chosen on 2026-09-27 for
-  content behaviour, because the base model refuses or sanitises some prompts
-  while this one does not. The measured A/B on an ordinary scene found no
-  quality difference (both 9/10 realism, 183 s, 9200 MiB). 183 s is inside
+- QUALITY: final stills. The standing model is the base Q6_K GGUF with the
+  default VAE tiling and the GGUF text encoder (see "The text encoder" below).
+  The uncensored Q6_K build (base weights with the 33.6 MB uncensored LoRA
+  merged) held this slot for part of 2026-09-27 and was replaced the same day: it
+  was adopted for content behaviour only - the measured A/B against the base was a
+  quality tie, both 9/10 realism, 183 s, 9200 MiB - and the operator reported
+  visible artifacts across that deployment's generations. 183 s is inside
   open-grok's 240 s read timeout with little margin. No adapter, so turbo is not
   available in this deployment (the bridge reports turbo_available false and
   refuses the toggle with 409, by design).
@@ -41,12 +48,41 @@ qa-evidence/qa-playground-turbo-1024.png (TURBO without the layer).
   subjects (realism 3/10 on the playground scene). Use it for composition checks,
   not for keepers.
 
+## The text encoder
+
+All three profiles condition on the GGUF Qwen3VL-8B-Instruct-Q4_K_M file, the
+component models/MANIFEST.md has called fixed since 2026-09-21. This is a
+correction of the 2026-09-27 uncensored adoption, which also switched the encoder
+to the ComfyUI int8 convrot safetensors; the operator reported artifacts in every
+generation of that deployment, and after the encoder was put back the artifacts
+were gone on the same prompts.
+
+The evidence for the attribution, and its limits: the diffusion and VAE files are
+unchanged since 2026-09-21, the sampling parameters never moved, and a controlled
+A/B proved the bridge binary cannot change a pixel (see "The identity guarantee"),
+so the encoder is the only component that differed from the configuration
+effectively serving the retained reference images - the backend captured on
+2026-09-26 carried the GGUF encoder while imagegen.toml already named the convrot
+file, so the process was stale relative to the config. The limit is that the
+2026-09-22 comparison of the two encoders recorded a quality tie, so this is an
+operator verdict on artifacts that the earlier measurement did not capture, not a
+reproduced encoder defect. Details: docs/convrot-encoder-experiment.md.
+
+The convrot file was deleted from disk on 2026-09-27. It is a public download if
+it is ever wanted again: Comfy-Org/Qwen-Image-2.1 text_encoders/
+qwen3vl_8b_int8_convrot.safetensors, sha256
+8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f (see
+models/MANIFEST.md and tools/convrot-te-experiment.sh, which is the script that
+measured it), and it needs the patched sd-server built from patches/0001 and
+patches/0002.
+
 ## The uncensored layer
 
-The uncensored behaviour is available two ways, and the deployment uses one of
-each: QUALITY ships the merged UC build, while the DRAFT/TURBO deployment layers
-the separate 33.6 MB LoRA on the base weights through the bridge's `extra_lora`
-key. The layer rides on every request in every mode, so one process gives
+The uncensored behaviour is available as the separate 33.6 MB LoRA on the base
+weights through the bridge's `extra_lora` key, which the DRAFT and TURBO
+deployments use. The two merged uncensored diffusion GGUFs stay on disk but no
+profile stands on them after 2026-09-27. The layer rides on every request in
+every mode, so one process gives
 uncensored DRAFT and uncensored TURBO; a turbo request carries both adapters in
 the server's structured lora list, verified in one run with "(454 / 454) LoRA
 tensors ... viggle-turbo" and "(256 / 256) LoRA tensors ... uncensored-lora".
@@ -80,9 +116,9 @@ seed, which is what the adapter-leak test in qa-evidence/qa-report.md relies on.
 Two deployments, one at a time (the machine runs one sd-server on the GPU):
 
 A. QUALITY (standing). imagegen.toml as committed: diffusion =
-   qwen-image-2.1-UC-Q6_K.gguf, backend_args without --vae-tiling, the turbo and
-   extra-lora keys commented out. Turbo is refused; this file's comments carry
-   the same recipe.
+   qwen-image-2.1-Q6_K.gguf, llm = Qwen3VL-8B-Instruct-Q4_K_M.gguf, backend_args
+   without --vae-tiling, the turbo and extra-lora keys commented out. Turbo is
+   refused; this file's comments carry the same recipe.
 
 B. DRAFT + TURBO. Four edits in imagegen.toml, listed above `diffusion`:
    diffusion = qwen-image-2.1-Q4_K_M.gguf, add --vae-tiling --vae-tile-size 16x16

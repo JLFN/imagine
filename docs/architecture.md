@@ -116,7 +116,9 @@ prompt "a lovely cat holding a sign says 'qwen2.1.cpp'", seed 42, euler, cfg 6.0
 peak VRAM from a 1 s nvidia-smi poll and host RSS from /usr/bin/time -v - the same
 method as the placement table above.
 
-Resolution headroom, 1344x1344 / 40 steps, one variable per row:
+Resolution headroom, 1344x1344 / 40 steps, one variable per row (the convrot rows
+were measured on 2026-09-22 with the encoder removed from disk on 2026-09-27; they
+are kept as the measurement that was made):
 
   layout                          encoder  result  sampling  decode      total     peak VRAM  peak RSS
   1152 sq, pinned (1152x1152)     GGUF     ok      269.29 s  5.13 tiled  275.88 s  10,060 MiB  6.4 GiB
@@ -188,13 +190,19 @@ models/diffusion_models/ for the GGUF diffusion models, models/text_encoders/ fo
 the text encoders, models/vae/ for the VAE. The files themselves are unchanged and
 hash-match the published checksums.
 
-The default text encoder is the ComfyUI int8 convrot file the upstream card
-recommends, which is why the deployed sd-server is the patched build from
-patches/0001 and patches/0002: stock sd.cpp aborts on that file. The GGUF encoder
-stays on disk at models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf and needs
-no patches; set IMAGEGEN_LLM to it (or edit imagegen.toml) to go back. Its
-measured cost against the GGUF encoder is about 5.8 GB more host RAM for the same
-VRAM peak, a somewhat higher conditioning time, and a tie on image quality.
+The default text encoder is the GGUF Qwen3VL-8B-Instruct-Q4_K_M file at
+models/text_encoders/, the component this project has treated as fixed since
+2026-09-21. The ComfyUI int8 convrot file the upstream model card recommends held
+the slot from 2026-09-22 until 2026-09-27, when it was reverted and then deleted
+from disk after the operator reported artifacts in its generations - evidence,
+limits and the recovery path in docs/convrot-encoder-experiment.md,
+docs/sampling-profiles.md and models/MANIFEST.md. The deployed sd-server is still
+the patched build from patches/0001 and patches/0002, which the convrot file
+required (stock sd.cpp aborts on it); the patched binary serves the GGUF encoder
+unchanged, which is the arrangement running today. The measured cost of the
+convrot file against the GGUF encoder was about 5.8 GB more host RAM for the same
+VRAM peak, a somewhat higher conditioning time, and a tie on image quality - the
+tie is what the artifact report above sits outside of.
 
 The bridge supervises its backend. It reaps the child, and if the process dies it
 restarts it with exponential backoff and waits for it to answer before calling it

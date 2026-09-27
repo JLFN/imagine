@@ -69,7 +69,9 @@ verified locally against the repository's SHA256SUMS on 2026-09-27.
 - File:         models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf
 - Size:         5.03 GB
 - Source:       https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF
-- Checksums:    repo page
+- Checksums:    sha256 67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2
+                (matches the Hugging Face LFS object id; verified locally
+                2026-09-27 after the file was re-fetched, 5,027,784,800 bytes)
 - Note:         Qwen-Image-2.1 conditions on Qwen3-VL-8B-Instruct exactly.
                 It CANNOT be substituted with the Qwen3.8 Flash Next model
                 served by ds4 on the Spark (different embedding space). Try
@@ -157,18 +159,25 @@ SHA256SUMS / HF LFS oids. sha256sum and ls -l output below:
   size    5876556448
   sha256  a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
   (source: abenzerps/Qwen-Image-2.1-GGUF SHA256SUMS; matches HF LFS oid)
-- models/text_encoders/qwen3vl_8b_int8_convrot.safetensors   (deployed default TE)
+- models/text_encoders/qwen3vl_8b_int8_convrot.safetensors   (REMOVED FROM DISK 2026-09-27)
   size    9350798360
   sha256  8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
   (source: Comfy-Org/Qwen-Image-2.1 text_encoders/ HF LFS oid; the same bytes are
   published as KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF
   text_encoders/qwen3vl_8b_int8_convrot.safetensors, verified against both)
+  NOT DEPLOYED, and no longer on disk: it held the text-encoder slot for part of
+  2026-09-27 as part of the uncensored adoption, the operator reported visible
+  artifacts in the generations of that deployment, and the GGUF encoder in
+  section 2 above is the standing component. It is a public download, so the
+  bytes above (size and sha256) are the whole recovery path; the recipe and the
+  measured comparison are docs/convrot-encoder-experiment.md and
+  docs/sampling-profiles.md.
   REQUIRES the patched sd-server built from patches/0001 and patches/0002: stock
   sd.cpp misreads this file's geometry at load and then cannot dequantize its
-  int8 token embedding. See docs/convrot-encoder-experiment.md. Reports
+  int8 token embedding. Reports
   10,104.77 MB of parameters at load against the GGUF encoder's 4,302.33 MB, so it
   costs about 5.8 GB more host RAM for the same VRAM peak; the GGUF encoder above
-  remains the lighter option and needs no patches.
+  was always the lighter option and needs no patches.
   The Q6_K diffusion model (~28% larger than Q4_K_M) is the practical
   higher-fidelity default on the 12 GB GPU and is the deployed default in
   the bridge. Its parameters are pinned in VRAM (not RAM-staged): updated

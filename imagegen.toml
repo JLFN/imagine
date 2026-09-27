@@ -13,12 +13,13 @@
 # switched at runtime (POST /v1/turbo, or a per-request "turbo" flag), so the
 # adapter is no longer applied to every generation.
 #
-# The STANDING deployment is base-only, on the UNCENSORED Q6_K with default VAE
-# tiling: the QUALITY profile. Measured 2026-09-27 at 1024 square (same prompt
-# and seed, independent critic pass), QUALITY scores 9/10 realism against 6/10
-# for DRAFT (Q4_K_M base with the 16x16 tiles) and 3/10 for TURBO, at 183 s
-# against 141 s and 29 s. The turbo keys at the bottom of this file are therefore
-# commented out and the bridge reports turbo unavailable; the note above
+# The STANDING deployment is base-only, on the base Q6_K model with default VAE
+# tiling, conditioned by the GGUF text encoder: the QUALITY profile. Measured
+# 2026-09-27 at 1024 square (same prompt and seed, independent critic pass),
+# QUALITY scores 9/10 realism against 6/10 for DRAFT (Q4_K_M base with the 16x16
+# tiles) and 3/10 for TURBO, at 183 s against 141 s and 29 s. The turbo keys at
+# the bottom of this file are therefore commented out and the bridge reports
+# turbo unavailable; the note above
 # `diffusion` says exactly what to change to get the DRAFT + TURBO deployment
 # back (the base Q4_K_M model, the small VAE tiles, the four turbo keys and the
 # extra uncensored layer, then a restart). The full recipe for the three
@@ -35,16 +36,20 @@
 
 # sd-server binary, and the model paths it is given.
 sd_server = "bin/sd-server"
-# Q6_K, UNCENSORED build: the standing deployment is the QUALITY profile, and the
-# uncensored variant was chosen on 2026-09-27 for its content behaviour (the base
-# model refuses or sanitises some prompts; this one does not), not for quality -
-# the measured A/B found no quality difference on an ordinary scene (both 9/10
-# realism at 1024 square). It is the base weights with the repo's 33.6 MB
-# uncensored LoRA merged; provenance and checksums in models/MANIFEST.md.
+# Q6_K, base weights: the standing deployment is the QUALITY profile. Three more
+# diffusion GGUFs sit on disk (the plain Q4_K_M and the two abenzerps uncensored
+# builds); provenance and checksums in models/MANIFEST.md.
 # Measured 2026-09-27 at 1024 square, one prompt and seed, critic pass (agy):
 #   QUALITY (this file):      183 s, peak VRAM 9200 MiB, realism 9/10
 #   DRAFT (Q4_K_M + tiles):   141 s, peak VRAM 7272 MiB, realism 6/10
 #   TURBO (Q4_K_M + adapter):  29 s, peak VRAM 7978 MiB, realism 3/10
+#
+# This line and the encoder below moved together on 2026-09-27 to reproduce the
+# configuration that was effectively live when the retained reference images were
+# made. The evidence points at the encoder rather than the diffusion file: the
+# diffusion and VAE files have not changed since 2026-09-21, and the uncensored
+# Q6_K was only ever a content-behaviour choice (the measured A/B against the
+# base was a quality tie), so it is not the standing model.
 #
 # The turbo adapter cannot run on Q6_K at 1024 square (measured: "model manager
 # cannot make enough memory available on CUDA0", then segment 29/34
@@ -59,40 +64,51 @@ sd_server = "bin/sd-server"
 #      layer; without it DRAFT runs the plain base weights)
 # then restart the bridge (about 35 s of weight staging) and toggle as
 # documented in docs/sampling-profiles.md and docs/viggle-turbo-lora.md.
-diffusion = "models/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf"
+diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 
-# The text encoder. The upstream card recommends the ComfyUI int8 convrot file
-# (8.71 GiB) over the bf16 one (16.33 GiB), and that ordering is true within that
-# pair. Against the GGUF encoder below it is not a memory saving: it reports
-# 10,104.77 MB of parameters against 4,302.33 MB, for the same VRAM peak, a
-# somewhat higher conditioning time, and a tie on image quality.
+# The text encoder: the GGUF file this project has treated as a fixed
+# architectural component since 2026-09-21 (models/MANIFEST.md: "Try any other
+# encoder and generations are incoherent"), and the one the running backend
+# carried when the retained reference images were made. Restored 2026-09-27; it
+# is the standing choice, and the int8 convrot file below is not.
 #
-# It also needs the patched build from patches/0001 and patches/0002. The patch
-# that dequantizes the int8 token embedding reads the companion row scales from
-# whichever source the weights came from: a plain file (sd-cli) or an mmap
-# (sd-server). Handling only the plain-file case made a generation abort the
-# backend with "type i8 unsupported for integer quantization" while sd-cli worked;
-# both paths are implemented as of 2026-09-22. The zip path is still unimplemented
-# and logs an explicit error rather than throwing.
-llm = "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
-
-# Fallback that needs no patched sd.cpp, at 4.3 GB instead of 10.1 GB of params:
-# llm = "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+# The int8 convrot file is the alternative the upstream card recommends (8.71 GiB
+# against the bf16 16.33 GiB). It is DELETED FROM DISK as of 2026-09-27, and the
+# line below is not a switch but the record of what it was; its size and sha256,
+# and the public sources to fetch it from, are in models/MANIFEST.md.
+# llm = "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+# Against this GGUF file it is not a memory saving - 10,104.77 MB of parameters
+# against 4,302.33 MB, for the same VRAM peak, a somewhat higher conditioning
+# time, and a tie on image quality in the 2026-09-22 comparison - and it needs the
+# patched build from patches/0001 and patches/0002. The patch that dequantizes the
+# int8 token embedding reads the companion row scales from whichever source the
+# weights came from: a plain file (sd-cli) or an mmap (sd-server). Handling only
+# the plain-file case made a generation abort the backend with "type i8
+# unsupported for integer quantization" while sd-cli worked; both paths are
+# implemented as of 2026-09-22. The zip path is still unimplemented and logs an
+# explicit error rather than throwing. Measured evidence for the restore, and the
+# limits of the attribution: docs/convrot-encoder-experiment.md.
+llm = "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
 
 # Where each module's graphs run and where its parameters live. Measured on this
 # workstation: diffusion parameters pinned in VRAM, text encoder entirely on the
-# CPU, VAE parameters in RAM with GPU compute. This holds ~4.4 GiB less host RAM
-# and ~3.4 GiB less of the VRAM peak than sd.cpp's --offload-to-cpu. Pinning the
-# text encoder's parameters as well cannot complete a 1024-square generation on
-# this 12 GB card. See docs/architecture.md.
+# CPU. This holds ~4.4 GiB less host RAM and ~3.4 GiB less of the VRAM peak than
+# sd.cpp's --offload-to-cpu. Pinning the text encoder's parameters as well cannot
+# complete a 1024-square generation on this 12 GB card. See docs/architecture.md.
+#
+# The VAE is on the CPU in both lines below: that is the arrangement of the
+# process that produced the retained reference images (2026-09-26). The committed
+# 2026-09-26 file paired --backend vae=cuda0 (decode on the GPU) with
+# --params-backend vae=cpu; which of the two the artifact report above is
+# sensitive to has not been measured.
 #
 # Default VAE tiling (no --vae-tiling): with Q6_K and no adapter the 1024-square
 # decode fits, and the small tiles were only ever needed for the turbo adapter's
 # 2.4 GB of runtime tables. The turbo deployment needs
 # --vae-tiling --vae-tile-size 16x16 instead; see the note above `diffusion`.
 backend_args = [
-  "--backend", "te=cpu,diffusion=cuda0,vae=cuda0",
+  "--backend", "te=cpu,diffusion=cuda0,vae=cpu",
   "--params-backend", "te=cpu,diffusion=cuda0,vae=cpu",
 ]
 
