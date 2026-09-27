@@ -33,6 +33,21 @@
 //   IMAGEGEN_BACKEND_PORT    internal sd-server port     (8788)
 //   IMAGEGEN_STEPS           default sampling steps      (28)
 //   IMAGEGEN_CFG_SCALE       default CFG scale           (6.0)
+//   IMAGEGEN_LORA_DIR        LoRA directory, handed to sd-server as
+//                            --lora-model-dir            (models/loras)
+//   IMAGEGEN_LORA            LoRA file, relative to IMAGEGEN_LORA_DIR; unset
+//                            means the base model with no adapter
+//   IMAGEGEN_LORA_MULTIPLIER adapter multiplier           (1.0)
+//   IMAGEGEN_SIGMAS          comma-separated sigma schedule, e.g.
+//                            1.0,0.9375,0.875,0.75,0.5,0.25,0.0; unset or empty
+//                            means sd.cpp's own scheduler
+//
+// Few-step turbo adapters (the Viggle Qwen-Image-2.1 distillation; see
+// docs/viggle-turbo-lora.md) are published as a sigma schedule rather than a
+// step count, and sd-server is deliberately not a place where a prompt tag can
+// carry a LoRA. Both facts shape the wiring here: the adapter goes out as a
+// structured `lora` entry, and the schedule goes out inside the native JSON the
+// server reads from the prompt, because the sdapi route has no sigma field.
 //
 // Placement rationale (measured 2026-09-22 on this box, 1024x1024 / 28 steps /
 // seed 42, same prompt throughout, RTX 4070 SUPER 12 GB; peak VRAM from a 1 s
@@ -78,8 +93,17 @@ struct Config {
     steps: u32,
     cfg_scale: f64,
     backend_args: Vec<String>,
-    max_edge: u32,
-    idle_timeout_secs: u32,
+    /// Directory handed to sd-server as --lora-model-dir. The `lora` path below
+    /// is resolved by the server as a path RELATIVE to this directory: the
+    /// server builds its LoRA cache from a recursive scan of the directory and
+    /// only accepts a match against a cache entry (routes_sdapi.cpp lora[] ->
+    /// runtime.cpp get_lora_full_path). An absolute path would not match.
+    lora_dir: Option<String>,
+    /// Adapter file name, relative to `lora_dir`. None means no adapter.
+    lora: Option<String>,
+    lora_multiplier: f64,
+    /// Custom sigma schedule. Empty means sd.cpp's scheduler decides.
+    sigmas: Vec<f64>,
 }
 
 /// What the TOML configuration file may contain.
@@ -101,8 +125,10 @@ struct FileConfig {
     backend_port: Option<u16>,
     steps: Option<u32>,
     cfg_scale: Option<f64>,
-    max_edge: Option<u32>,
-    idle_timeout_secs: Option<u32>,
+    lora_dir: Option<String>,
+    lora: Option<String>,
+    lora_multiplier: Option<f64>,
+    sigmas: Option<Vec<f64>>,
 }
 
 /// Environment wins, then the file, then the built-in fallback.
@@ -171,6 +197,59 @@ impl Config {
             }
         };
 
+        // LoRA and sigma schedule. Setting an environment variable to the empty
+        // string is the documented way to turn an optional setting off without
+        // editing the file, so "" means None here, not an empty path.
+        let env_or_file_opt = |env_key: &str, file_val: Option<String>| -> Option<String> {
+            match std::env::var(env_key) {
+                Ok(v) => {
+                    let trimmed = v.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }
+                Err(_) => file_val,
+            }
+        };
+        let lora_dir = env_or_file_opt("IMAGEGEN_LORA_DIR", file.lora_dir);
+        let lora = env_or_file_opt("IMAGEGEN_LORA", file.lora);
+        let lora_multiplier =
+            pick("IMAGEGEN_LORA_MULTIPLIER", file.lora_multiplier, Some(1.0)).unwrap();
+        let sigmas = match std::env::var("IMAGEGEN_SIGMAS") {
+            Ok(v) => match parse_sigmas(&v) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("{}", e);
+                    std::process::exit(2);
+                }
+            },
+            Err(_) => file.sigmas.unwrap_or_default(),
+        };
+        if lora.is_some() && lora_dir.is_none() {
+            error!(
+                "IMAGEGEN_LORA is set without IMAGEGEN_LORA_DIR: sd-server resolves the \
+                 adapter path relative to that directory, so the adapter would be ignored"
+            );
+            std::process::exit(2);
+        }
+        // A configured adapter that is not on disk is a startup error, for the
+        // same reason a wrong model path is: silently generating without the
+        // adapter looks like a quality regression, not like a typo.
+        if let (Some(dir), Some(name)) = (&lora_dir, &lora) {
+            let full = std::path::Path::new(dir).join(name);
+            if !full.is_file() {
+                error!(
+                    "no adapter at {} (lora_dir = {}): refusing to start rather than \
+                     generate without the configured LoRA",
+                    full.display(),
+                    dir
+                );
+                std::process::exit(2);
+            }
+        }
+
         let cfg = Config {
             // Every path, the binary included, comes from the file or the
             // environment. A wrong path is a startup error, not a panic later.
@@ -189,17 +268,14 @@ impl Config {
                 .map(|s| s.split_whitespace().map(str::to_string).collect())
                 .or(file.backend_args)
                 .unwrap_or_else(default_backend_args),
-            max_edge: pick("IMAGEGEN_MAX_EDGE", file.max_edge, Some(DEFAULT_MAX_EDGE)).unwrap(),
-            idle_timeout_secs: pick(
-                "IMAGEGEN_IDLE_TIMEOUT_SECS",
-                file.idle_timeout_secs,
-                Some(DEFAULT_IDLE_TIMEOUT_SECS),
-            )
-            .unwrap(),
+            lora_dir,
+            lora,
+            lora_multiplier,
+            sigmas,
         };
         info!(
             "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
-             steps={} cfg_scale={} max_edge={} idle_timeout_secs={} placement={}",
+             steps={} cfg_scale={} lora={} lora_multiplier={} sigmas={} placement={}",
             cfg.diffusion,
             cfg.llm,
             cfg.vae,
@@ -208,8 +284,13 @@ impl Config {
             cfg.backend_port,
             cfg.steps,
             cfg.cfg_scale,
-            cfg.max_edge,
-            cfg.idle_timeout_secs,
+            cfg.lora.as_deref().unwrap_or("(none)"),
+            cfg.lora_multiplier,
+            if cfg.sigmas.is_empty() {
+                "(scheduler)".to_string()
+            } else {
+                sigmas_arg(&cfg.sigmas)
+            },
             cfg.backend_args.join(" ")
         );
         cfg
@@ -229,8 +310,11 @@ fn spawn_backend(cfg: &Config) -> Result<Child, String> {
         "backend placement args: {}",
         cfg.backend_args.join(" ")
     );
-    Command::new(&cfg.sd_server)
-        .arg("--diffusion-model")
+    if let Some(dir) = cfg.lora_dir.as_deref() {
+        info!("backend lora directory: {}", dir);
+    }
+    let mut cmd = Command::new(&cfg.sd_server);
+    cmd.arg("--diffusion-model")
         .arg(&cfg.diffusion)
         .arg("--vae")
         .arg(&cfg.vae)
@@ -239,8 +323,13 @@ fn spawn_backend(cfg: &Config) -> Result<Child, String> {
         .arg("--listen-ip")
         .arg("127.0.0.1")
         .arg("--listen-port")
-        .arg(cfg.backend_port.to_string())
-        .args(&cfg.backend_args)
+        .arg(cfg.backend_port.to_string());
+    if let Some(dir) = cfg.lora_dir.as_deref() {
+        // Without this the server's LoRA cache is empty and every configured
+        // adapter path is rejected as "invalid lora path".
+        cmd.arg("--lora-model-dir").arg(dir);
+    }
+    cmd.args(&cfg.backend_args)
         .spawn()
         .map_err(|e| format!("failed to spawn sd-server at {}: {}", cfg.sd_server, e))
 }
@@ -422,45 +511,75 @@ struct AppState {
     cfg: Config,
     backend_base: String,
     backend: std::sync::Arc<BackendHandle>,
-    /// Millisecond timestamp of the last generation request, the idle timer's
-    /// input. Starts at process start, so a bridge that is started and never
-    /// used still releases itself.
-    last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Generation requests currently being served. The idle timer never fires
-    /// while this is non-zero, so a long first request cannot be interrupted by
-    /// its own timeout.
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the backend's LoRA cache has been primed in this process, and
+    /// whether the configured adapter was in the list when it was.
+    lora_primed: std::sync::atomic::AtomicBool,
+    lora_visible: std::sync::Mutex<Option<bool>>,
 }
 
-/// Marks one generation request as in flight for as long as it lives, and
-/// refreshes the idle timer at both ends. The timeout therefore counts from the
-/// end of the last request, never from its start.
-struct ActivityGuard {
-    last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl ActivityGuard {
-    fn enter(
-        last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        use std::sync::atomic::Ordering::SeqCst;
-        in_flight.fetch_add(1, SeqCst);
-        last_activity_ms.store(now_ms() as u64, SeqCst);
-        Self {
-            last_activity_ms,
-            in_flight,
+/// Ask the backend for its LoRA list.
+///
+/// sd-server builds that cache lazily, and its sdapi generation route does not
+/// refresh it, so on a cold backend every configured adapter path is rejected
+/// with "invalid lora path" until something asks for the list. The bridge
+/// therefore primes it once, and the answer doubles as a check that the
+/// configured adapter is actually visible to the server.
+async fn prime_lora_cache(st: &AppState) -> bool {
+    let url = format!("{}/sdapi/v1/loras", st.backend_base);
+    let resp = st
+        .client
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let list_ok = match resp {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let want = st.cfg.lora.as_deref();
+                let visible = want
+                    .map(|want| {
+                        v.as_array()
+                            .map(|entries| {
+                                entries.iter().any(|e| {
+                                    e.get("path").and_then(|p| p.as_str()) == Some(want)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+                *st.lora_visible.lock().unwrap() = Some(visible);
+                if !visible {
+                    error!(
+                        "the backend does not list the configured adapter {}; every \
+                         generation will be refused by it",
+                        want.unwrap_or("(none)")
+                    );
+                } else {
+                    info!(
+                        "backend lora cache primed; configured adapter {} is visible",
+                        want.unwrap_or("(none)")
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                warn!("could not parse the backend lora list: {}", e);
+                false
+            }
+        },
+        Ok(r) => {
+            warn!(
+                "backend lora list returned {}; leaving the LoRA cache alone",
+                r.status()
+            );
+            false
         }
-    }
-}
-
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.last_activity_ms.store(now_ms() as u64, SeqCst);
-        self.in_flight.fetch_sub(1, SeqCst);
-    }
+        Err(e) => {
+            warn!("backend lora list request failed: {}", e);
+            false
+        }
+    };
+    list_ok
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +600,65 @@ struct GenRequest {
     cfg_scale: Option<f64>,
 }
 
+/// Parse a comma-separated sigma list. An empty string or the word "none" means
+/// "let sd.cpp build its own schedule".
+fn parse_sigmas(value: &str) -> Result<Vec<f64>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<f64>() {
+            Ok(v) => out.push(v),
+            Err(_) => return Err(format!("sigma list: '{}' is not a number", part)),
+        }
+    }
+    if out.len() == 1 {
+        return Err("sigma list: a schedule needs at least two values".to_string());
+    }
+    Ok(out)
+}
+
+/// The comma-separated form, for logs and for the environment override.
+fn sigmas_arg(sigmas: &[f64]) -> String {
+    sigmas
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Attach a custom sigma schedule to the prompt.
+///
+/// The sdapi route has no sigma field of its own, so the schedule travels as the
+/// native JSON the server extracts from the prompt: it strips
+/// <sd_cpp_extra_args>...</sd_cpp_extra_args>, then parses the payload with
+/// gen_params.from_json_str, which reads sample_params.custom_sigmas. The tag is
+/// removed before generation, so it never reaches the text encoder.
+fn prompt_with_sigmas(prompt: &str, sigmas: &[f64]) -> String {
+    if sigmas.is_empty() {
+        return prompt.to_string();
+    }
+    let extra = serde_json::json!({ "sample_params": { "custom_sigmas": sigmas } });
+    format!("{}<sd_cpp_extra_args>{}</sd_cpp_extra_args>", prompt, extra)
+}
+
+/// sd.cpp derives its step count from the sigma list length (steps = len - 1).
+/// Deriving it here keeps the two from disagreeing, and a disagreement is not
+/// cosmetic: too few steps drops the last denoise.
+fn steps_for(steps: u32, sigmas: &[f64]) -> u32 {
+    if sigmas.is_empty() {
+        steps
+    } else {
+        (sigmas.len() - 1) as u32
+    }
+}
+
 fn parse_size(size: &str) -> Result<(u32, u32), String> {
     let (w, h) = size
         .split_once('x')
@@ -496,68 +674,21 @@ fn parse_size(size: &str) -> Result<(u32, u32), String> {
             size
         ));
     }
+    check_edge_limit(w, h)?;
     Ok((w, h))
 }
 
-/// The largest edge the default layout can actually serve, measured on this
-/// workstation rather than assumed. The deployed placement pins the Q6_K
-/// diffusion model in VRAM (5.6 GB of the 12 GB card), which leaves room for
-/// 1152 square (peak 10,060 MiB, sampling 269 s for 40 steps) but not for 1344:
-/// at 1344 square the sampling graph fails during weight preparation, short by
-/// about 0.2 MB of a 6,658 MB budget, for both text encoders and with an
-/// explicit --max-vram budget. 1344 square does run under --offload-to-cpu
-/// (502 s, 16.1 GB host RAM), which is what a direct sd-cli run should use.
-///
-/// A ceiling keeps one caller from asking for a size that cannot fit and
-/// failing the generation or aborting the backend; a clear rejection is better
-/// than either. It is configurable because it is a property of the layout in
-/// backend_args, not of the card: raise it together with a layout that can
-/// serve the larger size. See docs/architecture.md.
-const DEFAULT_MAX_EDGE: u32 = 1152;
+/// The largest edge this card is documented to cover at this precision. A hard
+/// ceiling keeps one caller from asking for a size that cannot fit and failing
+/// the generation or aborting the backend; a clear rejection is better than
+/// either. Applied to the final size from both request paths.
+const MAX_EDGE: u32 = 1536;
 
-/// Seconds without a generation request before the bridge shuts itself down and
-/// releases the model stack. On-demand deployments are started by a hook when an
-/// image is requested; nothing would otherwise release the backend afterwards,
-/// and the stack is not small: after the first request the backend holds about
-/// 11 GB of RSS and 5.6 GB of pinned VRAM for as long as the bridge lives.
-///
-/// 900 s (15 minutes) is a deliberately generous default: restaging costs about
-/// 35 to 40 s on the next request, so exiting too eagerly trades a cheap idle
-/// process for an expensive first request. Set it to 0 to disable the timer and
-/// behave like a permanently resident service.
-const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 900;
-
-/// How often the idle timer checks. The check itself is free; the poll interval
-/// bounds how late the shutdown can be, not how long the process lives.
-const IDLE_POLL_SECS: u64 = 30;
-
-/// Pure decision behind the idle shutdown, so the rule is testable without
-/// waiting out a timeout: idle only once the timeout has actually elapsed, and
-/// never while a request is in flight. A timeout of 0 disables the timer.
-fn idle_expired(now_ms: u128, last_activity_ms: u128, in_flight: usize, timeout_secs: u32) -> bool {
-    if timeout_secs == 0 || in_flight > 0 {
-        return false;
-    }
-    now_ms.saturating_sub(last_activity_ms) >= (timeout_secs as u128) * 1000
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
-fn check_edge_limit(w: u32, h: u32, max_edge: u32) -> Result<(), String> {
-    if w > max_edge || h > max_edge {
+fn check_edge_limit(w: u32, h: u32) -> Result<(), String> {
+    if w > MAX_EDGE || h > MAX_EDGE {
         return Err(format!(
-            "size {}x{} exceeds the maximum {}x{} supported by the configured layout \
-             (diffusion parameters pinned in VRAM): at larger sizes the sampling graph \
-             cannot be allocated on this 12 GB GPU and the request fails during weight \
-             preparation. Raise max_edge in the configuration only together with a layout \
-             that can serve it; for a one-off large image run sd-cli directly with \
-             --offload-to-cpu. See docs/architecture.md.",
-            w, h, max_edge, max_edge
+            "size {}x{} exceeds the supported maximum of {}x{} on this 12 GB GPU",
+            w, h, MAX_EDGE, MAX_EDGE
         ));
     }
     Ok(())
@@ -623,22 +754,24 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
-    // Idle state is reported so an operator (or the stop hook) can tell a busy
-    // bridge from an idle one without guessing: a stop that interrupts a request
-    // wastes the whole generation.
-    let in_flight = st
-        .in_flight
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let idle_secs = now_ms().saturating_sub(st.last_activity_ms.load(std::sync::atomic::Ordering::SeqCst) as u128) / 1000;
     Json(serde_json::json!({
         "status": "ok",
         "backend": backend_ok,
         "backend_process_alive": st.backend.is_alive(),
         "backend_restarts": st.backend.restarts(),
         "backend_restart_attempts": st.backend.restart_attempts(),
-        "in_flight": in_flight,
-        "idle_secs": idle_secs,
-        "idle_timeout_secs": st.cfg.idle_timeout_secs
+        // What every generation will actually be asked for: the adapter in use,
+        // the schedule, and the step count derived from it. lora_visible is null
+        // until the backend has been asked for its adapter list.
+        "lora": st.cfg.lora.clone().unwrap_or_else(|| "(none)".to_string()),
+        "lora_visible": *st.lora_visible.lock().unwrap(),
+        "sigmas": if st.cfg.sigmas.is_empty() {
+            "(scheduler)".to_string()
+        } else {
+            sigmas_arg(&st.cfg.sigmas)
+        },
+        "steps": steps_for(st.cfg.steps, &st.cfg.sigmas),
+        "cfg_scale": st.cfg.cfg_scale
     }))
 }
 
@@ -670,7 +803,7 @@ async fn create_generation(
     // The ceiling has to be applied to the final size, not inside parse_size:
     // the aspect_ratio + resolution path is the one open-grok actually uses, and
     // it would otherwise forward 2048x2048 for "2k" straight past the limit.
-    if let Err(msg) = check_edge_limit(width, height, st.cfg.max_edge) {
+    if let Err(msg) = check_edge_limit(width, height) {
         return err(StatusCode::BAD_REQUEST, &msg);
     }
 
@@ -681,18 +814,34 @@ async fn create_generation(
             "n must be 1 (multi-image batches are not supported)",
         );
     }
+    // A configured adapter must be visible to the backend before the request
+    // goes out: sd-server's sdapi route does not refresh its own LoRA cache, so
+    // an unprimed cache turns a valid adapter path into "invalid lora path".
+    if st.cfg.lora.is_some()
+        && !st
+            .lora_primed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        && prime_lora_cache(&st).await
+    {
+        st.lora_primed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
-    // From here the request is accepted and will do backend work, so it counts
-    // as activity for the idle timer until it finishes (successfully or not).
-    let _activity = ActivityGuard::enter(st.last_activity_ms.clone(), st.in_flight.clone());
-
-    let steps = req.num_inference_steps.unwrap_or(st.cfg.steps);
+    let requested_steps = req.num_inference_steps.unwrap_or(st.cfg.steps);
+    let steps = steps_for(requested_steps, &st.cfg.sigmas);
+    if steps != requested_steps {
+        warn!(
+            "the sigma schedule carries {} steps, so it overrides steps={}",
+            steps, requested_steps
+        );
+    }
     let cfg_scale = req.cfg_scale.unwrap_or(st.cfg.cfg_scale);
     // seed < 0 (or omitted) means random, matching sd-server's convention.
     let seed = req.seed.unwrap_or(-1);
 
-    let body = serde_json::json!({
-        "prompt": req.prompt,
+    let prompt = prompt_with_sigmas(&req.prompt, &st.cfg.sigmas);
+    let mut body = serde_json::json!({
+        "prompt": prompt,
         "negative_prompt": "",
         "width": width,
         "height": height,
@@ -701,8 +850,30 @@ async fn create_generation(
         "seed": seed,
         "batch_size": n,
     });
+    // The server takes a LoRA only from this structured field; a <lora:...> tag
+    // in the prompt is deliberately ignored there.
+    if let Some(lora) = st.cfg.lora.as_deref() {
+        body["lora"] = serde_json::json!([{
+            "path": lora,
+            "multiplier": st.cfg.lora_multiplier,
+        }]);
+    }
 
-    info!("generating {} image(s) at {}x{} steps={} cfg={} seed={}", n, width, height, steps, cfg_scale, seed);
+    info!(
+        "generating {} image(s) at {}x{} steps={} cfg={} seed={} lora={} sigmas={}",
+        n,
+        width,
+        height,
+        steps,
+        cfg_scale,
+        seed,
+        st.cfg.lora.as_deref().unwrap_or("(none)"),
+        if st.cfg.sigmas.is_empty() {
+            "(scheduler)".to_string()
+        } else {
+            sigmas_arg(&st.cfg.sigmas)
+        }
+    );
 
     let started = Instant::now();
     let resp = st
@@ -832,8 +1003,8 @@ async fn main() {
         cfg: cfg.clone(),
         backend_base: format!("http://127.0.0.1:{}", cfg.backend_port),
         backend: backend.clone(),
-        last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_ms() as u64)),
-        in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        lora_primed: std::sync::atomic::AtomicBool::new(false),
+        lora_visible: std::sync::Mutex::new(None),
     });
 
     // Keep the backend up for the lifetime of the bridge. The supervisor owns
@@ -851,11 +1022,21 @@ async fn main() {
     // that is alive but not answering HTTP is NOT auto-restarted yet; that is a
     // known limitation, recorded in docs/architecture.md.
     {
-        let cfg = cfg.clone();
-        let client = client.clone();
+        let st = state.clone();
         tokio::spawn(async move {
-            match wait_backend_ready(&cfg, &client).await {
-                Ok(()) => info!("sd-server backend ready"),
+            match wait_backend_ready(&st.cfg, &st.client).await {
+                Ok(()) => {
+                    info!("sd-server backend ready");
+                    // Prime the adapter list as soon as the backend answers, so
+                    // a cold start cannot refuse the first LoRA request and so
+                    // /health can report whether the adapter is visible. The
+                    // first generation primes too, in case this has not landed.
+                    if st.cfg.lora.is_some() {
+                        let primed = prime_lora_cache(&st).await;
+                        st.lora_primed
+                            .store(primed, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 Err(e) => warn!(
                     "sd-server backend did not answer within the startup window ({}); \
                      the bridge is serving and /health reports backend false",
@@ -869,43 +1050,9 @@ async fn main() {
         .route("/v1/models", get(get_models))
         .route("/v1/images/generations", post(create_generation))
         .route("/health", get(health))
-        .with_state(state.clone());
+        .with_state(state);
 
     info!("imagegen bridge listening on http://{}", addr);
-
-    // Idle shutdown. An on-demand deployment is started by a hook when an image
-    // is requested, so something has to stop it again: nothing releases the
-    // backend otherwise, and after the first request it holds about 11 GB of RSS
-    // and 5.6 GB of pinned VRAM. The check never fires while a request is in
-    // flight, so a long first request cannot be cut off by its own timeout.
-    if cfg.idle_timeout_secs == 0 {
-        info!("idle shutdown disabled (idle_timeout_secs = 0)");
-    } else {
-        let idle_timeout_secs = cfg.idle_timeout_secs;
-        let last_activity_ms = state.last_activity_ms.clone();
-        let in_flight = state.in_flight.clone();
-        let shutting_down = shutting_down.clone();
-        let backend = backend.clone();
-        tokio::spawn(async move {
-            use std::sync::atomic::Ordering::SeqCst;
-            loop {
-                tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)).await;
-                let last = last_activity_ms.load(SeqCst) as u128;
-                let busy = in_flight.load(SeqCst);
-                if idle_expired(now_ms(), last, busy, idle_timeout_secs) {
-                    let idle_for = now_ms().saturating_sub(last) / 1000;
-                    info!(
-                        "idle for {}s (timeout {}s), releasing the backend; the next request \
-                         restages the model stack",
-                        idle_for, idle_timeout_secs
-                    );
-                    shutting_down.store(true, SeqCst);
-                    backend.kill();
-                    std::process::exit(0);
-                }
-            }
-        });
-    }
 
     // Shut sd-server down when the bridge is terminated.
     tokio::spawn(async move {
@@ -923,130 +1070,66 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    // SIGINT is the documented clean stop (Ctrl-C, and what the stop hook and the
-    // detached launcher use). SIGTERM is handled as well so that a systemd unit
-    // stop, which sends SIGTERM by default, reaps sd-server instead of leaving it
-    // behind: the whole point of the handler is that no orphan backend survives a
-    // stop.
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                "cannot install a SIGTERM handler ({}); SIGINT still stops the bridge cleanly",
-                e
-            );
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
-        _ = sigterm.recv() => info!("SIGTERM received"),
-    }
+    let _ = tokio::signal::ctrl_c().await;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-//
-// The request-size rules are the part of the bridge that a live generation
-// cannot cheaply re-check at every boundary (each one costs minutes of GPU
-// time), so they are pinned here instead.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ceiling_allows_the_measured_working_size() {
-        assert!(check_edge_limit(1024, 1024, DEFAULT_MAX_EDGE).is_ok());
-        assert!(check_edge_limit(1152, 1152, DEFAULT_MAX_EDGE).is_ok());
-        assert!(check_edge_limit(1152, 1024, DEFAULT_MAX_EDGE).is_ok());
+    fn sigma_list_parses_and_rejects_bad_input() {
+        // Absent schedule: the server's own scheduler decides.
+        assert_eq!(parse_sigmas("").unwrap(), Vec::<f64>::new());
+        assert_eq!(parse_sigmas("none").unwrap(), Vec::<f64>::new());
+        assert_eq!(parse_sigmas("  NONE  ").unwrap(), Vec::<f64>::new());
+        // The Viggle v0.2.1 schedule, with slack around the separators.
+        assert_eq!(
+            parse_sigmas("1.0, 0.9375 ,0.875,0.75,0.5,0.25,0.0").unwrap(),
+            vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
+        );
+        // A typo must not silently become a different schedule.
+        assert!(parse_sigmas("1.0,abc").is_err());
+        // One value is not a schedule.
+        assert!(parse_sigmas("1.0").is_err());
     }
 
     #[test]
-    fn ceiling_rejects_the_size_the_layout_cannot_serve() {
-        // Measured: 1344 square fails during sampling weight preparation under
-        // the pinned layout, for both text encoders.
-        let e = check_edge_limit(1344, 1344, DEFAULT_MAX_EDGE).unwrap_err();
-        assert!(e.contains("1344x1344"), "message must name the size: {e}");
-        assert!(e.contains("1152"), "message must name the ceiling: {e}");
-        assert!(e.contains("--offload-to-cpu"), "message must name the way out: {e}");
+    fn steps_follow_the_schedule_when_one_is_configured() {
+        let sigmas = vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0];
+        assert_eq!(steps_for(28, &sigmas), 6);
+        assert_eq!(steps_for(28, &[]), 28);
     }
 
     #[test]
-    fn ceiling_is_symmetric_and_configurable() {
-        // Either edge over the limit is rejected, not just the width.
-        assert!(check_edge_limit(1152, 1344, DEFAULT_MAX_EDGE).is_err());
-        assert!(check_edge_limit(1344, 1152, DEFAULT_MAX_EDGE).is_err());
-        // A layout that can serve more may raise it (config-driven, not compiled in).
-        assert!(check_edge_limit(1536, 1536, 1536).is_ok());
-        assert!(check_edge_limit(1536, 1536, DEFAULT_MAX_EDGE).is_err());
+    fn the_prompt_carries_the_schedule_without_losing_its_text() {
+        let prompt = prompt_with_sigmas("a capybara", &[1.0, 0.5, 0.0]);
+        assert!(prompt.starts_with("a capybara<sd_cpp_extra_args>"));
+        assert!(prompt.ends_with("</sd_cpp_extra_args>"));
+        let inner = prompt
+            .trim_start_matches("a capybara<sd_cpp_extra_args>")
+            .trim_end_matches("</sd_cpp_extra_args>");
+        let parsed: serde_json::Value = serde_json::from_str(inner).unwrap();
+        assert_eq!(parsed["sample_params"]["custom_sigmas"][0], 1.0);
+        assert_eq!(
+            parsed["sample_params"]["custom_sigmas"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
-    fn size_parsing_rejects_non_multiples_of_32() {
-        assert_eq!(parse_size("1024x1024").unwrap(), (1024, 1024));
-        assert_eq!(parse_size("1152x896").unwrap(), (1152, 896));
-        for bad in ["1000x1024", "1024x1000", "0x1024", "abc", "1024", "1024x"] {
-            assert!(parse_size(bad).is_err(), "{bad} should be rejected");
-        }
+    fn no_schedule_leaves_the_prompt_untouched() {
+        assert_eq!(prompt_with_sigmas("a capybara", &[]), "a capybara");
     }
 
     #[test]
-    fn aspect_path_stays_inside_the_ceiling() {
-        // 1:1 at the 1k tier is the common open-grok request.
-        let (w, h) = dims_from_aspect("1:1", "1k");
-        assert_eq!((w, h), (1024, 1024));
-        assert!(check_edge_limit(w, h, DEFAULT_MAX_EDGE).is_ok());
-        // A 2k tier produces 2048, which the ceiling rejects rather than silently clamping.
-        let (w2, h2) = dims_from_aspect("1:1", "2k");
-        assert_eq!((w2, h2), (2048, 2048));
-        assert!(check_edge_limit(w2, h2, DEFAULT_MAX_EDGE).is_err());
-        // Wide aspect ratios are larger on the long edge and still bounded.
-        let (w3, h3) = dims_from_aspect("16:9", "1k");
-        assert!(check_edge_limit(w3, h3, DEFAULT_MAX_EDGE).is_ok());
-    }
-
-    #[test]
-    fn idle_timer_fires_only_after_the_timeout() {
-        let t0 = 1_000_000u128;
-        // Just under the timeout: still serving.
-        assert!(!idle_expired(t0 + 899_000, t0, 0, 900));
-        // Exactly at the timeout and past it: release.
-        assert!(idle_expired(t0 + 900_000, t0, 0, 900));
-        assert!(idle_expired(t0 + 5_000_000, t0, 0, 900));
-    }
-
-    #[test]
-    fn idle_timer_never_fires_mid_request_or_when_disabled() {
-        let t0 = 1_000_000u128;
-        // A request in flight wins over any elapsed time: a long first request
-        // stages the whole model stack and must not be cut off by its own timer.
-        assert!(!idle_expired(t0 + 10_000_000, t0, 1, 900));
-        // 0 disables the timer, for a permanently resident deployment.
-        assert!(!idle_expired(t0 + 10_000_000, t0, 0, 0));
-        // A clock that appears to go backwards must not cause a shutdown loop.
-        assert!(!idle_expired(t0, t0 + 60_000, 0, 900));
-    }
-
-    #[test]
-    fn activity_guard_counts_and_refreshes() {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
-        use std::sync::Arc;
-        let last = Arc::new(AtomicU64::new(0));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let before = now_ms() as u64;
-        {
-            let _g = ActivityGuard::enter(last.clone(), in_flight.clone());
-            assert_eq!(in_flight.load(SeqCst), 1, "enter marks the request in flight");
-            assert!(
-                last.load(SeqCst) >= before,
-                "enter refreshes the idle timer"
-            );
-        }
-        assert_eq!(in_flight.load(SeqCst), 0, "drop clears the in-flight mark");
-        assert!(last.load(SeqCst) >= before, "drop refreshes the idle timer");
+    fn sigma_list_renders_for_logs_and_the_health_endpoint() {
+        assert_eq!(
+            sigmas_arg(&[1.0, 0.9375, 0.0]),
+            "1,0.9375,0".to_string()
+        );
     }
 }
