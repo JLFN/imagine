@@ -1,9 +1,9 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: cf5ae4c
+last_updated_commit: 80e89eb
 branch: dev
-work_branch: none in flight; PRs 5, 6 and 7 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
+work_branch: none in flight; PRs 5-8 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
 handoff_written_at_context_usage: ~29% (signals.json, session 01a0e408)
 handoff_written_at: 2026-09-27T19:07:00Z
@@ -112,32 +112,45 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-27 — the standing deployment is base-only Q6_K; turbo is one edit away)
+2. Current state (2026-09-27 — the standing deployment is the UNCENSORED Q6_K; the bridge can layer adapters)
 
-- dev LOCAL is 6ff743a, thirteen commits ahead of origin/dev and unpushed
+- dev LOCAL is 73fdb63, fifteen commits ahead of origin/dev and unpushed
   (handoff probes, QA evidence and merge commits only). Rule 23 forbids pushing
   dev directly.
-- LANDED on origin/dev this session: PR 5 (feature/turbo-toggle, 4ef1ac1) made
-  turbo a runtime mode with the base model as the default; PR 6
-  (chore/deploy-q6k-base, 6662398) made the STANDING DEPLOYMENT base-only Q6_K
-  with default VAE tiling and the turbo keys commented out; PR 7
-  (docs/sampling-profiles, cf5ae4c) wrote the recipe. All three branches are
-  deleted; no PR is open.
-- THE PROFILES HAVE NAMES AND NUMBERS now: QUALITY (Q6_K base, standing, 183 s /
-  9200 MiB / 9 of 10 realism at 1024 square), DRAFT (Q4_K_M base + 16x16 tiles,
-  141 s / 7272 MiB / 6 of 10), TURBO (DRAFT's deployment + adapter, 29 s /
-  7978 MiB / 3 of 10). Recipe, artifacts and the switch procedure:
-  docs/sampling-profiles.md.
+- LANDED on origin/dev this session: PR 5 (turbo toggle), PR 6 (Q6_K
+  deployment), PR 7 (the QUALITY/DRAFT/TURBO recipe), PR 8
+  (feature/uncensored-model-trial, 80e89eb): the standing model is now
+  qwen-image-2.1-UC-Q6_K.gguf (base weights + the 33.6 MB uncensored LoRA
+  merged; chosen for content behaviour, NOT quality - the A/B measured 9/10
+  realism on both), and the bridge gained an optional EXTRA adapter layer
+  (extra_lora) applied in every mode. All four branches are deleted; no PR is
+  open.
+- THE LAYER: `extra_lora` rides on base and turbo alike, so one process serves
+  uncensored DRAFT and uncensored TURBO; a turbo request carries two adapters
+  (verified in one run: 454/454 Viggle + 256/256 uncensored tensors), and the
+  cache check verifies every configured adapter. Measured cost at 1024 square:
+  7571 MiB peak against 7562 MiB without it - no measurable VRAM cost. With the
+  layer configured the base path is no longer byte-identical to the pre-turbo
+  request; the identity check holds with it unset.
+- THE PROFILES: QUALITY (UC-Q6_K, standing, 183 s / 9200 MiB / 9 of 10 realism),
+  DRAFT (Q4_K_M base + 16x16 tiles + the layer when configured, 141-187 s /
+  7272-7571 MiB / 5-6 of 10), TURBO (that deployment + the Viggle adapter, 29-33 s
+  / 7978-8230 MiB / 3 of 10). Recipe and switch procedure:
+  docs/sampling-profiles.md; all five model files with verified checksums:
+  models/MANIFEST.md.
 - IDENTITY CHECKED: the pre-LoRA bridge (98ffc4a) and the current code, both on
-  Q4_K_M with default tiling, produced byte-identical images for one request
-  (1024 square, seed 4242, sha256 436f3a96...); artifact
-  qa-evidence/qa-q4km-identity-1024.png. The base path is provably the pre-turbo
-  request, and the sampler is deterministic across processes for a fixed seed.
-- LIVE SERVICE: Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
+  Q4_K_M with default tiling and no extra layer, produced byte-identical images
+  for one request (1024 square, seed 4242, sha256 436f3a96...); artifact
+  qa-evidence/qa-q4km-identity-1024.png.
+- LIVE SERVICE: UC-Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
   POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason.
-  183 s per 1024-square image against open-grok's 240 s read timeout. Turbo is
-  one three-line edit away plus a bridge restart.
+  183 s per 1024-square image against open-grok's 240 s read timeout.
 - Unit 10 (edits) unchanged at 511c061 on feature/image-edit-probe, no PR yet.
+- UNEXPLAINED, watch it: four tracked QA artifacts (qa-playground-turbo-1024,
+  qa-q4km-identity-1024, qa-gen-1152-8steps-seed5, qa-gen-512-seed11) were found
+  missing from disk once this session, along with the session images 1.jpg and
+  2.jpg; the tracked ones were restored from git. Cause unknown - check
+  `git status` before committing anything that touches qa-evidence/.
 - FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
   code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
   added and that architecture.md and stop-imagegen-bridge still assume - the
@@ -145,7 +158,7 @@ anything that affects the model stack.
   reads an in_flight field that no longer exists. Reconcile with
   feature/on-demand-lifecycle.
 
-3. Next unit plan — Unit 15: restore the lifecycle code, then land the edit path
+3. Next unit plan — Unit 16: restore the lifecycle code, then land the edit path
 
 Task 1, restore the on-demand lifecycle on dev (see section 2's finding). Diff
 feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
@@ -177,7 +190,7 @@ LoRA cache that rejects a valid adapter path until an unrelated route has been
 called (the bridge primes it, which is a workaround).
 
 Task 5, wrap: fold the outcome into section 2, replace section 3, refresh the memory
-entry, close with "Unit: 15 complete".
+entry, close with "Unit: 16 complete".
 
 Still open from earlier units, none of it done: create main and protect dev and main
 on GitHub; register or correct the ensure-localembed hook; the JSON body-size hang;
