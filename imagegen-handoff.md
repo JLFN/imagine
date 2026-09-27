@@ -126,7 +126,9 @@ anything that affects the model stack.
   7272 MiB peak; turbo same seed 26.6 s warm, 7978 MiB, "(454 / 454) LoRA
   tensors have been applied"; base after turbo byte-identical to base before it.
   Q4_K_M plus 16x16 VAE tiles are startup-fixed, so base mode inherits them.
-- Unit 10 (edits) unchanged at 511c061; PRs 1, 2 and 5 open.
+- Unit 10 (edits) unchanged at 511c061 on feature/image-edit-probe, no PR yet.
+  PR state checked live: PRs 2, 3 and 4 are merged, PR 1 is closed with its
+  content in dev, and only PR 5 (this unit) is open.
 - FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
   code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
   added and that architecture.md and stop-imagegen-bridge still assume - the
@@ -136,13 +138,14 @@ anything that affects the model stack.
 
 3. Next unit plan — Unit 13: land the PR stack, then restore the lifecycle code
 
-Task 1, land the stack. Review and merge, in order: PR 1
-(feature/unit7-resolution-and-port), PR 2 (feature/on-demand-lifecycle), PR 3
-(feature/viggle-turbo-lora), PR 4 (feature/bridge-turbo-lora), PR 5
-(feature/turbo-toggle). Rule 23 wants one unit in flight and five branches
-currently carry work. Then decide what carries dev's local commits (handoff/QA
-docs only; dev is never pushed directly, so either PR them or fold them into the
-next branch), and create main plus protection for dev and main on GitHub.
+Task 1, land the remaining work. Review and merge PR 5
+(feature/turbo-toggle); the rest of the stack is already in dev (PRs 2, 3 and 4
+merged, PR 1 closed with its content in dev - verified with gh pr list --state
+all and git branch --merged dev on 2026-09-27). What still sits outside dev is
+feature/image-edit-probe (Unit 10, no PR, three commits unpushed) and dev's own
+six local commits, which are handoff and QA docs only: dev is never pushed
+directly, so either PR them or fold them into the next branch. Then create main
+plus protection for dev and main on GitHub.
 
 Task 2, restore the on-demand lifecycle on dev (see section 2's finding). Diff
 feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
@@ -260,9 +263,10 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
 - OPEN items:
   1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
      72a641f) are unpushed as of this handoff; push them with the Unit 10 PR.
-  2. Five branches carry unmerged work and five PRs are open (1: unit7, 2:
-     on-demand lifecycle, 3: viggle-turbo-lora docs, 4: bridge-turbo-lora, 5:
-     turbo-toggle). Rule 23 wants one unit at a time; land the stack first.
+  2. PR 5 (feature/turbo-toggle) is open and is the only open PR; PRs 2, 3 and 4
+     are merged and PR 1 is closed. The only branch with unmerged work besides
+     PR 5 is feature/image-edit-probe (Unit 10, no PR). Rule 23 wants one unit at
+     a time: land PR 5 first.
   3. dev's bridge source lost the on-demand lifecycle code in the af4e6c9 merge
      (in_flight, idle_secs, idle_timeout_secs, the idle shutdown); the stop hook
      and architecture.md still assume it. See section 3 task 2.
