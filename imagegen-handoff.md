@@ -12,6 +12,7 @@ session_id: 01a0de48-f809-7353-a458-31b3f19d943f
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
 --- units completed since plan start (7443adfcd22374ddaa3e2139287e83a78d431367):
+6e718d2 feat(repo): measure the resolution headroom, port the verifier to Rust, bound the bridge
 4e8f1a0 feat(bridge): pin Q6_K diffusion in VRAM and run the text encoder on CPU
 9169fed feat(bridge): on-demand OpenAI image API bridge over sd-server
 347ed52 docs(handoff): mark Unit 1 complete and plan Unit 2 (Rust bridge)
@@ -19,28 +20,53 @@ session_id: 01a0de48-f809-7353-a458-31b3f19d943f
 --- progress diff stat:
 .gitignore                                         |   13 +-
  AGENTS.md                                          |    5 +-
- Cargo.lock                                         | 1228 ++++++++++++++++++++
- Cargo.toml                                         |    7 +
+ Cargo.lock                                         | 1491 ++++++++++++++++++++
+ Cargo.toml                                         |    9 +
  crates/bridge/Cargo.toml                           |   16 +
- crates/bridge/README.md                            |   87 ++
- crates/bridge/src/main.rs                          |  777 +++++++++++++
- docs/architecture.md                               |  173 ++-
- docs/convrot-encoder-experiment.md                 |  234 ++++
- imagegen-handoff.md                                |  251 ++++
- imagegen.toml                                      |   57 +
- models/MANIFEST.md                                 |  115 ++
+ crates/bridge/README.md                            |  145 ++
+ crates/bridge/src/main.rs                          | 1135 +++++++++++++++
+ crates/convrot-verify/Cargo.toml                   |   10 +
+ crates/convrot-verify/src/main.rs                  |  343 +++++
+ docs/architecture.md                               |  386 ++++-
+ docs/convrot-encoder-experiment.md                 |  242 ++++
+ docs/viggle-turbo-lora.md                          |  312 ++++
+ imagegen-handoff.md                                |  263 ++++
+ imagegen.toml                                      |  114 ++
+ models/MANIFEST.md                                 |  160 +++
+ packaging/hooks/ensure-imagegen-bridge             |  117 ++
+ packaging/hooks/stop-imagegen-bridge               |  104 ++
  ...01-sd-cpp-llm-te-config-skip-weight-scale.patch |   53 +
  ...-cpp-dequantize-int8-tensorwise-embedding.patch |  172 +++
  qa-evidence/qa-gen-1024-28steps-seed42.png         |  Bin 0 -> 2463614 bytes
+ qa-evidence/qa-gen-1152-28steps-seed5.png          |  Bin 0 -> 2826304 bytes
+ qa-evidence/qa-gen-1152-8steps-seed5.png           |  Bin 0 -> 2297223 bytes
  qa-evidence/qa-gen-512-seed11.png                  |  Bin 0 -> 286535 bytes
  qa-evidence/qa-gen-512-seed3.png                   |  Bin 0 -> 280816 bytes
- qa-evidence/qa-report.md                           |  218 ++++
- tools/convrot-te-experiment.sh                     |   72 ++
- tools/verify-convrot-dequant.py                    |  105 ++
- 20 files changed, 3568 insertions(+), 15 deletions(-)
+ qa-evidence/qa-report.md                           |  133 ++
+ qa-evidence/qa-tiling-1024-untiled-vs-tiled.png    |  Bin 0 -> 2771580 bytes
+ qa-evidence/unit6-qa-report.md                     |  218 +++
+ qa-evidence/unit7-qa-report.md                     |  271 ++++
+ tests/qa-gate.sh                                   |  109 ++
+ tests/run.sh                                       |   34 +
+ tools/convrot-te-experiment.sh                     |   72 +
+ 31 files changed, 5912 insertions(+), 15 deletions(-)
 --- staleness (last_updated_commit 90618e4 .. HEAD):
+bf76419 docs(handoff): record the turbo adapter units and plan Unit 12
+6aaa31f test(qa): self-verified QA pass over the bridge turbo LoRA unit
+21e61a8 test(qa): self-verified QA pass over the Viggle turbo LoRA recipe unit
+639a098 docs(handoff): refresh the session probe block on dev
+86171d7 Merge pull request #2 from JLFN/feature/on-demand-lifecycle
+af4e6c9 merge: bring the on-demand branch onto dev, keeping the turbo request path
+00c257e Merge pull request #4 from JLFN/feature/viggle-turbo-lora
+8a76b6b Merge pull request #3 from JLFN/feature/bridge-turbo-lora
+f0d663c docs(recipe): record that the bridge now serves the turbo adapter
+671d03a feat(bridge): apply the Viggle turbo LoRA and its sigma schedule
+d3a1686 docs(recipe): add the Viggle turbo LoRA recipe and register the adapter
 98ffc4a docs(handoff): record the no-GUI and loopback-only decisions
 d607893 docs(handoff): record Unit 10 complete, the hook-only lifecycle and the new limits
+4066f8e feat(lifecycle): start the bridge on demand from a hook and let it idle out
+d36eb68 docs(qa): add a production-step artifact at the new ceiling and record the step-count effect
+6e718d2 feat(repo): measure the resolution headroom, port the verifier to Rust, bound the bridge
 --- end handoff probe ---
 
 
