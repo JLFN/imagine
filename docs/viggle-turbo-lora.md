@@ -218,7 +218,7 @@ Verified in the server's own documentation and source at /data/build-sd:
   travel as the native JSON embedded in the prompt:
   `prompt<sd_cpp_extra_args>{"sample_params":{"custom_sigmas":[...]}}</sd_cpp_extra_args>`.
 
-The bridge does all of that (commit 671d03a on feature/bridge-turbo-lora, with
+The bridge does all of that (commit ce5689f on feature/bridge-turbo-lora, with
 its QA evidence on dev): `imagegen.toml` carries `lora_dir`, `lora`,
 `lora_multiplier` and `sigmas`, the bridge sends the structured entry and the
 schedule, derives the step count from the schedule, and primes the server's
