@@ -64,13 +64,13 @@ byte-identical to the pre-turbo request. The identity check below holds with
 ## The identity guarantee (DRAFT is the pre-turbo behaviour)
 
 The turbo work was required not to change the base path, and it did not: the
-pre-LoRA bridge (commit 98ffc4a, the parent of the LoRA commit) and the current
+pre-LoRA bridge (commit 8c5b808, the parent of the LoRA commit) and the current
 code, both running Q4_K_M with default tiling and the same request (1024 square,
 seed 4242), produced byte-identical images:
 
     sha256 436f3a964994d2cfa217cb4f56d60e83146e77dd7edae96d58f9711dcc231a03
 
-pre-LoRA (98ffc4a, debug build) and current (dev HEAD, release build). The
+pre-LoRA (8c5b808, debug build) and current (dev HEAD, release build). The
 artifact is qa-evidence/qa-q4km-identity-1024.png. The same check doubles as
 evidence that this sampler is deterministic across separate processes for a fixed
 seed, which is what the adapter-leak test in qa-evidence/qa-report.md relies on.
