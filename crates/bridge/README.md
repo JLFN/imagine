@@ -26,10 +26,18 @@ adds:
 
 - `GET /v1/models` — `{"data":[{"id":"Qwen-Image-2.1",...}]}`
 - `POST /v1/images/generations` — OpenAI shape, returns
-  `{"created":...,"data":[{"b64_json":"..."}]}`
-- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>,"lora":<name>,"lora_visible":<bool|null>,"sigmas":<list>,"steps":<n>,"cfg_scale":<n>}`
-  `lora_visible` answers whether the backend lists the configured adapter; it is
-  null until the backend has been asked.
+  `{"created":...,"data":[{"b64_json":"..."}]}`. An optional `"turbo": true|false`
+  in the body pins this one request to a sampling mode.
+- `GET /v1/turbo` — the live sampling mode and what the next request will use:
+  `{"mode":"base"|"turbo","turbo":<bool>,"turbo_available":<bool>,"lora":<name>,"sigmas":<list>,"steps":<n>,"cfg_scale":<n>,"lora_visible":<bool|null>}`
+- `POST /v1/turbo` — switch the mode: `{"enabled": true|false}` or
+  `{"mode": "turbo"|"base"}`. Enabling turbo is refused (HTTP 409, mode
+  unchanged) unless the adapter is configured, on disk, and confirmed by the
+  backend. The mode is process state, not persisted.
+- `GET /health` — `{"status":"ok","backend":<bool>,"backend_process_alive":<bool>,"backend_restarts":<n>,"backend_restart_attempts":<n>,"mode":"base"|"turbo","turbo_available":<bool>,"lora":<name>,"lora_visible":<bool|null>,"sigmas":<list>,"steps":<n>,"cfg_scale":<n>}`
+  `mode`, `lora`, `sigmas`, `steps` and `cfg_scale` describe the LIVE mode and
+  the next request; `lora_visible` answers whether the backend lists the
+  configured adapter, and is null until the backend has been asked.
 - Request limits: width and height must be divisible by 32 and at most 1536 on
   either edge. Larger sizes are rejected with HTTP 400 rather than forwarded,
   because they cannot fit this card and would abort the backend.
@@ -50,24 +58,27 @@ ships plus the built-in fallbacks where one exists.
 | `IMAGEGEN_LISTEN_IP` | `127.0.0.1` | `127.0.0.1` |
 | `IMAGEGEN_LISTEN_PORT` | `8787` | `8787` |
 | `IMAGEGEN_BACKEND_PORT` | `8788` (internal sd-server listener) | `8788` |
-| `IMAGEGEN_STEPS` | `6` | `28` |
-| `IMAGEGEN_CFG_SCALE` | `1.0` | `6.0` |
+| `IMAGEGEN_STEPS` | `28` | `28` |
+| `IMAGEGEN_CFG_SCALE` | `6.0` | `6.0` |
+| `IMAGEGEN_TURBO` | `false` (start in base mode) | `false` |
+| `IMAGEGEN_TURBO_CFG_SCALE` | `1.0` | `1.0` |
 | `IMAGEGEN_LORA_DIR` | `models/loras` | none; required when a LoRA is set |
-| `IMAGEGEN_LORA` | the Viggle turbo rank-128 adapter | none (no adapter) |
+| `IMAGEGEN_LORA` | the Viggle turbo rank-128 adapter | none (turbo unavailable) |
 | `IMAGEGEN_LORA_MULTIPLIER` | `1.0` | `1.0` |
-| `IMAGEGEN_SIGMAS` | `1.0,0.9375,0.875,0.75,0.5,0.25,0.0` | none (sd.cpp's scheduler) |
+| `IMAGEGEN_SIGMAS` | `1.0,0.9375,0.875,0.75,0.5,0.25,0.0` | none (turbo unavailable) |
 
 Run it from the repository root so the default model/sd-server paths resolve.
 The diffusion model in the repository default is Q4_K_M rather than the
 higher-quality Q6_K because of the adapter: with a runtime LoRA applied, Q6_K
-cannot fit a 1024-square generation on this card (measured 2026-09-27). Without
-an adapter, Q6_K is the better generator; see docs/viggle-turbo-lora.md.
+cannot fit a 1024-square generation on this card (measured 2026-09-27). The mode
+toggle does not swap models or tile sizes, so base mode runs on the turbo-tuned
+setup as well; a base-only deployment swaps Q6_K back in and drops the small VAE
+tiles, at the price of a restart to use turbo. See docs/viggle-turbo-lora.md.
 
-To run the base model without editing the file, set all four of
-`IMAGEGEN_LORA=""`, `IMAGEGEN_SIGMAS=none`, `IMAGEGEN_STEPS=28` and
-`IMAGEGEN_CFG_SCALE=6.0`. Clearing the adapter alone is not enough: the step and
-CFG defaults in the file are the turbo pair, and the base model is not trained
-for those.
+The base model is the default and needs no environment juggling: the adapter and
+its schedule are used only in turbo mode. To start a bridge in turbo mode set
+`IMAGEGEN_TURBO=true`; to switch a running bridge use `POST /v1/turbo` (or the
+`packaging/hooks/imagegen-turbo on|off|status` script).
 
 Model files follow the upstream card's layout, one directory per component:
 
@@ -90,10 +101,36 @@ The bridge reaps and restarts its sd-server backend if it dies. `backend_restart
 in `/health` counts those restarts, so a restarted backend is visible rather than
 silent.
 
+## Sampling modes: base and turbo
+
+One process serves two sampling profiles:
+
+- BASE (the default) is the base model: no adapter, sd.cpp's own scheduler,
+  `IMAGEGEN_STEPS` (28) and `IMAGEGEN_CFG_SCALE` (6.0).
+- TURBO is the Viggle Qwen-Image-2.1 few-step distillation: the adapter, its
+  published sigma schedule (which is also where its step count comes from) and
+  `IMAGEGEN_TURBO_CFG_SCALE` (1.0).
+
+The live mode is reported by `GET /v1/turbo` and `GET /health`, switched with
+`POST /v1/turbo`, or pinned for one request with `"turbo": true` in the
+generation body. `packaging/hooks/imagegen-turbo on|off|status` is the shell-side
+wrapper, and it starts the bridge if it is not up.
+
+Switching turbo ON is verified rather than assumed: the bridge asks the backend
+for its adapter list, requires the configured adapter to be in it, and only then
+flips the mode. A bridge that cannot confirm the adapter keeps serving base and
+answers HTTP 409 with the reason. The mode is process state; a restart returns to
+`IMAGEGEN_TURBO` from imagegen.toml.
+
+One caveat stated plainly: the model file and the backend placement flags are
+fixed when sd-server starts, so the toggle changes the sampling profile, not the
+model. This repository's Q4_K_M plus 16x16-tile setup is tuned for turbo, and
+base mode inherits it; a base-only deployment is described in imagegen.toml.
+
 ## Few-step turbo adapter (Viggle Qwen-Image-2.1 turbo)
 
-Setting `lora`, and normally `sigmas`, turns every generation into a few-step run
-of a distilled adapter. Recipe, file list and checksums: docs/viggle-turbo-lora.md.
+Turbo mode is what uses the adapter and the schedule; a base request sends
+neither. Recipe, file list and checksums: docs/viggle-turbo-lora.md.
 Three details are not obvious:
 
 1. The adapter travels as the structured `lora` field. sd-server deliberately
@@ -113,8 +150,8 @@ Three details are not obvious:
    sdapi generation route never refreshes it, so a cold backend answered
    `invalid lora path` until something asked for the adapter list. The bridge
    primes that cache when the backend becomes ready, and again before the first
-   generation if that has not happened yet, and reports the result as
-   `lora_visible` in `/health`.
+   turbo generation (and before a turbo switch) if that has not happened yet, and
+   reports the result as `lora_visible` in `/health`.
 
 VRAM is the constraint. Adapters here can only be applied at runtime (merged mode
 is refused because the int8 convrot text encoder rules it out for the model

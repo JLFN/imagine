@@ -198,7 +198,7 @@ Quality, on the evidence rather than on the upstream claim:
 models/ and out/ are both gitignored; the images are working evidence, not
 deliverables.
 
-## 6. Through the bridge and the image tools (IMPLEMENTED on feature/bridge-turbo-lora)
+## 6. Through the bridge and the image tools (IMPLEMENTED; turbo is a mode, not the default)
 
 sd-cli takes the `<lora:...>` prompt tag, but the server deliberately does not.
 Verified in the server's own documentation and source at /data/build-sd:
@@ -218,13 +218,24 @@ Verified in the server's own documentation and source at /data/build-sd:
   travel as the native JSON embedded in the prompt:
   `prompt<sd_cpp_extra_args>{"sample_params":{"custom_sigmas":[...]}}</sd_cpp_extra_args>`.
 
-The bridge now does all of that (commit 671d03a on feature/bridge-turbo-lora, with
+The bridge does all of that (commit 671d03a on feature/bridge-turbo-lora, with
 its QA evidence on dev): `imagegen.toml` carries `lora_dir`, `lora`,
 `lora_multiplier` and `sigmas`, the bridge sends the structured entry and the
 schedule, derives the step count from the schedule, and primes the server's
 lazily built LoRA cache so the first request cannot fail with "invalid lora
-path". Set `IMAGEGEN_LORA` to the empty string (with `IMAGEGEN_SIGMAS=none`,
-`IMAGEGEN_STEPS=28` and `IMAGEGEN_CFG_SCALE=6.0`) to go back to the base model.
+path".
+
+Since the turbo-toggle unit, that adapter is no longer applied to every
+generation. The bridge serves two profiles and starts in base mode (`turbo =
+false` in imagegen.toml): base sends neither the adapter nor the schedule and
+uses `steps`/`cfg_scale`, while turbo sends both and uses the schedule's step
+count with `turbo_cfg_scale`. The live mode is reported by `GET /v1/turbo` and
+switched without a restart by `POST /v1/turbo` (or for one request with
+`"turbo": true` in the generation body), and `packaging/hooks/imagegen-turbo
+on|off|status` wraps that endpoint for shell and hook use. Enabling turbo is
+verified before it takes effect: the adapter must be on disk and listed by the
+backend, otherwise the switch is refused with HTTP 409 and the mode is left
+alone.
 
 Two consequences of doing it through the bridge rather than sd-cli:
 

@@ -403,14 +403,28 @@ Source-verified semantics:
 - model_override naming the endpoint's model id is optional; the example
   above sets model so open-grok names it.
 
-## Few-step turbo path (2026-09-27)
+## Sampling modes: base and turbo (2026-09-27)
 
-The deployed generator is the Viggle Qwen-Image-2.1 turbo adapter, a DMD
-distillation of the same base transformer applied at runtime, sampled with a
-fixed six-node sigma schedule and no classifier-free guidance. Full recipe,
-checksums and the file table: docs/viggle-turbo-lora.md.
+The bridge serves two sampling profiles from one process, and the live one is
+visible in `GET /v1/turbo` and `/health` and switched with `POST /v1/turbo` (or
+pinned for a single request with a `"turbo"` flag in the generation body):
 
-What it changes in this deployment:
+- base (the default): the base model, sd.cpp's own scheduler, 28 steps, cfg 6.0.
+  The adapter and the sigma schedule are not sent at all.
+- turbo: the Viggle Qwen-Image-2.1 turbo adapter, a DMD distillation of the same
+  base transformer applied at runtime, sampled with a fixed six-node sigma
+  schedule and no classifier-free guidance. Full recipe, checksums and the file
+  table: docs/viggle-turbo-lora.md.
+
+Switching turbo ON is verified before it takes effect: the adapter must be
+configured, present on disk and listed by the backend (the cache priming below is
+the check), otherwise the switch is refused with HTTP 409 and the mode stays
+where it was. That is what keeps a mode change from becoming a silent quality
+change. The mode is process state and is not persisted; a restart returns to
+imagegen.toml's `turbo` value, and `packaging/hooks/imagegen-turbo
+on|off|status` is the shell-side wrapper over the same endpoint.
+
+What turbo changes in this deployment:
 
 - Diffusion model Q4_K_M instead of Q6_K. The adapter is applied at runtime
   (merged mode is refused: "INT8 tensorwise weights do not support the
@@ -429,6 +443,12 @@ What it changes in this deployment:
   `sample_params.custom_sigmas` inside `sd_cpp_extra_args`, and primes the
   server's lazily built LoRA cache so the first request cannot fail with
   "invalid lora path". See crates/bridge/README.md.
+
+Both bullets are startup-fixed, and the toggle does not change them: the model
+file and the placement flags belong to sd-server's process, and switching them
+means a restart (~35 s of weight staging). So base mode inherits the turbo-tuned
+Q4_K_M plus 16x16-tile setup; the base-only alternative (Q6_K, default tiling) is
+described in imagegen.toml.
 
 Measured end to end through the bridge (1024x672 from a 3:2 request, cold start):
 sampling 33.0 s at 1.51 s/it, whole request 77.3 s, `(454 / 454) LoRA tensors
