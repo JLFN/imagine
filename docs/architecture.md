@@ -11,7 +11,9 @@ in this file must be re-verified before being trusted.
      source with cmake (requires a CUDA toolkit for the CUDA backend).
    - Backends: CPU (AVX/AVX2/AVX512), CUDA, Vulkan, Metal, OpenCL, SYCL.
 2. Model files (see models/MANIFEST.md): diffusion Q6_K GGUF 5.47 GiB
-   (the deployed default; Q4_K_M at 4.29 GiB is also on disk), encoder
+   (the deployed default until 2026-09-27, and still the better generator when
+   no adapter is configured; Q4_K_M at 4.29 GiB is also on disk and is what the
+   few-step turbo path deploys, see "Few-step turbo path" below), encoder
    Qwen3-VL-8B-Instruct Q4_K_M GGUF 4.68 GiB, VAE 0.63 GiB. Note: earlier
    revisions of this file and of MANIFEST.md quoted Q4_K_M as "4.6 GiB" and
    the encoder as "5.03 GB" - those are decimal GB, not GiB (4.60 GB and
@@ -71,7 +73,7 @@ same prompt, peak VRAM from a 1 s nvidia-smi poll, host RSS from
   DiT pinned, encoder CPU, Q4_K_M 132.9 s    4.4 s tiled  139.4 s   8,172 MiB   6.2 GiB
   all pinned, encoder on GPU      -          -            failed       -           -
   Q6_K pinned, encoder CPU, VAE
-    parameters in RAM (deployed)  146.5 s    4.7 s tiled  153.9 s   9,426 MiB      -
+    parameters in RAM (base path) 146.5 s    4.7 s tiled  153.9 s   9,426 MiB      -
 
 What the measurements establish:
 
@@ -156,8 +158,10 @@ fail the generation or abort the backend.
 
 - Quality on a 12 GB card is bounded by VRAM. Q4_K_M @ 1024 peaks ~11.5 GB.
   The practical higher-quality point is the Q6_K diffusion model (5.88 GB,
-  near-lossless), which is the deployed default: parameters pinned in VRAM
-  with the arrangement described under Parameter placement above. The
+  near-lossless): parameters pinned in VRAM
+  with the arrangement described under Parameter placement above. It is the
+  default for the base path, but not once an adapter is configured - see
+  "Few-step turbo path" below. The
   figures in the next sentence were measured with --offload-to-cpu (weights
   RAM-resident, staged on demand): Q6_K @ 1344x1344, 40 steps fits (peak
   11.1 GB) at ~11.5 s/it (~8.3 min) and gives a clear quality step over
@@ -221,6 +225,38 @@ Source-verified semantics:
   is what the bridge returns.
 - model_override naming the endpoint's model id is optional; the example
   above sets model so open-grok names it.
+
+## Few-step turbo path (2026-09-27)
+
+The deployed generator is the Viggle Qwen-Image-2.1 turbo adapter, a DMD
+distillation of the same base transformer applied at runtime, sampled with a
+fixed six-node sigma schedule and no classifier-free guidance. Full recipe,
+checksums and the file table: docs/viggle-turbo-lora.md.
+
+What it changes in this deployment:
+
+- Diffusion model Q4_K_M instead of Q6_K. The adapter is applied at runtime
+  (merged mode is refused: "INT8 tensorwise weights do not support the
+  immediately LoRA apply mode; using at_runtime instead", forced by the int8
+  convrot text encoder), and the per-segment tables it needs cost about 2.4 GB
+  of device memory. With Q6_K the sampling step itself fails: "model manager
+  cannot make enough memory available on CUDA0: need 767.11 MB device /
+  733.12 MB available", then segment 29/34 (transformer_blocks.27) fails during
+  weight preparation.
+- VAE tiles of 16x16 latent units. With the default 32x32 tiles the decode misses
+  its budget by 3 MB (need 512.00 MB, 508.69 MB free) and the request ends in a
+  500; smaller tiles are not slower here (about 32 s either way), because the
+  pressure of the large tiles cost more than the extra tile count. Moving the VAE
+  to the CPU also fits but costs about 116 s instead of 32 s.
+- The bridge sends the adapter as a structured `lora` entry and the schedule as
+  `sample_params.custom_sigmas` inside `sd_cpp_extra_args`, and primes the
+  server's lazily built LoRA cache so the first request cannot fail with
+  "invalid lora path". See crates/bridge/README.md.
+
+Measured end to end through the bridge (1024x672 from a 3:2 request, cold start):
+sampling 33.0 s at 1.51 s/it, whole request 77.3 s, `(454 / 454) LoRA tensors
+have been applied`. The same prompt at 1024 square on the base 28-step path took
+168.8 s of generation.
 
 ## Constraints that shape everything
 
