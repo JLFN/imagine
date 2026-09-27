@@ -23,3 +23,7 @@ graphify-out/
 .callgraph-index.bin
 # logs
 *.log
+# QA image artifacts stay local: the committed evidence is the text report
+# (qa-evidence/*-qa-report.md and qa-report.md); images are regenerable and were
+# dropped from tracking on 2026-09-27 at the operator request
+qa-evidence/*.png
