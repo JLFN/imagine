@@ -1,12 +1,12 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 4ef1ac1
+last_updated_commit: 6662398
 branch: dev
-work_branch: none in flight on the local tree; PR 5 (feature/turbo-toggle, tip 4ef1ac1) is open, and PRs 1-4 carry the older branches
+work_branch: none in flight; PRs 5 and 6 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~16% (signals.json, session 01a0e408)
-handoff_written_at: 2026-09-27T18:30:00Z
+handoff_written_at_context_usage: ~22% (signals.json, session 01a0e408)
+handoff_written_at: 2026-09-27T18:55:00Z
 session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
 ---
 --- handoff probe (auto) ---
@@ -112,22 +112,27 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-27 — turbo is a runtime mode; base is the default)
+2. Current state (2026-09-27 — the standing deployment is base-only Q6_K; turbo is one edit away)
 
-- dev LOCAL is 282d380, five commits ahead of origin/dev and unpushed (handoff
-  probes and QA evidence only). Rule 23 forbids pushing dev directly.
-- feature/turbo-toggle (4ef1ac1) is pushed and open as PR 5: the bridge starts in
-  BASE mode (steps 28, cfg 6.0, no adapter) and switches without a restart via
-  GET/POST /v1/turbo, packaging/hooks/imagegen-turbo on|off|status, or a
-  per-request "turbo" flag. Enabling turbo is verified against the backend or
-  refused with 409. QA evidence: qa-evidence/qa-report.md; gate PASS.
-- Measured through the rebuilt bridge: base 1024 square seed 4242 169.5 s cold,
-  7272 MiB peak; turbo same seed 26.6 s warm, 7978 MiB, "(454 / 454) LoRA
-  tensors have been applied"; base after turbo byte-identical to base before it.
-  Q4_K_M plus 16x16 VAE tiles are startup-fixed, so base mode inherits them.
+- dev LOCAL is c5666b3, eleven commits ahead of origin/dev and unpushed (handoff
+  probes, QA evidence and merge commits only). Rule 23 forbids pushing dev
+  directly.
+- LANDED on origin/dev this session: PR 5 (feature/turbo-toggle, 4ef1ac1) made
+  turbo a runtime mode with the base model as the default, and PR 6
+  (chore/deploy-q6k-base, 6662398) made the STANDING DEPLOYMENT base-only Q6_K
+  with default VAE tiling and the turbo keys commented out. Both branches are
+  deleted; no PR is open.
+- LIVE SERVICE: Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
+  POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason. A
+  1024-square image takes about 183 s and 9200 MiB peak, against open-grok's
+  240 s read timeout. Turbo is one three-line edit away (Q4_K_M, 16x16 tiles,
+  four uncommented keys) plus a bridge restart.
+- The deployment decision rests on a measured comparison at 1024 square, one
+  prompt and seed, independent critic pass: Q6_K base 9/10 realism (183 s,
+  9200 MiB), Q4_K_M base 6/10 (141 s, 7272 MiB), turbo 3/10 (29 s, 7978 MiB).
+  Artifacts and the full QA report: qa-evidence/qa-report.md (Unit 12's report
+  preserved as unit12-qa-report.md).
 - Unit 10 (edits) unchanged at 511c061 on feature/image-edit-probe, no PR yet.
-  PR state checked live: PRs 2, 3 and 4 are merged, PR 1 is closed with its
-  content in dev, and only PR 5 (this unit) is open.
 - FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
   code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
   added and that architecture.md and stop-imagegen-bridge still assume - the
@@ -135,51 +140,44 @@ anything that affects the model stack.
   reads an in_flight field that no longer exists. Reconcile with
   feature/on-demand-lifecycle.
 
-3. Next unit plan — Unit 13: land the PR stack, then restore the lifecycle code
+3. Next unit plan — Unit 14: restore the lifecycle code, then land the edit path
 
-Task 1, land the remaining work. Review and merge PR 5
-(feature/turbo-toggle); the rest of the stack is already in dev (PRs 2, 3 and 4
-merged, PR 1 closed with its content in dev - verified with gh pr list --state
-all and git branch --merged dev on 2026-09-27). What still sits outside dev is
-feature/image-edit-probe (Unit 10, no PR, three commits unpushed) and dev's own
-six local commits, which are handoff and QA docs only: dev is never pushed
-directly, so either PR them or fold them into the next branch. Then create main
-plus protection for dev and main on GitHub.
-
-Task 2, restore the on-demand lifecycle on dev (see section 2's finding). Diff
+Task 1, restore the on-demand lifecycle on dev (see section 2's finding). Diff
 feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
 restore in_flight/idle_secs/idle_timeout_secs and the idle shutdown, or change
 stop-imagegen-bridge's guard 2 and architecture.md to what the bridge actually
 reports. A unit of its own on a branch off dev; the QA pass must exercise the
 idle shutdown live (short IMAGEGEN_IDLE_TIMEOUT_SECS) and both stop-hook guards,
-and it must not disturb the turbo toggle (its state and endpoints were added on
-top of the same file).
+and it must not disturb the turbo toggle or the Q6_K deployment (the same file
+and the same config carry them).
 
-Task 3, wire the adapter into the edit route (only after Unit 10 lands). The edit
-body is a multipart POST to the backend's /v1/images/edits, and that route is
-OpenAI-shaped: it takes no lora field and ignores prompt tags. Investigate first
-whether it honours sd_cpp_extra_args inside the prompt (which is how the schedule
-would travel) and where a structured lora entry could go, or whether the edit path
-should move to the native surface instead. UNVERIFIED: no turbo edit has been run,
-and the generation wiring gives no evidence about the edit route.
+Task 2, land Unit 10 (the image-edit path). feature/image-edit-probe carries
+three unpushed commits (tip 511c061) and has no PR; push it and open one against
+dev, or fold the unit into a fresh branch off the current dev tip. Then wire the
+adapter into the edit route: the edit body is a multipart POST to the backend's
+/v1/images/edits, that route is OpenAI-shaped (no lora field, prompt tags
+ignored), so investigate whether sd_cpp_extra_args inside the prompt is honoured
+there and where a structured lora entry could go, or whether the edit path
+should move to the native surface. UNVERIFIED: no turbo edit has been run.
 
-Task 4, the cheap measurements left open at 1024 square: VAE tile sizes between
-16x16 and the 32x32 default (24x24 was never tried), flash attention as an
-alternative way to recover the decode margin, and the cfg-isolation run (6 steps at
-cfg 2.0) that would split the per-step gain between step count and guidance.
+Task 3, the quality and measurement follow-ups from the Q6_K decision:
+resolutions above 1024 square on Q6_K (1536 is untested; ~2.4 GiB of the card is
+free at the 9200 MiB peak), and a written definition of acceptable image quality,
+which is still missing and is why the three-way comparison had to be argued from
+a critic pass.
 
-Task 5, upstream candidates, all needing the operator's go-ahead before anything is
+Task 4, upstream candidates, all needing the operator's go-ahead before anything is
 sent: the JSON body-size hang (bypassed, still unexplained), and the lazily built
 LoRA cache that rejects a valid adapter path until an unrelated route has been
 called (the bridge primes it, which is a workaround).
 
-Task 6, wrap: fold the outcome into section 2, replace section 3, refresh the memory
-entry, close with "Unit: 13 complete".
+Task 5, wrap: fold the outcome into section 2, replace section 3, refresh the memory
+entry, close with "Unit: 14 complete".
 
 Still open from earlier units, none of it done: create main and protect dev and main
 on GitHub; register or correct the ensure-localembed hook; the JSON body-size hang;
-and the missing definition of acceptable image quality, which is why Q4_K_M could
-not be scored against Q6_K and why the turbo output has only been judged by eye.
+and the missing definition of acceptable image quality, which is why the
+three-way deployment comparison had to be argued from a critic pass.
 
 
 4. Project facts a fresh session cannot re-derive
@@ -263,17 +261,19 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
      curl when a session needs turbo. The script is installed and symlinked, so
      wiring a trigger later is a one-line hook addition, but it is not wanted
      now.
+  5. The STANDING DEPLOYMENT is base-only Q6_K with default VAE tiling, and the
+     turbo keys stay commented out (decided 2026-09-27 on the operator's pick
+     from a measured three-way comparison). Turbo is refused with 409 by design;
+     bringing it back is the three-line edit above `diffusion` in imagegen.toml
+     plus a bridge restart. Do not "helpfully" re-enable the adapter.
 
 - OPEN items:
-  1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
-     72a641f) are unpushed as of this handoff; push them with the Unit 10 PR.
-  2. PR 5 (feature/turbo-toggle) is open and is the only open PR; PRs 2, 3 and 4
-     are merged and PR 1 is closed. The only branch with unmerged work besides
-     PR 5 is feature/image-edit-probe (Unit 10, no PR). Rule 23 wants one unit at
-     a time: land PR 5 first.
+  1. feature/image-edit-probe (Unit 10, tip 511c061) carries three unpushed
+     commits and has no PR; land it (section 3 task 2).
+  2. No PR is open as of this handoff: PRs 2-6 are merged and PR 1 is closed.
   3. dev's bridge source lost the on-demand lifecycle code in the af4e6c9 merge
      (in_flight, idle_secs, idle_timeout_secs, the idle shutdown); the stop hook
-     and architecture.md still assume it. See section 3 task 2.
+     and architecture.md still assume it. See section 3 task 1.
   4. The systemd path is dead on this machine but alive in the repo: the Unit 8
      branch still carries packaging/imagegen-bridge.service and the ensure
      script's systemd branch, and the unit it carried pointed at a deleted
@@ -282,16 +282,19 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
   6. The ensure-localembed hook described in the docs is not registered anywhere.
   7. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead), and the
      JSON body-size hang this session bypassed looks like a third candidate.
-  8. No quality standard is defined anywhere in the project, which is why Q4_K_M
-     could not be scored against Q6_K.
+  8. No quality standard is defined anywhere in the project; the Q6_K decision
+     rests on one critic pass over one scene, which is evidence but not a
+     standard.
   9. SessionEnd does not fire in headless runs, so the stop hook covers
      interactive sessions and the idle timer covers headless ones - and the idle
      timer itself is one of the things item 3 says is missing on dev.
-  10. Untested and open: the step count and cfg for edits (sd.cpp's own examples
-     use cfg 2.5, we inherit 6.0); whether the convrot encoder's built-in vision
-     tower matches the separate mmproj in quality; and whether removing the VRAM
-     oversubscription would let 1024 square fit inside the timeout. The turbo
-     toggle is deliberately manual (decision 4).
+  10. Untested and open: resolutions above 1024 square on Q6_K (about 2.4 GiB of
+     the card is free at the 9200 MiB peak); the step count and cfg for edits
+     (sd.cpp's own examples use cfg 2.5, we inherit 6.0); whether the convrot
+     encoder's built-in vision tower matches the separate mmproj in quality; and
+     whether removing the VRAM oversubscription would let 1024 square fit inside
+     the timeout. The turbo toggle is deliberately manual (decision 4), and the
+     deployment is base-only (decision 5).
 
 6. Progress and staleness check (run this first, every session)
 
