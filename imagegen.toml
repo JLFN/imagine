@@ -13,13 +13,16 @@
 # switched at runtime (POST /v1/turbo, or a per-request "turbo" flag), so the
 # adapter is no longer applied to every generation.
 #
-# The STANDING deployment is base-only, on Q6_K with default VAE tiling: measured
-# 2026-09-27 at 1024 square (same prompt and seed, independent critic pass), Q6_K
-# scores 9/10 realism against 6/10 for Q4_K_M with the 16x16 tiles and 3/10 for
-# turbo, at 183 s against 141 s and 29 s. The turbo keys at the bottom of this
-# file are therefore commented out and the bridge reports turbo unavailable; the
-# note above `diffusion` says exactly what to change to bring turbo back (it
-# needs the Q4_K_M model plus the small VAE tiles, and a restart).
+# The STANDING deployment is base-only, on Q6_K with default VAE tiling: the
+# QUALITY profile. Measured 2026-09-27 at 1024 square (same prompt and seed,
+# independent critic pass), QUALITY scores 9/10 realism against 6/10 for DRAFT
+# (Q4_K_M base with the 16x16 tiles) and 3/10 for TURBO, at 183 s against 141 s
+# and 29 s. The turbo keys at the bottom of this file are therefore commented out
+# and the bridge reports turbo unavailable; the note above `diffusion` says
+# exactly what to change to get the DRAFT + TURBO deployment back (it needs the
+# Q4_K_M model plus the small VAE tiles, and a restart). The full recipe for the
+# three profiles, with artifacts and the byte-identity check that DRAFT is the
+# pre-turbo behaviour: docs/sampling-profiles.md.
 #
 # Model paths have no built-in default on purpose: a wrong path that silently
 # loads a different model is worse than a refusal to start.
@@ -31,22 +34,24 @@
 
 # sd-server binary, and the model paths it is given.
 sd_server = "bin/sd-server"
-# Q6_K: the standing deployment is the base model, chosen for stills quality.
-# Measured 2026-09-27 at 1024 square, one prompt and seed, critic pass (agy):
-#   Q6_K, default tiling:     183 s, peak VRAM 9200 MiB, realism 9/10
-#   Q4_K_M, 16x16 VAE tiles:  141 s, peak VRAM 7272 MiB, realism 6/10
-#   turbo (Q4_K_M + adapter):  29 s, peak VRAM 7978 MiB, realism 3/10
+# Q6_K: the standing deployment is the QUALITY profile - the base model, chosen
+# for stills quality. Measured 2026-09-27 at 1024 square, one prompt and seed,
+# critic pass (agy):
+#   QUALITY (this file):      183 s, peak VRAM 9200 MiB, realism 9/10
+#   DRAFT (Q4_K_M + tiles):   141 s, peak VRAM 7272 MiB, realism 6/10
+#   TURBO (Q4_K_M + adapter):  29 s, peak VRAM 7978 MiB, realism 3/10
 #
 # The turbo adapter cannot run on Q6_K at 1024 square (measured: "model manager
 # cannot make enough memory available on CUDA0", then segment 29/34
 # transformer_blocks.27 fails during weight preparation), so the adapter keys at
 # the bottom of this file are commented out and the bridge reports turbo
-# unavailable. To use turbo again, change all three together:
+# unavailable. To switch to the DRAFT + TURBO deployment, change all three
+# together:
 #   1. diffusion to models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
 #   2. backend_args to add --vae-tiling --vae-tile-size 16x16
 #   3. uncomment lora_dir, lora, lora_multiplier and sigmas below
 # then restart the bridge (about 35 s of weight staging) and toggle as
-# documented in docs/viggle-turbo-lora.md.
+# documented in docs/sampling-profiles.md and docs/viggle-turbo-lora.md.
 diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 
@@ -115,11 +120,12 @@ turbo = false
 # turbo request sends when the client does not send cfg_scale itself.
 turbo_cfg_scale = 1.0
 
-# Few-step turbo adapter: DISABLED in the standing deployment. The keys are kept
-# for reference and to make the switch back a three-line edit (see the note above
-# `diffusion`); uncomment all four together with the Q4_K_M model and the 16x16
-# VAE tiles, or turbo stays unavailable (the bridge reports turbo_available false
-# and refuses POST /v1/turbo with 409).
+# Few-step turbo adapter: DISABLED in the standing QUALITY deployment. These keys
+# are the TURBO profile and they belong with the DRAFT model (Q4_K_M) and the
+# 16x16 VAE tiles; uncomment all four together with those two edits, or turbo
+# stays unavailable (the bridge reports turbo_available false and refuses
+# POST /v1/turbo with 409). The full recipe, including what each profile is for:
+# docs/sampling-profiles.md.
 #
 # With the keys active, the path is relative to lora_dir on purpose: sd-server
 # builds its LoRA cache from a recursive scan of the directory handed to it as
