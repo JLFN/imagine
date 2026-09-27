@@ -1,160 +1,160 @@
-QA report for imagegen Unit 8: the hook-driven on-demand lifecycle (start on an
-image request, stop on session end, and the bridge's own idle shutdown), plus
-re-verification of the Unit 7 surfaces this branch also carries.
+QA report for imagegen Unit 12: the turbo toggle. The bridge serves two sampling
+profiles from one process, starts in BASE mode (the adapter and its schedule are
+no longer applied to every generation), and switches to TURBO without a restart
+via POST /v1/turbo, the packaging/hooks/imagegen-turbo script, or a per-request
+"turbo" flag in the generation body.
 
 qa-model: deepseek-flash (the primary agent, by operator request)
-Date: 2026-09-22. Revision tested: the working tree on
-feature/on-demand-lifecycle, which is STACKED on feature/unit7-resolution-and-port
-(d36eb68), so the diff against dev contains both units. Rebuilt binaries:
-bin/imagegen-bridge 5,348,760 bytes (this unit) and bin/convrot-verify (Unit 7).
+Date: 2026-09-27. Revision tested: the working tree on feature/turbo-toggle, cut
+from origin/dev 86171d7. Binary: bin/imagegen-bridge, rebuilt with the canonical
+builder (bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge,
+release). The bridge that had been left running by the previous session was
+stopped first (packaging/hooks/stop-imagegen-bridge --force) and the rebuilt
+binary restarted through packaging/hooks/ensure-imagegen-bridge.
 
 INDEPENDENCE DISCLOSURE, read this first
 This pass was performed by the same agent that wrote the code, at the operator's
 request, so it is self-verification and strictly weaker than an independent QA
-model's pass. Every claim below was exercised live - a real headless open-grok
-session, the real systemd unit, the real hook scripts through their installed
-symlinks - and the output is quoted verbatim. Nothing was verified by reading the
-code alone. The explicit "NOT verified" list at the end is part of the evidence.
+model's pass. Every claim below was exercised live - the real bridge, the real
+backend, real generations through the OpenAI endpoint - and the output is quoted
+verbatim. Nothing below is claimed from reading the code alone. The explicit
+"NOT verified" list at the end is part of the evidence.
 
 Surfaces covered, each with the command and what was observed.
 
-CONFIG KEY idle_timeout_secs (the bridge's own stop, imagegen.toml)
+ENDPOINT /v1/turbo (new: GET reports the live mode, POST switches it)
   Unit tests: cargo test -p imagegen-bridge
-  observed: 8 passed; 0 failed, including the four new ones -
-  idle_timer_fires_only_after_the_timeout,
-  idle_timer_never_fires_mid_request_or_when_disabled,
-  activity_guard_counts_and_refreshes, plus the five pre-existing size/ceiling
-  tests.
-  Live, the running bridge reports and logs the value:
-  - effective configuration: ... max_edge=1152 idle_timeout_secs=900 placement=...
-  - GET /health -> {"status":"ok","backend":true,"backend_process_alive":true,
-    "backend_restarts":0,"backend_restart_attempts":0,"in_flight":0,
-    "idle_secs":126,"idle_timeout_secs":900}
-  The shutdown itself, with the timeout shortened to 20 s so the test fits in a
-  session:
-  command: IMAGEGEN_IDLE_TIMEOUT_SECS=20 setsid nohup env
-           IMAGEGEN_IDLE_TIMEOUT_SECS=20 LD_LIBRARY_PATH=... ./bin/imagegen-bridge
-  observed: up after 1s, health idle_timeout_secs 20; the bridge exited BY ITSELF
-  after 48 s (the timer polls every 30 s, so the exit lands within one poll of the
-  timeout), with the log line "idle for 30s (timeout 20s), releasing the backend;
-  the next request restages the model stack", and pgrep -x sd-server afterwards
-  returned 0, so the backend was reaped rather than orphaned.
+  observed: 9 passed; 0 failed, including the four new ones -
+  the_base_profile_ignores_the_adapter_and_its_schedule,
+  the_turbo_profile_carries_the_adapter_and_takes_steps_from_the_schedule,
+  the_toggle_body_accepts_both_forms_and_rejects_anything_else,
+  a_generation_body_may_pin_its_own_mode.
 
-CONFIG KEY max_edge (inherited from the Unit 7 branch, re-verified here)
-  command: curl -X POST http://127.0.0.1:8787/v1/images/generations -d
-           '{"prompt":"x","size":"1344x1344"}'
-  observed: http_code=400 with "size 1344x1344 exceeds the maximum 1152x1152
-  supported by the configured layout (diffusion parameters pinned in VRAM) ..." and
-  the same run's config line showing max_edge=1152. Full Unit 7 coverage, with the
-  measurements behind the value, is in qa-evidence/unit7-qa-report.md.
+  Live, GET on the restarted bridge:
+    {"cfg_scale":6.0,"lora":"(none)","lora_visible":true,"mode":"base",
+     "sigmas":"(scheduler)","steps":28,"turbo":false,"turbo_available":true}
 
-BINARY convrot-verify (inherited from the Unit 7 branch, re-verified here)
-  commands and observed exit codes, captured without a pipeline to avoid masking:
-    bin/convrot-verify                                  exit=0
-      verdict: PASS (pearson >= 0.99, rel_l2 <= 0.02 on every tensor checked)
-      embed_tokens pearson=0.999961 rel_l2=0.0089 max_abs=0.0010 control 1.3746
-    bin/convrot-verify /tmp/fake-weights.safetensors     exit=1
-      verdict: FAIL (a tensor disagreed with its BF16 ground truth)
-    bin/convrot-verify /tmp/nope.safetensors             exit=1
-      error: open /tmp/nope.safetensors: No such file or directory (os error 2)
+  POST {"enabled":true} -> 200, mode turbo, steps 6, cfg_scale 1.0, lora and
+  sigmas populated; POST {"enabled":false} -> 200, mode base again. Both quoted
+  in full in the sections below.
 
-The hook-driven lifecycle (the unit's actual subject)
+  Body validation, all on the live bridge, all HTTP 400 with an OpenAI-style
+  error object:
+    {}                -> "expected \"enabled\" or \"mode\" in the request body"
+    {"mode":"fast"}   -> "mode 'fast' is neither turbo nor base"
+    "not json"        -> "invalid request body: expected ident at line 1 column 2"
+    (empty body)      -> "expected a JSON body: {\"enabled\": true} or
+                          {\"mode\": \"turbo\"|\"base\"}"
+  After all four, GET /v1/turbo still reported mode base: a rejected body does
+  not move the mode.
 
-Two hook scripts, installed as symlinks from this repository so the repo is the
-source of truth (verified: ls -la ~/.opengrok/hooks/bin shows
-ensure-imagegen-bridge and stop-imagegen-bridge pointing at
-/data/imagegen/packaging/hooks/*, and both run through the symlink).
+CONFIG KEY turbo (new key, default false) and CONFIG KEY turbo_cfg_scale (1.0)
+  The restarted bridge's own startup line proves the file default is base mode
+  and that turbo is still available:
+    effective configuration: ... mode=base turbo_available=true steps=28
+    cfg_scale=6 lora=Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors
+    lora_multiplier=1 sigmas=1,0.9375,0.875,0.75,0.5,0.25,0 turbo_cfg_scale=1 ...
 
-  END-TO-END START, through a real session
-  command: bash /data/build-sd/e2e-hook-test.sh
-    (stop --force, confirm the bridge is down, then run
-     open-grok --cwd /data/imagegen -p "Use the image_gen tool to generate one
-     image of a red cube on a white table...")
-  observed: the headless session exit=0 and reported the tool result: a PNG at
-  .../images/1.jpg, 1,154,861 bytes, 1024x1024. The lifecycle log proves the hook
-  did the start, nobody else:
-    12:02:29 stop: stopping the bridge (sessions=2 in_flight=0 force=1)
-    12:02:29 stop: systemctl --user stop imagegen-bridge.service issued
-    12:02:38 started imagegen-bridge.service
-    12:02:39 healthy (foreground wait 10s)
-  and the bridge log shows the request it then served:
-    "generating 1 image(s) at 1024x1024 steps=28 cfg=6 seed=-1" at 12:02:39
-    "generated 1 image(s) in 175.280632557s"
-  175.28 s is inside open-grok's 240 s read timeout with the cold staging cost
-  included, which is the number that matters for on-demand use.
+  A bridge started with IMAGEGEN_TURBO=true (fake backend so no second sd-server
+  is spawned: IMAGEGEN_SD_SERVER=/bin/false, port 8797) reported
+    {"mode":"turbo","steps":6,"cfg_scale":1.0,"lora":"...r128.safetensors",...}
+  and POST {"enabled":false} answered 200 with {"mode":"base"}: the configured
+  startup mode is honored and is itself switchable.
 
-  START FALLBACK, with the systemd unit not installed
-  command: mv the unit away; systemctl --user daemon-reload; ensure-imagegen-bridge
-  observed: "unit load state: not-found"; the script launched the binary detached,
-  logged "detached launch attempted (pid 2335456)", the pid file matched the real
-  process (pgrep -x imagegen-bridge -> 2335456), and /health answered with
-  idle_timeout_secs 900. The unit was then restored and the deployment returned to
-  unit management (active, MainPID 2335572, health ok).
+  Startup validation, three runs, each exits 2 with its reason and no backend
+  spawned:
+    IMAGEGEN_TURBO=true IMAGEGEN_LORA=          -> "IMAGEGEN_TURBO is set but no
+      adapter is configured: set IMAGEGEN_LORA to the Viggle turbo adapter ..."
+    IMAGEGEN_TURBO=true IMAGEGEN_SIGMAS=none    -> "IMAGEGEN_TURBO is set but no
+      sigma schedule is configured: the turbo adapter ships with its own schedule,
+      and the base scheduler is not what it was distilled for"
+    IMAGEGEN_TURBO=true IMAGEGEN_LORA=nope...   -> "IMAGEGEN_TURBO is set but
+      there is no adapter at models/loras/nope.safetensors: refusing to start
+      rather than generate without the configured LoRA"
 
-  STOP, guarded (three paths exercised)
-  command: stop-imagegen-bridge            -> observed "stop: skipped, 2 open-grok
-    sessions are alive (use --force to override)" and the bridge stayed up.
-  command: stop-imagegen-bridge --force    -> observed "stop: systemctl --user stop
-    imagegen-bridge.service issued" then "bridge is down, ports released".
-  command: stop-imagegen-bridge (bridge already down) -> observed "nothing to do,
-    /health does not answer".
-  The in-flight guard was NOT exercised against a live generation (see NOT
-  verified); it reads the in_flight field, which /health reports as 0 when idle and
-  which the unit test covers as a counter.
+CONFIG KEY steps and CONFIG KEY cfg_scale (defaults flipped back to the base pair)
+  The live base run's bridge log line and the request timing prove the defaults:
+    generating 1 image(s) at 1024x1024 mode=base steps=28 cfg=6 seed=4242
+    lora=(none) sigmas=(scheduler)
+  observed: HTTP 200 in 169.5 s on a cold bridge (weights staged by this
+  request), sampling 137.07 s in the backend; peak VRAM 7272 MiB (1 s poll).
+  Artifact: qa-evidence/qa-base-1024-seed4242.png, sha256
+  4ef0f68575a593aae156866e66105f588525f9a6c3cf1945d9fec2a39888bcbb.
 
-  CLEAN STOP THROUGH SYSTEMD (the new SIGTERM handler)
-  command: systemctl --user stop imagegen-bridge.service
-  observed: bridge process 0, sd-server 0, ports 8787/8788 free, and the bridge's
-  own log carries "SIGTERM received" followed by "shutdown signal received,
-  stopping sd-server" - i.e. the bridge reaped its own backend rather than relying
-  on systemd killing the whole cgroup. (The same test on the previous binary passed
-  only because of the cgroup kill, which is why it was re-run after the rebuild.)
+  The turbo run proves the turbo pair travels with the mode instead:
+    generating 1 image(s) at 1024x1024 mode=turbo steps=6 cfg=1 seed=4242
+    lora=Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors
+    sigmas=1,0.9375,0.875,0.75,0.5,0.25,0
+  observed: HTTP 200 in 26.6 s warm (18.39 s sampling), peak VRAM 7978 MiB
+  (adapter tables cost about 700 MiB against the base run).
+  Artifact: qa-evidence/qa-turbo-1024-seed4242.png, sha256
+  1d73a9effcb1cbe9cb5916d868f14a3351b1cd32073e73dd74a84a6bcd4b05d3.
 
-  WHICH EVENTS FIRE, measured with a temporary probe hook
-  A throwaway hook logger recorded, for a headless run:
-    session_start, pre_tool_use, stop (reason end_turn)
-  and no session_end. The probe files were removed afterwards (verified: the only
-  hook json files left are callgraph, handoff, imagegen-bridge, skill-allowlist).
-  So the start half fires in headless and interactive runs, while the SessionEnd
-  stop applies to interactive sessions only and the idle timer is the backstop for
-  headless ones. This is recorded in docs/architecture.md rather than papered over.
+  The backend log for the turbo request shows the adapter being applied at
+  runtime, and the base requests show no such lines at all:
+    [INFO] diffusion_engine.cpp:1673 - apply lora at runtime
+    [INFO] diffusion_engine.cpp:1786 - apply_loras completed, taking 0.03s
+    [INFO] lora.hpp:982 - (454 / 454) LoRA tensors have been applied, ...
+  and for the base request right after it: "get_sigmas with Flux scheduler", no
+  lora load or apply lines.
 
-Rule 19 gate and the test entry point
-  command: bash tests/run.sh   (cargo test --workspace, then tests/qa-gate.sh)
-  observed: the gate extracts BINARY convrot-verify, CONFIG KEY max_edge and
-  CONFIG KEY idle_timeout_secs for this branch and requires a fresh report naming
-  each of them with the operative verdict as the last non-empty line.
+ADAPTER-LEAK TEST (the one thing a mode switch could get silently wrong)
+  Same prompt, same seed, 1024 square: base run BEFORE any turbo request, then a
+  turbo request, then base run AGAIN with the live mode switched back.
+  observed: the two base images are byte-identical -
+    4ef0f68575a593aae156866e66105f588525f9a6c3cf1945d9fec2a39888bcbb  base run 1
+    4ef0f68575a593aae156866e66105f588525f9a6c3cf1945d9fec2a39888bcbb  base run 2
+  So the runtime adapter does not leak into later base requests on this sd-server
+  build, and the base path is deterministic here (the comparison is meaningful).
+  Base run 2 took 135.0 s warm; peak VRAM 7328 MiB.
 
-Rule 10 dependency scan (before any push)
-  command: osv__osv_map_dependencies path=/data/imagegen
-  observed: no new dependencies were added by this unit (no Cargo.toml dependency
-  change), so the lockfile is the one scanned for Unit 7: 1 manifest, 155 packages,
-  0 vulnerable. Re-scanned at push time.
+REQUEST-LEVEL "turbo" FLAG (not a gate surface, but part of the unit)
+  With the live mode at base, a single request carrying "turbo": true ran turbo
+  and did not move the mode:
+    generating 1 image(s) at 512x512 mode=turbo steps=6 cfg=1 seed=7 lora=...
+  observed: HTTP 200 in 5.7 s; GET /v1/turbo afterwards still {"mode":"base"}.
+  Artifact: qa-evidence/qa-turbo-perrequest-512-seed7.png.
 
-Rule 5 canonical build
-  command: bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
-  observed: built and copied to bin/imagegen-bridge (5,348,760 bytes). The bridge
-  was stopped first: the builder cannot replace a running binary ("Text file busy")
-  and deletes target/ afterwards, so a build against a live bridge silently
-  discards its output.
+TURBO-UNAVAILABLE PATH (second instance on port 8797, no adapter configured:
+IMAGEGEN_LORA="" IMAGEGEN_SIGMAS=none, IMAGEGEN_SD_SERVER=/bin/false so no
+second GPU process is started)
+  GET /v1/turbo -> {"mode":"base","turbo":false,"turbo_available":false,...}
+  POST {"enabled":true} -> HTTP 409 "turbo cannot be enabled: the adapter and its
+  sigma schedule are not both configured (see /health turbo_available, and
+  docs/viggle-turbo-lora.md)"
+  POST a generation with "turbo":true -> HTTP 409 "turbo was requested but is not
+  available: the adapter and its sigma schedule are not both configured ..."
+  observed: the mode stayed base in both cases.
 
-NOT verified in this pass, stated plainly
-  - The SessionEnd stop hook has never been observed firing. Headless runs do not
-    emit session_end on this build (measured), so it could only be exercised by an
-    interactive session ending, which this pass did not do. The script itself, its
-    guards and its systemd/SIGINT stop paths are verified by direct invocation.
-  - The in-flight guard was not tested against a real generation in progress; only
-    the counter and the /health field were verified.
-  - The unit's Restart=on-failure behavior was not exercised by killing the bridge
-    with a nonzero exit or an unhandled signal.
-  - The hooks were verified in a headless session and by direct invocation, not in
-    an interactive TUI session: the PreToolUse start is proven end to end, the
-    SessionEnd registration is proven only by inspection of the loaded hook files.
-  - The bridge's own idle shutdown was tested with a 20 s timeout; the shipped
-    900 s default was not waited out.
-  - No concurrency test was run: two sessions requesting images at once, and the
-    stop hook racing a starting request, are both untested.
-  - The hook scripts are bash; they were run with bash on this machine only (no
-    other shell, no other host).
+HOOK SCRIPT packaging/hooks/imagegen-turbo (new, symlinked at
+~/.opengrok/hooks/bin/imagegen-turbo)
+  bash -n: syntax ok.
+  Live, against the running bridge:
+    imagegen-turbo status -> mode base JSON, rc=0
+    imagegen-turbo on     -> mode turbo JSON, rc=0
+    imagegen-turbo off    -> mode base JSON, rc=0
+    imagegen-turbo sideways -> "usage: imagegen-turbo [on|off|status]", rc=2
+  Log lines land in ~/.local/state/imagegen-turbo.log with the verb and outcome.
+
+IMAGE SANITY (independent vision route, not the QA agent's own eyes)
+  Both 1024 artifacts were described through the agy/Gemini vision route
+  (rustcv-mcp describe_image): each is "a coherent photo-like image depicting a
+  red fox sitting upright in deep snow ... snow-covered forest", not noise and
+  not a corrupted file. The two runs differ in composition, as a 28-step base
+  generation and a 6-step turbo generation of the same seed should.
+
+NOT verified live, and why
+- The 409 branch "the backend did not confirm the adapter" (adapter on disk but
+  not listed by the backend): reaching it needs a real sd-server whose LoRA cache
+  lacks the adapter, and the machine rule allows one sd-server at a time, so no
+  second backend was started. The branch calls the same prime_lora_cache that the
+  request path exercises; its behavior was recorded as a code path, not a live
+  result.
+- The image-edit route: the bridge has no edit route yet (Unit 10 has not
+  merged), so nothing in this unit touches it.
+- Mode persistence: the mode is process state by design; no restart-survival test
+  was run beyond the startup-mode test above, which covers the configured default.
+- Quality scoring of base vs turbo images: this project still has no defined
+  quality standard; the artifacts above are for the operator's own judgment.
 
 verdict: overall PASS
