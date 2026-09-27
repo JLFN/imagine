@@ -40,6 +40,10 @@
 //   IMAGEGEN_LORA            LoRA file, relative to IMAGEGEN_LORA_DIR; unset
 //                            means no turbo adapter is available at all
 //   IMAGEGEN_LORA_MULTIPLIER adapter multiplier           (1.0)
+//   IMAGEGEN_EXTRA_LORA      a second adapter, applied in EVERY mode (base and
+//                            turbo); unset means none. Used here for the
+//                            uncensored LoRA, which layers on the base weights
+//   IMAGEGEN_EXTRA_LORA_MULTIPLIER  its multiplier        (1.0)
 //   IMAGEGEN_SIGMAS          the turbo sigma schedule, comma separated, e.g.
 //                            1.0,0.9375,0.875,0.75,0.5,0.25,0.0; unset or empty
 //                            means turbo mode has no schedule and is
@@ -56,6 +60,13 @@
 // Switching turbo ON is verified against the backend (adapter on disk and listed
 // by it) before it takes effect, and the active mode is reported by /health and
 // /v1/turbo, so a request never runs silently with or without the adapter.
+//
+// The EXTRA adapter is a layer, not a mode: when configured it rides on every
+// request, base and turbo alike, and a turbo request carries both adapters in
+// the server's structured lora list (the API takes a list, and the engine loops
+// over it). With no extra adapter configured the base path sends no lora entry
+// at all, which is the byte-identical-to-pre-turbo behaviour the identity check
+// in docs/sampling-profiles.md relies on.
 //
 // Few-step turbo adapters (the Viggle Qwen-Image-2.1 distillation; see
 // docs/viggle-turbo-lora.md) are published as a sigma schedule rather than a
@@ -130,6 +141,11 @@ struct Config {
     /// configured, which makes turbo mode unavailable.
     lora: Option<String>,
     lora_multiplier: f64,
+    /// A second adapter, applied to every request in every mode. Used here for
+    /// the uncensored LoRA so it can layer on the base weights without a merged
+    /// model file. None means no extra layer.
+    extra_lora: Option<String>,
+    extra_lora_multiplier: f64,
     /// The turbo sigma schedule, which also carries the turbo step count
     /// (sd.cpp derives steps = sigmas.len() - 1). Empty means turbo mode cannot
     /// be entered: the distillation is not trained for the base scheduler.
@@ -157,13 +173,30 @@ impl Mode {
 /// What one request actually asks the backend for, once the mode is resolved.
 struct Profile<'a> {
     mode: Mode,
-    /// The adapter to send, if this profile uses one.
-    lora: Option<&'a str>,
+    /// The adapters to send, in application order: the turbo adapter first (in
+    /// turbo mode) and the extra layer after it. Empty means the request carries
+    /// no lora entry at all.
+    loras: Vec<(&'a str, f64)>,
     /// The sigma schedule to embed in the prompt, if this profile has one.
     sigmas: &'a [f64],
     /// Step count before the schedule has its say.
     steps: u32,
     cfg_scale: f64,
+}
+
+impl Profile<'_> {
+    /// The adapters as one comma-separated string, for logs and /health.
+    fn loras_arg(&self) -> String {
+        if self.loras.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.loras
+                .iter()
+                .map(|(path, _)| *path)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
 }
 
 /// What the TOML configuration file may contain.
@@ -190,6 +223,8 @@ struct FileConfig {
     lora_dir: Option<String>,
     lora: Option<String>,
     lora_multiplier: Option<f64>,
+    extra_lora: Option<String>,
+    extra_lora_multiplier: Option<f64>,
     sigmas: Option<Vec<f64>>,
 }
 
@@ -279,6 +314,13 @@ impl Config {
         let lora = env_or_file_opt("IMAGEGEN_LORA", file.lora);
         let lora_multiplier =
             pick("IMAGEGEN_LORA_MULTIPLIER", file.lora_multiplier, Some(1.0)).unwrap();
+        let extra_lora = env_or_file_opt("IMAGEGEN_EXTRA_LORA", file.extra_lora);
+        let extra_lora_multiplier = pick(
+            "IMAGEGEN_EXTRA_LORA_MULTIPLIER",
+            file.extra_lora_multiplier,
+            Some(1.0),
+        )
+        .unwrap();
         let sigmas = match std::env::var("IMAGEGEN_SIGMAS") {
             Ok(v) => match parse_sigmas(&v) {
                 Ok(s) => s,
@@ -307,6 +349,27 @@ impl Config {
                  adapter path relative to that directory, so the adapter would be ignored"
             );
             std::process::exit(2);
+        }
+        if extra_lora.is_some() && lora_dir.is_none() {
+            error!(
+                "IMAGEGEN_EXTRA_LORA is set without IMAGEGEN_LORA_DIR: sd-server resolves the \
+                 adapter path relative to that directory, so the adapter would be ignored"
+            );
+            std::process::exit(2);
+        }
+        // The extra layer rides on every request, so a missing file would change
+        // every image silently: that is a startup error, not a warning.
+        if let (Some(dir), Some(name)) = (&lora_dir, &extra_lora) {
+            let full = std::path::Path::new(dir).join(name);
+            if !full.is_file() {
+                error!(
+                    "no extra adapter at {} (lora_dir = {}): refusing to start rather than \
+                     generate every image without the configured layer",
+                    full.display(),
+                    dir
+                );
+                std::process::exit(2);
+            }
         }
         // Turbo mode needs three things to be usable: an adapter file name, a
         // sigma schedule (the distillation is published as a schedule, not as a
@@ -378,12 +441,14 @@ impl Config {
             lora_dir,
             lora,
             lora_multiplier,
+            extra_lora,
+            extra_lora_multiplier,
             sigmas,
         };
         info!(
             "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
              mode={} turbo_available={} steps={} cfg_scale={} lora={} lora_multiplier={} \
-             sigmas={} turbo_cfg_scale={} placement={}",
+             extra_lora={} extra_lora_multiplier={} sigmas={} turbo_cfg_scale={} placement={}",
             cfg.diffusion,
             cfg.llm,
             cfg.vae,
@@ -396,6 +461,8 @@ impl Config {
             cfg.cfg_scale,
             cfg.lora.as_deref().unwrap_or("(none)"),
             cfg.lora_multiplier,
+            cfg.extra_lora.as_deref().unwrap_or("(none)"),
+            cfg.extra_lora_multiplier,
             if cfg.sigmas.is_empty() {
                 "(none)".to_string()
             } else {
@@ -409,27 +476,52 @@ impl Config {
 
     /// The sampling profile a mode means, resolved against the configuration.
     ///
-    /// Base never touches the adapter and never carries a schedule, even when
-    /// both are configured: the two are the turbo recipe and the base model was
-    /// not distilled for them. Turbo takes the adapter, the published schedule
-    /// (which is also where its step count comes from) and the turbo CFG scale.
+    /// Base never touches the turbo adapter and never carries a schedule, even
+    /// when both are configured: the two are the turbo recipe and the base model
+    /// was not distilled for them. Turbo takes the adapter, the published
+    /// schedule (which is also where its step count comes from) and the turbo
+    /// CFG scale. The EXTRA adapter, when configured, is not part of either
+    /// profile: it is a layer applied to both, so it appears in both lists.
     fn profile(&self, mode: Mode) -> Profile<'_> {
+        let mut loras: Vec<(&str, f64)> = Vec::new();
+        if mode == Mode::Turbo {
+            if let Some(viggle) = self.lora.as_deref() {
+                loras.push((viggle, self.lora_multiplier));
+            }
+        }
+        if let Some(extra) = self.extra_lora.as_deref() {
+            loras.push((extra, self.extra_lora_multiplier));
+        }
         match mode {
             Mode::Turbo => Profile {
                 mode,
-                lora: self.lora.as_deref(),
+                loras,
                 sigmas: &self.sigmas,
                 steps: steps_for(self.steps, &self.sigmas),
                 cfg_scale: self.turbo_cfg_scale,
             },
             Mode::Base => Profile {
                 mode,
-                lora: None,
+                loras,
                 sigmas: &[],
                 steps: self.steps,
                 cfg_scale: self.cfg_scale,
             },
         }
+    }
+
+    /// Every configured adapter, turbo first. Used by the LoRA cache check and
+    /// the startup log: a configured adapter that the backend cannot see is a
+    /// refused request, so all of them are verified.
+    fn configured_loras(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if let Some(viggle) = self.lora.as_deref() {
+            out.push(viggle);
+        }
+        if let Some(extra) = self.extra_lora.as_deref() {
+            out.push(extra);
+        }
+        out
     }
 }
 
@@ -684,29 +776,37 @@ async fn prime_lora_cache(st: &AppState) -> bool {
     let list_ok = match resp {
         Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
             Ok(v) => {
-                let want = st.cfg.lora.as_deref();
-                let visible = want
-                    .map(|want| {
-                        v.as_array()
+                let wanted = st.cfg.configured_loras();
+                let entries = v.as_array();
+                let missing: Vec<&str> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|want| {
+                        !entries
                             .map(|entries| {
-                                entries.iter().any(|e| {
-                                    e.get("path").and_then(|p| p.as_str()) == Some(want)
-                                })
+                                entries
+                                    .iter()
+                                    .any(|e| e.get("path").and_then(|p| p.as_str()) == Some(*want))
                             })
                             .unwrap_or(false)
                     })
-                    .unwrap_or(true);
+                    .collect();
+                let visible = missing.is_empty();
                 *st.lora_visible.lock().unwrap() = Some(visible);
                 if !visible {
                     error!(
-                        "the backend does not list the configured adapter {}; every \
-                         generation will be refused by it",
-                        want.unwrap_or("(none)")
+                        "the backend does not list the configured adapter(s) {}; requests \
+                         carrying them will be refused by it",
+                        missing.join(", ")
                     );
                 } else {
                     info!(
-                        "backend lora cache primed; configured adapter {} is visible",
-                        want.unwrap_or("(none)")
+                        "backend lora cache primed; configured adapter(s) {} visible",
+                        if wanted.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            wanted.join(", ")
+                        }
                     );
                 }
                 true
@@ -942,7 +1042,7 @@ fn turbo_status(st: &AppState) -> serde_json::Value {
         "turbo_available": st.cfg.turbo_available,
         // What the next generation will be asked for, so one call answers
         // "which profile is live and what does it mean".
-        "lora": profile.lora.unwrap_or("(none)"),
+        "lora": profile.loras_arg(),
         "sigmas": if profile.sigmas.is_empty() {
             "(scheduler)".to_string()
         } else {
@@ -1037,7 +1137,7 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
         // lora_visible is null until the backend has been asked for its list.
         "mode": mode.as_str(),
         "turbo_available": st.cfg.turbo_available,
-        "lora": profile.lora.unwrap_or("(none)"),
+        "lora": profile.loras_arg(),
         "lora_visible": *st.lora_visible.lock().unwrap(),
         "sigmas": if profile.sigmas.is_empty() {
             "(scheduler)".to_string()
@@ -1102,11 +1202,12 @@ async fn create_generation(
              are not both configured (see /health turbo_available)",
         );
     }
-    // A turbo request must have the adapter visible to the backend before it goes
-    // out: sd-server's sdapi route does not refresh its own LoRA cache, so an
-    // unprimed cache turns a valid adapter path into "invalid lora path". A base
-    // request never touches the adapter and is not delayed by this.
-    if mode == Mode::Turbo
+    let profile = st.cfg.profile(mode);
+    // Any request carrying an adapter needs the backend's LoRA cache primed
+    // first: sd-server's sdapi route does not refresh it, so an unprimed cache
+    // turns a valid adapter path into "invalid lora path". With no adapters in
+    // the profile (the plain base path) this is skipped entirely.
+    if !profile.loras.is_empty()
         && !st
             .lora_primed
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1115,7 +1216,6 @@ async fn create_generation(
         st.lora_primed
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    let profile = st.cfg.profile(mode);
 
     let requested_steps = req.num_inference_steps.unwrap_or(profile.steps);
     let steps = steps_for(requested_steps, profile.sigmas);
@@ -1140,14 +1240,21 @@ async fn create_generation(
         "seed": seed,
         "batch_size": n,
     });
-    // The server takes a LoRA only from this structured field; a <lora:...> tag
-    // in the prompt is deliberately ignored there. Base mode sends none: the
-    // adapter is the turbo profile, not a permanent part of the model.
-    if let Some(lora) = profile.lora {
-        body["lora"] = serde_json::json!([{
-            "path": lora,
-            "multiplier": st.cfg.lora_multiplier,
-        }]);
+    // The server takes LoRAs only from this structured field; a <lora:...> tag
+    // in the prompt is deliberately ignored there, and the field is a list the
+    // engine applies in order. The turbo profile puts the distillation first and
+    // the extra layer (when configured) after it; the plain base path sends no
+    // lora entry at all.
+    if !profile.loras.is_empty() {
+        body["lora"] = serde_json::Value::Array(
+            profile
+                .loras
+                .iter()
+                .map(|(path, multiplier)| {
+                    serde_json::json!({ "path": path, "multiplier": multiplier })
+                })
+                .collect(),
+        );
     }
 
     info!(
@@ -1159,7 +1266,7 @@ async fn create_generation(
         steps,
         cfg_scale,
         seed,
-        profile.lora.unwrap_or("(none)"),
+        profile.loras_arg(),
         if profile.sigmas.is_empty() {
             "(scheduler)".to_string()
         } else {
@@ -1324,7 +1431,7 @@ async fn main() {
                     // a cold start cannot refuse the first LoRA request and so
                     // /health can report whether the adapter is visible. The
                     // first generation primes too, in case this has not landed.
-                    if st.cfg.lora.is_some() {
+                    if !st.cfg.configured_loras().is_empty() {
                         let primed = prime_lora_cache(&st).await;
                         st.lora_primed
                             .store(primed, std::sync::atomic::Ordering::SeqCst);
@@ -1449,6 +1556,8 @@ mod tests {
             lora_dir: Some("models/loras".to_string()),
             lora: Some("Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors".to_string()),
             lora_multiplier: 1.0,
+            extra_lora: None,
+            extra_lora_multiplier: 1.0,
             sigmas: vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0],
         }
     }
@@ -1460,7 +1569,7 @@ mod tests {
         assert_eq!(base.mode, Mode::Base);
         // Configured, and still not used: the two are the turbo recipe.
         assert!(cfg.lora.is_some());
-        assert!(base.lora.is_none());
+        assert!(base.loras.is_empty());
         assert!(base.sigmas.is_empty());
         assert_eq!(base.steps, 28);
         assert_eq!(base.cfg_scale, 6.0);
@@ -1473,11 +1582,34 @@ mod tests {
         let cfg = turbo_capable_config();
         let turbo = cfg.profile(Mode::Turbo);
         assert_eq!(turbo.mode, Mode::Turbo);
-        assert_eq!(turbo.lora, cfg.lora.as_deref());
+        assert_eq!(turbo.loras.len(), 1);
+        assert_eq!(turbo.loras[0].0, cfg.lora.as_deref().unwrap());
+        assert_eq!(turbo.loras[0].1, 1.0);
         assert_eq!(turbo.sigmas.len(), 7);
         assert_eq!(turbo.steps, 6);
         assert_eq!(turbo.cfg_scale, 1.0);
         assert!(prompt_with_sigmas("a capybara", turbo.sigmas).contains("custom_sigmas"));
+    }
+
+    #[test]
+    fn the_extra_layer_rides_on_both_modes_and_after_the_turbo_adapter() {
+        let mut cfg = turbo_capable_config();
+        cfg.extra_lora = Some("qwen-image-2.1-uncensored-lora.safetensors".to_string());
+        cfg.extra_lora_multiplier = 0.8;
+
+        let base = cfg.profile(Mode::Base);
+        assert_eq!(base.loras.len(), 1);
+        assert_eq!(base.loras[0].0, "qwen-image-2.1-uncensored-lora.safetensors");
+        assert_eq!(base.loras[0].1, 0.8);
+
+        let turbo = cfg.profile(Mode::Turbo);
+        assert_eq!(turbo.loras.len(), 2);
+        // Turbo first, the extra layer after it, in application order.
+        assert_eq!(turbo.loras[0].0, cfg.lora.as_deref().unwrap());
+        assert_eq!(turbo.loras[1].0, "qwen-image-2.1-uncensored-lora.safetensors");
+        assert_eq!(turbo.loras_arg().matches(',').count(), 1);
+        // And the configured list the cache check verifies has both.
+        assert_eq!(cfg.configured_loras().len(), 2);
     }
 
     #[test]

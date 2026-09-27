@@ -8,31 +8,58 @@ in that session; the quality verdicts come from an independent critic pass
 
 ## The three profiles
 
-| Profile | Diffusion model | VAE tiles | Adapter | Steps | CFG | Wall (1024 square) | Peak VRAM | Critic realism |
+| Profile | Diffusion model | VAE tiles | Adapters | Steps | CFG | Wall (1024 square) | Peak VRAM | Critic realism |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| QUALITY | Q6_K | default | none | 28 | 6.0 | 183.3 s | 9200 MiB | 9/10 |
-| DRAFT | Q4_K_M | 16x16 | none | 28 | 6.0 | 140.9 s | 7272 MiB | 6/10 |
-| TURBO | Q4_K_M | 16x16 | Viggle r128 + its schedule | 6 | 1.0 | 29.3 s | 7978 MiB | 3/10 |
+| QUALITY | UC-Q6_K | default | none | 28 | 6.0 | 183.3 s | 9200 MiB | 9/10 |
+| DRAFT | Q4_K_M | 16x16 | uncensored layer | 28 | 6.0 | 187.5 s | 7571 MiB | (see below) |
+| TURBO | Q4_K_M | 16x16 | uncensored layer + Viggle r128 | 6 | 1.0 | 32.7 s | 8230 MiB | 3/10 |
 
 All three: 1024x1024, one prompt (the neighbourhood playground), one seed (4242),
 through the bridge's OpenAI endpoint. Artifacts beside this recipe's QA evidence:
-qa-evidence/qa-playground-q6k-1024.png (QUALITY),
-qa-evidence/qa-playground-q4km-base-1024.png (DRAFT),
-qa-evidence/qa-playground-turbo-1024.png (TURBO).
+qa-evidence/qa-playground-uncensored-q6k-1024.png (QUALITY, the standing model),
+qa-evidence/qa-playground-q6k-1024.png (the base Q6_K, the A/B reference),
+qa-evidence/qa-playground-q4km-base-1024.png (DRAFT without the layer),
+qa-evidence/qa-playground-turbo-1024.png (TURBO without the layer).
 
 ## What each one is for
 
-- QUALITY: final stills. Q6_K is the better generator and the 183 s is inside
-  open-grok's 240 s read timeout, with little margin. No adapter, so turbo is
-  not available in this deployment (the bridge reports turbo_available false and
+- QUALITY: final stills. The standing model is the UNCENSORED Q6_K build (base
+  weights with the 33.6 MB uncensored LoRA merged): chosen on 2026-09-27 for
+  content behaviour, because the base model refuses or sanitises some prompts
+  while this one does not. The measured A/B on an ordinary scene found no
+  quality difference (both 9/10 realism, 183 s, 9200 MiB). 183 s is inside
+  open-grok's 240 s read timeout with little margin. No adapter, so turbo is not
+  available in this deployment (the bridge reports turbo_available false and
   refuses the toggle with 409, by design).
-- DRAFT: iteration and preview. Same 28-step base path on the faster Q4_K_M with
-  the small VAE tiles; about 40 s cheaper per image and visibly softer in fine
-  mechanical detail.
-- TURBO: speed only. Six-step Viggle distillation, about 6x faster than DRAFT,
-  but the critic found melted structural geometry on mechanical subjects
-  (realism 3/10 on the playground scene). Use it for composition checks, not for
-  keepers.
+- DRAFT: iteration and preview. The 28-step base path on the faster base Q4_K_M
+  with the small VAE tiles, with the uncensored LoRA layered on top when the
+  DRAFT deployment is configured that way; about 40 s cheaper per image than
+  QUALITY and visibly softer in fine mechanical detail (6/10 realism without the
+  layer; the layer measured 5/10 on the same scene, i.e. no gain either way).
+- TURBO: speed only. Six-step Viggle distillation plus the layer, about 6x faster
+  than DRAFT, but the critic found melted structural geometry on mechanical
+  subjects (realism 3/10 on the playground scene). Use it for composition checks,
+  not for keepers.
+
+## The uncensored layer
+
+The uncensored behaviour is available two ways, and the deployment uses one of
+each: QUALITY ships the merged UC build, while the DRAFT/TURBO deployment layers
+the separate 33.6 MB LoRA on the base weights through the bridge's `extra_lora`
+key. The layer rides on every request in every mode, so one process gives
+uncensored DRAFT and uncensored TURBO; a turbo request carries both adapters in
+the server's structured lora list, verified in one run with "(454 / 454) LoRA
+tensors ... viggle-turbo" and "(256 / 256) LoRA tensors ... uncensored-lora".
+
+Measured cost of the layer, 1024 square, same prompt and seed: peak VRAM
+7571 MiB against 7562 MiB without it, wall 187.5 s against 168.7 s (staging
+noise; the tensor application itself takes 0.03 s). What it buys is content
+behaviour, not quality: prompts the base model would refuse, soften or sanitise
+render as asked. On ordinary scenes the two are equivalent.
+
+Honest caveat: with the layer configured, the base path is no longer
+byte-identical to the pre-turbo request. The identity check below holds with
+`extra_lora` unset (which is how it was measured).
 
 ## The identity guarantee (DRAFT is the pre-turbo behaviour)
 
@@ -52,20 +79,24 @@ seed, which is what the adapter-leak test in qa-evidence/qa-report.md relies on.
 
 Two deployments, one at a time (the machine runs one sd-server on the GPU):
 
-A. QUALITY (standing). imagegen.toml as committed: diffusion = Q6_K, backend_args
-   without --vae-tiling, the four turbo keys commented out. Turbo is refused;
-   this file's comments carry the same recipe.
+A. QUALITY (standing). imagegen.toml as committed: diffusion =
+   qwen-image-2.1-UC-Q6_K.gguf, backend_args without --vae-tiling, the turbo and
+   extra-lora keys commented out. Turbo is refused; this file's comments carry
+   the same recipe.
 
-B. DRAFT + TURBO. Three edits in imagegen.toml, listed above `diffusion`:
-   diffusion = Q4_K_M, add --vae-tiling --vae-tile-size 16x16 to backend_args,
-   and uncomment lora_dir / lora / lora_multiplier / sigmas. One process then
-   serves both: the bridge starts in base mode (DRAFT), and
+B. DRAFT + TURBO. Four edits in imagegen.toml, listed above `diffusion`:
+   diffusion = qwen-image-2.1-Q4_K_M.gguf, add --vae-tiling --vae-tile-size 16x16
+   to backend_args, uncomment lora_dir / lora / lora_multiplier / sigmas, and
+   uncomment extra_lora / extra_lora_multiplier (the uncensored layer; drop this
+   step for a plain base DRAFT). One process then serves both: the bridge starts
+   in base mode (DRAFT), and
    `curl -s -X POST http://127.0.0.1:8787/v1/turbo -d '{"enabled":true}'`
    (or `packaging/hooks/imagegen-turbo on`) switches it to TURBO without a
    restart; a per-request `"turbo": true` pins one image.
 
 Either direction takes effect on the next bridge start (about 35 s of weight
 staging). The mode is process state and resets to imagegen.toml's `turbo` value.
+The extra layer has no toggle of its own: it is on whenever it is configured.
 
 ## Honest limits
 
