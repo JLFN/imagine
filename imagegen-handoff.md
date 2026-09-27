@@ -1,13 +1,13 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 90618e4
+last_updated_commit: 4ef1ac1
 branch: dev
-work_branch: feature/image-edit-probe (Unit 10, tip 511c061, four commits, only 588ac82 pushed)
+work_branch: none in flight on the local tree; PR 5 (feature/turbo-toggle, tip 4ef1ac1) is open, and PRs 1-4 carry the older branches
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~65% (signals.json, session 01a0de48)
-handoff_written_at: 2026-09-26T20:20:00Z
-session_id: 01a0de48-f809-7353-a458-31b3f19d943f
+handoff_written_at_context_usage: ~16% (signals.json, session 01a0e408)
+handoff_written_at: 2026-09-27T18:30:00Z
+session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
 ---
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
@@ -113,30 +113,47 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-27 — the Viggle turbo adapter serves image_gen)
+2. Current state (2026-09-27 — turbo is a runtime mode; base is the default)
 
-- dev LOCAL is 91a2b5d, three commits ahead of origin/dev and unpushed (the
-  handoff probe plus two QA reports). Rule 23 forbids pushing dev directly.
-- Pushed this session, both off origin/dev, no PR yet: feature/viggle-turbo-lora
-  (f0d663c, docs: the adapter recipe, its MANIFEST section, the bridge-serves-it
-  correction) and feature/bridge-turbo-lora (671d03a, code: adapter plus sigmas).
-- TURBO ON THE TOOL PATH: image_gen returns six-step turbo images, "(454 / 454)
-  LoRA tensors have been applied"; 1024x672 in 32.97 s sampling (77.25 s cold),
-  1024 square 62.91 s. Adapter off, the base path still answers (200, 64.2 s).
-- Deployed: Q4_K_M, r128 adapter, seven-value sigma list, steps 6, cfg 1.0, 16x16
-  VAE tiles; Q6_K plus the adapter cannot sample at 1024, merged mode is refused.
-- Unit 10 (edits) unchanged at 511c061; PRs 1 and 2 open.
+- dev LOCAL is 282d380, five commits ahead of origin/dev and unpushed (handoff
+  probes and QA evidence only). Rule 23 forbids pushing dev directly.
+- feature/turbo-toggle (4ef1ac1) is pushed and open as PR 5: the bridge starts in
+  BASE mode (steps 28, cfg 6.0, no adapter) and switches without a restart via
+  GET/POST /v1/turbo, packaging/hooks/imagegen-turbo on|off|status, or a
+  per-request "turbo" flag. Enabling turbo is verified against the backend or
+  refused with 409. QA evidence: qa-evidence/qa-report.md; gate PASS.
+- Measured through the rebuilt bridge: base 1024 square seed 4242 169.5 s cold,
+  7272 MiB peak; turbo same seed 26.6 s warm, 7978 MiB, "(454 / 454) LoRA
+  tensors have been applied"; base after turbo byte-identical to base before it.
+  Q4_K_M plus 16x16 VAE tiles are startup-fixed, so base mode inherits them.
+- Unit 10 (edits) unchanged at 511c061; PRs 1, 2 and 5 open.
+- FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
+  code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
+  added and that architecture.md and stop-imagegen-bridge still assume - the
+  merge af4e6c9 resolved main.rs to the turbo side, and guard 2 of the stop hook
+  reads an in_flight field that no longer exists. Reconcile with
+  feature/on-demand-lifecycle.
 
-3. Next unit plan — Unit 12: land the stack, then wire the adapter into editing
+3. Next unit plan — Unit 13: land the PR stack, then restore the lifecycle code
 
-Task 1, land the PR stack. Review and merge PR 1 (feature/unit7-resolution-and-port)
-into dev, retarget and merge PR 2 (feature/on-demand-lifecycle), then open and merge
-PRs for the two branches pushed this session. Rule 23 wants one unit in flight and
-four branches currently carry work. Separately, decide what happens to dev's three
-local commits: they are the handoff and the QA evidence, and nothing carries them to
-the remote today.
+Task 1, land the stack. Review and merge, in order: PR 1
+(feature/unit7-resolution-and-port), PR 2 (feature/on-demand-lifecycle), PR 3
+(feature/viggle-turbo-lora), PR 4 (feature/bridge-turbo-lora), PR 5
+(feature/turbo-toggle). Rule 23 wants one unit in flight and five branches
+currently carry work. Then decide what carries dev's local commits (handoff/QA
+docs only; dev is never pushed directly, so either PR them or fold them into the
+next branch), and create main plus protection for dev and main on GitHub.
 
-Task 2, wire the adapter into the edit route (only after Unit 10 lands). The edit
+Task 2, restore the on-demand lifecycle on dev (see section 2's finding). Diff
+feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
+restore in_flight/idle_secs/idle_timeout_secs and the idle shutdown, or change
+stop-imagegen-bridge's guard 2 and architecture.md to what the bridge actually
+reports. A unit of its own on a branch off dev; the QA pass must exercise the
+idle shutdown live (short IMAGEGEN_IDLE_TIMEOUT_SECS) and both stop-hook guards,
+and it must not disturb the turbo toggle (its state and endpoints were added on
+top of the same file).
+
+Task 3, wire the adapter into the edit route (only after Unit 10 lands). The edit
 body is a multipart POST to the backend's /v1/images/edits, and that route is
 OpenAI-shaped: it takes no lora field and ignores prompt tags. Investigate first
 whether it honours sd_cpp_extra_args inside the prompt (which is how the schedule
@@ -144,22 +161,18 @@ would travel) and where a structured lora entry could go, or whether the edit pa
 should move to the native surface instead. UNVERIFIED: no turbo edit has been run,
 and the generation wiring gives no evidence about the edit route.
 
-Task 3, the cheap measurements left open at 1024 square: VAE tile sizes between
+Task 4, the cheap measurements left open at 1024 square: VAE tile sizes between
 16x16 and the 32x32 default (24x24 was never tried), flash attention as an
 alternative way to recover the decode margin, and the cfg-isolation run (6 steps at
 cfg 2.0) that would split the per-step gain between step count and guidance.
 
-Task 4, upstream candidates, all needing the operator's go-ahead before anything is
+Task 5, upstream candidates, all needing the operator's go-ahead before anything is
 sent: the JSON body-size hang (bypassed, still unexplained), and the lazily built
 LoRA cache that rejects a valid adapter path until an unrelated route has been
 called (the bridge primes it, which is a workaround).
 
-Task 5, the dead systemd path: packaging/ is untracked on dev and tracked on the
-Unit 8 branch, which still carries imagegen-bridge.service and the ensure script's
-systemd branch. Remove both when that branch merges.
-
 Task 6, wrap: fold the outcome into section 2, replace section 3, refresh the memory
-entry, close with "Unit: 12 complete".
+entry, close with "Unit: 13 complete".
 
 Still open from earlier units, none of it done: create main and protect dev and main
 on GitHub; register or correct the ensure-localembed hook; the JSON body-size hang;
@@ -247,24 +260,32 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
 - OPEN items:
   1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
      72a641f) are unpushed as of this handoff; push them with the Unit 10 PR.
-  2. PRs 1 and 2 await review and merge; a third branch is in flight, and rule 23
-     wants one unit at a time, so land the stack first.
-  3. The systemd path is dead on this machine but alive in the repo: the Unit 8
+  2. Five branches carry unmerged work and five PRs are open (1: unit7, 2:
+     on-demand lifecycle, 3: viggle-turbo-lora docs, 4: bridge-turbo-lora, 5:
+     turbo-toggle). Rule 23 wants one unit at a time; land the stack first.
+  3. dev's bridge source lost the on-demand lifecycle code in the af4e6c9 merge
+     (in_flight, idle_secs, idle_timeout_secs, the idle shutdown); the stop hook
+     and architecture.md still assume it. See section 3 task 2.
+  4. The systemd path is dead on this machine but alive in the repo: the Unit 8
      branch still carries packaging/imagegen-bridge.service and the ensure
      script's systemd branch, and the unit it carried pointed at a deleted
-     encoder. Remove both when that branch merges (section 3 task 2).
-  4. main does not exist and neither dev nor main is protected on GitHub.
-  5. The ensure-localembed hook described in the docs is not registered anywhere.
-  6. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead), and the
+     encoder. Remove both when that branch merges.
+  5. main does not exist and neither dev nor main is protected on GitHub.
+  6. The ensure-localembed hook described in the docs is not registered anywhere.
+  7. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead), and the
      JSON body-size hang this session bypassed looks like a third candidate.
-  7. No quality standard is defined anywhere in the project, which is why Q4_K_M
+  8. No quality standard is defined anywhere in the project, which is why Q4_K_M
      could not be scored against Q6_K.
-  8. SessionEnd does not fire in headless runs, so the stop hook covers
-     interactive sessions and the idle timer covers headless ones.
-  9. Untested and open: the step count and cfg for edits (sd.cpp's own examples
+  9. SessionEnd does not fire in headless runs, so the stop hook covers
+     interactive sessions and the idle timer covers headless ones - and the idle
+     timer itself is one of the things item 3 says is missing on dev.
+  10. Untested and open: the step count and cfg for edits (sd.cpp's own examples
      use cfg 2.5, we inherit 6.0); whether the convrot encoder's built-in vision
-     tower matches the separate mmproj in quality; and whether removing the VRAM
-     oversubscription would let 1024 square fit inside the timeout.
+     tower matches the separate mmproj in quality; whether removing the VRAM
+     oversubscription would let 1024 square fit inside the timeout; and whether
+     the operator wants the turbo mode bound to an open-grok hook (the script
+     packaging/hooks/imagegen-turbo is installed and symlinked, but no hook
+     entry calls it yet - the trigger is the operator's call).
 
 6. Progress and staleness check (run this first, every session)
 
