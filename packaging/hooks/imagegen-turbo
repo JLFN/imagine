@@ -87,8 +87,15 @@ case "$verb:$now" in
     exit 0
     ;;
   *)
-    echo "the bridge refused the switch; the mode is $now (see $LOG)" >&2
-    log "$verb: refused, mode is $now ($resp)"
+    # A refusal comes back as an OpenAI-style error object, which carries the
+    # reason but no mode field; print that reason rather than "unknown".
+    err_msg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)
+    if [ -n "$err_msg" ]; then
+      echo "the bridge refused the switch: $err_msg" >&2
+    else
+      echo "the bridge refused the switch; the mode is $now (see $LOG)" >&2
+    fi
+    log "$verb: refused ($resp)"
     exit 1
     ;;
 esac

@@ -52,7 +52,7 @@ ships plus the built-in fallbacks where one exists.
 | Variable | Repo default (`imagegen.toml`) | Built-in fallback |
 | --- | --- | --- |
 | `IMAGEGEN_SD_SERVER` | `bin/sd-server` | none |
-| `IMAGEGEN_DIFFUSION` | `models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf` | none |
+| `IMAGEGEN_DIFFUSION` | `models/diffusion_models/qwen-image-2.1-Q6_K.gguf` | none |
 | `IMAGEGEN_VAE` | `models/vae/qwen_image_2.1_vae_bf16.safetensors` | none |
 | `IMAGEGEN_LLM` | `models/text_encoders/qwen3vl_8b_int8_convrot.safetensors` | none |
 | `IMAGEGEN_LISTEN_IP` | `127.0.0.1` | `127.0.0.1` |
@@ -62,23 +62,26 @@ ships plus the built-in fallbacks where one exists.
 | `IMAGEGEN_CFG_SCALE` | `6.0` | `6.0` |
 | `IMAGEGEN_TURBO` | `false` (start in base mode) | `false` |
 | `IMAGEGEN_TURBO_CFG_SCALE` | `1.0` | `1.0` |
-| `IMAGEGEN_LORA_DIR` | `models/loras` | none; required when a LoRA is set |
-| `IMAGEGEN_LORA` | the Viggle turbo rank-128 adapter | none (turbo unavailable) |
-| `IMAGEGEN_LORA_MULTIPLIER` | `1.0` | `1.0` |
-| `IMAGEGEN_SIGMAS` | `1.0,0.9375,0.875,0.75,0.5,0.25,0.0` | none (turbo unavailable) |
+| `IMAGEGEN_LORA_DIR` | none (commented out; turbo disabled) | none; required when a LoRA is set |
+| `IMAGEGEN_LORA` | none (commented out; turbo disabled) | none (turbo unavailable) |
+| `IMAGEGEN_LORA_MULTIPLIER` | none (commented out) | `1.0` |
+| `IMAGEGEN_SIGMAS` | none (commented out; turbo disabled) | none (turbo unavailable) |
 
 Run it from the repository root so the default model/sd-server paths resolve.
-The diffusion model in the repository default is Q4_K_M rather than the
-higher-quality Q6_K because of the adapter: with a runtime LoRA applied, Q6_K
-cannot fit a 1024-square generation on this card (measured 2026-09-27). The mode
-toggle does not swap models or tile sizes, so base mode runs on the turbo-tuned
-setup as well; a base-only deployment swaps Q6_K back in and drops the small VAE
-tiles, at the price of a restart to use turbo. See docs/viggle-turbo-lora.md.
+The standing deployment is base-only on Q6_K with default VAE tiling: measured
+2026-09-27 at 1024 square on one prompt and seed with an independent critic pass,
+Q6_K scored 9/10 realism against 6/10 for Q4_K_M with 16x16 VAE tiles and 3/10
+for turbo (183 s against 141 s and 29 s). The turbo keys in imagegen.toml are
+commented out because the adapter cannot run on Q6_K at 1024 square on this card;
+the note above `diffusion` in imagegen.toml lists the three changes that bring
+turbo back (Q4_K_M, the small tiles, the four keys). See
+docs/viggle-turbo-lora.md.
 
-The base model is the default and needs no environment juggling: the adapter and
-its schedule are used only in turbo mode. To start a bridge in turbo mode set
-`IMAGEGEN_TURBO=true`; to switch a running bridge use `POST /v1/turbo` (or the
-`packaging/hooks/imagegen-turbo on|off|status` script).
+The base model is the default and needs no environment juggling. When the turbo
+keys are active, the mode is switched with `POST /v1/turbo` (or the
+`packaging/hooks/imagegen-turbo on|off|status` script) and a bridge can be
+started in turbo with `IMAGEGEN_TURBO=true`; with the keys commented out, the
+bridge reports `turbo_available: false` and the toggle answers 409.
 
 Model files follow the upstream card's layout, one directory per component:
 
@@ -124,8 +127,11 @@ answers HTTP 409 with the reason. The mode is process state; a restart returns t
 
 One caveat stated plainly: the model file and the backend placement flags are
 fixed when sd-server starts, so the toggle changes the sampling profile, not the
-model. This repository's Q4_K_M plus 16x16-tile setup is tuned for turbo, and
-base mode inherits it; a base-only deployment is described in imagegen.toml.
+model. The standing deployment therefore picks one: Q6_K with default tiling for
+base quality (turbo disabled, its keys commented out), or Q4_K_M with 16x16 VAE
+tiles for a working turbo switch at a lower base quality. The three-line switch
+between them is documented in imagegen.toml above `diffusion`; either way the
+change takes effect on the next bridge start.
 
 ## Few-step turbo adapter (Viggle Qwen-Image-2.1 turbo)
 
