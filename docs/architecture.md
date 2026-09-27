@@ -446,9 +446,15 @@ What turbo changes in this deployment:
 
 Both bullets are startup-fixed, and the toggle does not change them: the model
 file and the placement flags belong to sd-server's process, and switching them
-means a restart (~35 s of weight staging). So base mode inherits the turbo-tuned
-Q4_K_M plus 16x16-tile setup; the base-only alternative (Q6_K, default tiling) is
-described in imagegen.toml.
+means a restart (~35 s of weight staging). The STANDING deployment (decided
+2026-09-27) is therefore base-only: Q6_K with default VAE tiling, and the turbo
+keys in imagegen.toml commented out so the bridge reports `turbo_available:
+false` and refuses the toggle with 409. The measured basis, 1024 square, one
+prompt and seed, independent critic pass (agy): Q6_K base 183 s / 9200 MiB peak /
+9 of 10 realism, against 141 s / 7272 MiB / 6 of 10 for the Q4_K_M plus 16x16-tile
+base and 29 s / 7978 MiB / 3 of 10 for turbo. Turbo needs the Q4_K_M model plus
+the small tiles; imagegen.toml lists the three changes, and both directions take
+effect on the next bridge start.
 
 Measured end to end through the bridge (1024x672 from a 3:2 request, cold start):
 sampling 33.0 s at 1.51 s/it, whole request 77.3 s, `(454 / 454) LoRA tensors
