@@ -259,6 +259,11 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
      network occupy the GPU. Anything that needs remote access goes through a
      tunnel or a proxy with auth, never a direct bind.
   3. Hook-only start, no systemd, nothing autostarts (section 2 and 4).
+  4. The turbo toggle stays MANUAL (decided 2026-09-27): no hook entry calls
+     packaging/hooks/imagegen-turbo; the operator toggles with that script or
+     curl when a session needs turbo. The script is installed and symlinked, so
+     wiring a trigger later is a one-line hook addition, but it is not wanted
+     now.
 
 - OPEN items:
   1. Three local commits on feature/image-edit-probe (8922ae2 is superseded by
@@ -285,11 +290,9 @@ not be scored against Q6_K and why the turbo output has only been judged by eye.
      timer itself is one of the things item 3 says is missing on dev.
   10. Untested and open: the step count and cfg for edits (sd.cpp's own examples
      use cfg 2.5, we inherit 6.0); whether the convrot encoder's built-in vision
-     tower matches the separate mmproj in quality; whether removing the VRAM
-     oversubscription would let 1024 square fit inside the timeout; and whether
-     the operator wants the turbo mode bound to an open-grok hook (the script
-     packaging/hooks/imagegen-turbo is installed and symlinked, but no hook
-     entry calls it yet - the trigger is the operator's call).
+     tower matches the separate mmproj in quality; and whether removing the VRAM
+     oversubscription would let 1024 square fit inside the timeout. The turbo
+     toggle is deliberately manual (decision 4).
 
 6. Progress and staleness check (run this first, every session)
 
