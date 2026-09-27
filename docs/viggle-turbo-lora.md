@@ -99,6 +99,14 @@ The verified command (this is exactly what produced the images in section 4):
       --backend te=cpu,diffusion=cuda0,vae=cuda0 \
       --params-backend te=cpu,diffusion=cuda0,vae=cpu
 
+The `--llm` line above is the encoder these measurements were made with. That
+file, the int8 convrot safetensors, was removed from disk on 2026-09-27 and the
+standing encoder is the GGUF Qwen3VL-8B-Instruct-Q4_K_M.gguf file
+(models/MANIFEST.md section 2). The adapter does not depend on the encoder: the
+same path was re-verified through the bridge on 2026-09-27 with the GGUF encoder
+in place, reporting mode turbo, 6 steps, cfg 1.0, the six-node schedule and both
+adapters listed by the backend, with a full 672x1024 render completing.
+
 The four knobs that decide whether it works, and why:
 
 1. `--lora-model-dir models/loras` plus the `<lora:NAME:WEIGHT>` prompt tag. NAME

@@ -140,12 +140,60 @@ Against the pre-registered criteria:
 
 So the encoding is correct and the file runs, but it buys nothing that the
 measurement can see while costing about 5.8 GB more encoder parameters (host RSS
-6.6 GB to 11.7 GB) and an unresolved amount of extra conditioning time. It is the
+6.6 GB to 11.7 GB) and an unresolved amount of extra conditioning time. It was the
 deployed default from 2026-09-22 by operator decision, with the GGUF encoder kept
-one line away in imagegen.toml. On the diffusion side, their recommended Q4_K_M
+one line away in imagegen.toml; that decision was reversed and the file removed on
+2026-09-27 - see "Reversal" below, which also states what the measurement above
+does and does not cover. On the diffusion side, their recommended Q4_K_M
 is a trade rather than a win on this box: 158.18 s and 8,163 MiB against Q6_K's
 159.60 s and 9,395 MiB, i.e. the same speed, about 1.2 GiB less VRAM, and less
 DiT precision. Q6_K fits comfortably at 9,395 of 11,893 MiB, so it stays.
+
+## Reversal (2026-09-27): reverted to the GGUF encoder, convrot deleted
+
+The operator reported visible artifacts in the generations of the deployment that
+carried this encoder, and none after the GGUF encoder was put back, on the same
+prompts. The change applied, all verified live rather than assumed:
+
+    llm (imagegen.toml)   qwen3vl_8b_int8_convrot.safetensors
+                          -> Qwen3VL-8B-Instruct-Q4_K_M.gguf
+    diffusion             qwen-image-2.1-Q6_K.gguf (base weights)
+    vae compute           CPU, in both --backend and --params-backend
+
+The captured backend command line from the session that produced the retained
+reference images (2026-09-26, session 01a0ddef) is the target configuration, and
+the live process now prints it character for character: diffusion Q6_K, VAE
+qwen_image_2.1_vae_bf16, `--llm .../Qwen3VL-8B-Instruct-Q4_K_M.gguf`, backend
+`te=cpu,diffusion=cuda0,vae=cpu` and the same for params-backend.
+
+What supports the attribution, and what does not:
+
+- The diffusion GGUF, the VAE and the sd-server binary are unchanged since
+  2026-09-21/22, so the encoder is the only component that differed between the
+  artifacts and the clean images.
+- The bridge binary cannot account for it: a controlled A/B with a fixed request
+  (512 square, 8 steps, seed 4242) through today's build and through a build of
+  the 2026-09-26 dev tip (a9e35b6) produced byte-identical output, sha256
+  e9d27abcfd8e660d725ff95c75835e3c9741959874275edbc3ef55e9f95a614f on both.
+- The GGUF encoder is the component models/MANIFEST.md marks fixed, with the
+  standing warning that another encoder gives incoherent generations.
+- LIMIT, stated plainly: this section does not overturn the 2026-09-22
+  measurement above. That measurement recorded a quality tie, but its probe was a
+  text-rendering prompt ("qwen2.1.cpp" transcribed correctly) scored for legibility,
+  which is not the surface an artifact report is about. The artifact-bearing
+  prompt was never run as a fixed-seed A/B across the two encoders, so the
+  encoder defect is unproven; what is proven is that the report correlates with
+  the encoder swap and that the swap is reverted.
+
+The convrot file has been deleted from disk (9,350,798,360 bytes freed). Its
+recovery path is its size and sha256, both recorded in models/MANIFEST.md, plus
+the public sources named there (Comfy-Org/Qwen-Image-2.1 text_encoders/, mirrored
+at KasugaiSakura/Qwen-Image-2.1-Uncensored-GGUF). The patches it requires
+(patches/0001, patches/0002) stay in the repository, and
+tools/convrot-te-experiment.sh remains the script that measures it.
+
+If this is revisited, the cheap decisive test is the one that was not run: one
+artifact-bearing prompt, one seed, both encoders, everything else fixed.
 
 ### The mmap gap, found only in production
 
