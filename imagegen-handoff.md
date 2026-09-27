@@ -87,75 +87,59 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-26 — image editing works; Unit 10 complete)
+2. Current state (2026-09-27 — the Viggle turbo adapter serves image_gen)
 
-- dev is at 90618e4 and pushed. Units 7 and 8 are STILL open PRs, re-verified
-  this session with gh pr list --state open: PR 1 feature/unit7-resolution-and-port
-  into dev, PR 2 feature/on-demand-lifecycle stacked on PR 1. Land PR 1 first.
-- feature/image-edit-probe carries Unit 10 in four commits, pushed only as far as
-  588ac82: 4656299 (body-size bracket), 8922ae2 (first edit route), 72a641f (the
-  multipart fix that made it work) and 511c061 (configurable ceiling, Q4_K_M
-  deployed). The last three are LOCAL until pushed.
-- EDITING WORKS through the tool path, verified end to end with the bridge started
-  by the PreToolUse ensure script: open-grok's JSON shape with a base64 reference
-  in, a 768x768 PNG out. At 28 steps with the encoder graph on the GPU: 768 square
-  in 121 s warm and 180 s fresh at about 8.3 GiB peak; 1024 square in 331 s at
-  11,241 MiB peak, past open-grok's 300 s total request timeout, so 1024 square
-  serves a direct curl client only.
-- The fix was to stop inlining the reference in a JSON body: sd-server hangs on a
-  JSON body above about 8.5 kB (bracketed 8,495 .. 64,495 bytes, and a body of that
-  size with NO extension block hangs identically, so it is the size, not the
-  block). Large bodies now go to the backend's MULTIPART images/edits route, which
-  carried a 628 KiB reference without complaint. The JSON hang is BYPASSED, not
-  explained, and still looks upstream-worthy.
-- Placement: encoder GRAPH on the GPU, its parameters in host RAM. Generation is
-  unaffected, measured same-session in both orders (CPU 181/157 s, GPU 176/160 s;
-  the spread follows run order). This supersedes an earlier wrong claim of a 43 s
-  generation penalty.
-- Diffusion model is Q4_K_M, because the model's size decides whether a 1024-square
-  edit fits at all (pinned Q6_K was 88 MB short). Q4_K_M measured slightly SLOWER
-  than Q6_K at 768 square (180 against 166 s) and its quality is unmeasured; it is
-  deployed for capacity. Q6_K is still on disk and one line is the revert. Edit
-  ceiling: edit_max_pixels = 1,048,576, refused as a 400 in under a millisecond.
-- SYSTEMD IS RETIRED by operator decision: hook-only, nothing autostarts. The unit
-  file is moved aside (imagegen-bridge.service.retired-20260926), disabled and
-  reloaded, LoadState not-found. Verified: nothing running before the hook, then a
-  detached launch. The unit had been breaking the tool path by carrying
-  Environment=IMAGEGEN_LLM pointing at the GGUF encoder deleted earlier, and
-  systemd Environment overrides imagegen.toml.
-- Machine state at handoff: the hook-started bridge may still be up; it exits by
-  itself after idle_timeout_secs (900). No sd-cli and no probe processes.
+- dev LOCAL is 91a2b5d, three commits ahead of origin/dev and unpushed (the
+  handoff probe plus two QA reports). Rule 23 forbids pushing dev directly.
+- Pushed this session, both off origin/dev, no PR yet: feature/viggle-turbo-lora
+  (f0d663c, docs: the adapter recipe, its MANIFEST section, the bridge-serves-it
+  correction) and feature/bridge-turbo-lora (671d03a, code: adapter plus sigmas).
+- TURBO ON THE TOOL PATH: image_gen returns six-step turbo images, "(454 / 454)
+  LoRA tensors have been applied"; 1024x672 in 32.97 s sampling (77.25 s cold),
+  1024 square 62.91 s. Adapter off, the base path still answers (200, 64.2 s).
+- Deployed: Q4_K_M, r128 adapter, seven-value sigma list, steps 6, cfg 1.0, 16x16
+  VAE tiles; Q6_K plus the adapter cannot sample at 1024, merged mode is refused.
+- Unit 10 (edits) unchanged at 511c061; PRs 1 and 2 open.
 
-3. Next unit plan — Unit 11: land the stack and remove the dead systemd path
+3. Next unit plan — Unit 12: land the stack, then wire the adapter into editing
 
-- Task 1, land the PR stack: review and merge PR 1 into dev, retarget PR 2
-  (gh pr edit 2 --base dev), refresh and merge it, then push the three local Unit
-  10 commits and open the Unit 10 PR. Rule 23 wants one unit in flight and three
-  branches are currently carrying work.
-- Task 2, remove the systemd path from the packaged scripts (tracked on the Unit 8
-  branch): delete packaging/imagegen-bridge.service, and drop the systemd branch
-  from packaging/hooks/ensure-imagegen-bridge so the detached launch is the only
-  route; check packaging/hooks/stop-imagegen-bridge, which may still assume
-  systemd for the clean stop. Hook-only start with no autostart is the machine's
-  state now but not yet the repo's.
-- Task 3, the edit ceiling beyond 768 square (operator stopped this line; reopen
-  only on request): the per-step cost nearly doubles between 768 and 1024 square
-  because the card is over-subscribed, with "model manager cannot make enough
-  memory available on CUDA0" and weight shuffling every step. The candidate
-  measurement is letting the DiT offload instead of pinning it, or capping its
-  budget, which Unit 1 measurements suggest costs little for generation.
-- Task 4, cheap and useful: retest 768 square on Q6_K against Q4_K_M at the same
-  warmth to confirm the 166-against-180 s difference, and choose the model on
-  speed rather than on the capacity the 1024 ceiling needs.
-- Task 5, wrap: fold the outcome into section 2, replace section 3, refresh the
-  memory entry, close with "Unit: 11 complete".
+Task 1, land the PR stack. Review and merge PR 1 (feature/unit7-resolution-and-port)
+into dev, retarget and merge PR 2 (feature/on-demand-lifecycle), then open and merge
+PRs for the two branches pushed this session. Rule 23 wants one unit in flight and
+four branches currently carry work. Separately, decide what happens to dev's three
+local commits: they are the handoff and the QA evidence, and nothing carries them to
+the remote today.
 
-Still open from earlier units, none of it done: create main and protect dev and
-main on GitHub; register or correct the ensure-localembed hook (documented, never
-registered); upstream patches/0001 and 0002 to leejet/stable-diffusion.cpp
-(EXTERNAL, needs the operator's go-ahead); define what acceptable image quality
-means, which is what blocked scoring Q4_K_M against Q6_K; and the JSON body-size
-hang, bypassed but unexplained.
+Task 2, wire the adapter into the edit route (only after Unit 10 lands). The edit
+body is a multipart POST to the backend's /v1/images/edits, and that route is
+OpenAI-shaped: it takes no lora field and ignores prompt tags. Investigate first
+whether it honours sd_cpp_extra_args inside the prompt (which is how the schedule
+would travel) and where a structured lora entry could go, or whether the edit path
+should move to the native surface instead. UNVERIFIED: no turbo edit has been run,
+and the generation wiring gives no evidence about the edit route.
+
+Task 3, the cheap measurements left open at 1024 square: VAE tile sizes between
+16x16 and the 32x32 default (24x24 was never tried), flash attention as an
+alternative way to recover the decode margin, and the cfg-isolation run (6 steps at
+cfg 2.0) that would split the per-step gain between step count and guidance.
+
+Task 4, upstream candidates, all needing the operator's go-ahead before anything is
+sent: the JSON body-size hang (bypassed, still unexplained), and the lazily built
+LoRA cache that rejects a valid adapter path until an unrelated route has been
+called (the bridge primes it, which is a workaround).
+
+Task 5, the dead systemd path: packaging/ is untracked on dev and tracked on the
+Unit 8 branch, which still carries imagegen-bridge.service and the ensure script's
+systemd branch. Remove both when that branch merges.
+
+Task 6, wrap: fold the outcome into section 2, replace section 3, refresh the memory
+entry, close with "Unit: 12 complete".
+
+Still open from earlier units, none of it done: create main and protect dev and main
+on GitHub; register or correct the ensure-localembed hook; the JSON body-size hang;
+and the missing definition of acceptable image quality, which is why Q4_K_M could
+not be scored against Q6_K and why the turbo output has only been judged by eye.
+
 
 4. Project facts a fresh session cannot re-derive
 
