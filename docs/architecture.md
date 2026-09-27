@@ -447,16 +447,22 @@ What turbo changes in this deployment:
 Both bullets are startup-fixed, and the toggle does not change them: the model
 file and the placement flags belong to sd-server's process, and switching them
 means a restart (~35 s of weight staging). The STANDING deployment (decided
-2026-09-27) is therefore base-only: Q6_K with default VAE tiling, and the turbo
+2026-09-27) is therefore base-only: the UNCENSORED Q6_K build (base weights with
+the 33.6 MB uncensored LoRA merged; chosen for content behaviour, not quality -
+the A/B measured 9/10 realism on both) with default VAE tiling, and the turbo
 keys in imagegen.toml commented out so the bridge reports `turbo_available:
 false` and refuses the toggle with 409. The three deployment options have names
 and measured numbers - QUALITY (this one, 183 s / 9200 MiB / 9 of 10 realism at
 1024 square), DRAFT (Q4_K_M base with the small tiles, 141 s / 7272 MiB / 6 of
 10) and TURBO (DRAFT's deployment with the adapter, 29 s / 7978 MiB / 3 of 10) -
 and the full recipe, artifacts and the byte-identity check that DRAFT reproduces
-the pre-turbo behaviour are in docs/sampling-profiles.md. Turbo needs the Q4_K_M
-model plus the small tiles; imagegen.toml lists the three changes, and both
-directions take effect on the next bridge start.
+the pre-turbo behaviour (with no extra layer configured) are in
+docs/sampling-profiles.md. Turbo needs the Q4_K_M model plus the small tiles;
+imagegen.toml lists the changes, and both directions take effect on the next
+bridge start. The DRAFT/TURBO deployment can also carry the uncensored LoRA as a
+separate layer (`IMAGEGEN_EXTRA_LORA`), which rides on every request in every
+mode; a turbo request then sends two adapters, verified in one run (454/454 plus
+256/256 tensors applied) at no measurable VRAM cost.
 
 Measured end to end through the bridge (1024x672 from a 3:2 request, cold start):
 sampling 33.0 s at 1.51 s/it, whole request 77.3 s, `(454 / 454) LoRA tensors

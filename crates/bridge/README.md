@@ -52,7 +52,7 @@ ships plus the built-in fallbacks where one exists.
 | Variable | Repo default (`imagegen.toml`) | Built-in fallback |
 | --- | --- | --- |
 | `IMAGEGEN_SD_SERVER` | `bin/sd-server` | none |
-| `IMAGEGEN_DIFFUSION` | `models/diffusion_models/qwen-image-2.1-Q6_K.gguf` | none |
+| `IMAGEGEN_DIFFUSION` | `models/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf` (uncensored build) | none |
 | `IMAGEGEN_VAE` | `models/vae/qwen_image_2.1_vae_bf16.safetensors` | none |
 | `IMAGEGEN_LLM` | `models/text_encoders/qwen3vl_8b_int8_convrot.safetensors` | none |
 | `IMAGEGEN_LISTEN_IP` | `127.0.0.1` | `127.0.0.1` |
@@ -65,6 +65,8 @@ ships plus the built-in fallbacks where one exists.
 | `IMAGEGEN_LORA_DIR` | none (commented out; turbo disabled) | none; required when a LoRA is set |
 | `IMAGEGEN_LORA` | none (commented out; turbo disabled) | none (turbo unavailable) |
 | `IMAGEGEN_LORA_MULTIPLIER` | none (commented out) | `1.0` |
+| `IMAGEGEN_EXTRA_LORA` | none (commented out) | none (no extra layer) |
+| `IMAGEGEN_EXTRA_LORA_MULTIPLIER` | none (commented out) | `1.0` |
 | `IMAGEGEN_SIGMAS` | none (commented out; turbo disabled) | none (turbo unavailable) |
 
 Run it from the repository root so the default model/sd-server paths resolve.
@@ -118,6 +120,15 @@ The live mode is reported by `GET /v1/turbo` and `GET /health`, switched with
 `POST /v1/turbo`, or pinned for one request with `"turbo": true` in the
 generation body. `packaging/hooks/imagegen-turbo on|off|status` is the shell-side
 wrapper, and it starts the bridge if it is not up.
+
+Separately from the mode, an optional EXTRA adapter (`IMAGEGEN_EXTRA_LORA`) is a
+layer rather than a mode: when configured it rides on every request, base and
+turbo alike, so one process serves an uncensored DRAFT and an uncensored TURBO. A
+turbo request then carries two entries in the server's structured lora list (the
+API takes a list and the engine applies it in order); both are verified against
+the backend's cache before use, and `/health` reports them joined by commas. It
+is used here for the 33.6 MB uncensored LoRA on the base weights; with it unset
+the base path sends no lora entry at all.
 
 Switching turbo ON is verified rather than assumed: the bridge asks the backend
 for its adapter list, requires the configured adapter to be in it, and only then
