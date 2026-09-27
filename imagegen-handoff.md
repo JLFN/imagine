@@ -1,12 +1,12 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 6662398
+last_updated_commit: cf5ae4c
 branch: dev
-work_branch: none in flight; PRs 5 and 6 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
+work_branch: none in flight; PRs 5, 6 and 7 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~22% (signals.json, session 01a0e408)
-handoff_written_at: 2026-09-27T18:55:00Z
+handoff_written_at_context_usage: ~29% (signals.json, session 01a0e408)
+handoff_written_at: 2026-09-27T19:07:00Z
 session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
 ---
 --- handoff probe (auto) ---
@@ -114,24 +114,29 @@ anything that affects the model stack.
 
 2. Current state (2026-09-27 — the standing deployment is base-only Q6_K; turbo is one edit away)
 
-- dev LOCAL is c5666b3, eleven commits ahead of origin/dev and unpushed (handoff
-  probes, QA evidence and merge commits only). Rule 23 forbids pushing dev
-  directly.
+- dev LOCAL is 6ff743a, thirteen commits ahead of origin/dev and unpushed
+  (handoff probes, QA evidence and merge commits only). Rule 23 forbids pushing
+  dev directly.
 - LANDED on origin/dev this session: PR 5 (feature/turbo-toggle, 4ef1ac1) made
-  turbo a runtime mode with the base model as the default, and PR 6
+  turbo a runtime mode with the base model as the default; PR 6
   (chore/deploy-q6k-base, 6662398) made the STANDING DEPLOYMENT base-only Q6_K
-  with default VAE tiling and the turbo keys commented out. Both branches are
+  with default VAE tiling and the turbo keys commented out; PR 7
+  (docs/sampling-profiles, cf5ae4c) wrote the recipe. All three branches are
   deleted; no PR is open.
+- THE PROFILES HAVE NAMES AND NUMBERS now: QUALITY (Q6_K base, standing, 183 s /
+  9200 MiB / 9 of 10 realism at 1024 square), DRAFT (Q4_K_M base + 16x16 tiles,
+  141 s / 7272 MiB / 6 of 10), TURBO (DRAFT's deployment + adapter, 29 s /
+  7978 MiB / 3 of 10). Recipe, artifacts and the switch procedure:
+  docs/sampling-profiles.md.
+- IDENTITY CHECKED: the pre-LoRA bridge (98ffc4a) and the current code, both on
+  Q4_K_M with default tiling, produced byte-identical images for one request
+  (1024 square, seed 4242, sha256 436f3a96...); artifact
+  qa-evidence/qa-q4km-identity-1024.png. The base path is provably the pre-turbo
+  request, and the sampler is deterministic across processes for a fixed seed.
 - LIVE SERVICE: Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
-  POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason. A
-  1024-square image takes about 183 s and 9200 MiB peak, against open-grok's
-  240 s read timeout. Turbo is one three-line edit away (Q4_K_M, 16x16 tiles,
-  four uncommented keys) plus a bridge restart.
-- The deployment decision rests on a measured comparison at 1024 square, one
-  prompt and seed, independent critic pass: Q6_K base 9/10 realism (183 s,
-  9200 MiB), Q4_K_M base 6/10 (141 s, 7272 MiB), turbo 3/10 (29 s, 7978 MiB).
-  Artifacts and the full QA report: qa-evidence/qa-report.md (Unit 12's report
-  preserved as unit12-qa-report.md).
+  POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason.
+  183 s per 1024-square image against open-grok's 240 s read timeout. Turbo is
+  one three-line edit away plus a bridge restart.
 - Unit 10 (edits) unchanged at 511c061 on feature/image-edit-probe, no PR yet.
 - FOUND 2026-09-27, NOT fixed: dev's bridge source lacks the on-demand lifecycle
   code (in_flight, idle_secs, idle_timeout_secs, the idle shutdown) that 4066f8e
@@ -140,7 +145,7 @@ anything that affects the model stack.
   reads an in_flight field that no longer exists. Reconcile with
   feature/on-demand-lifecycle.
 
-3. Next unit plan — Unit 14: restore the lifecycle code, then land the edit path
+3. Next unit plan — Unit 15: restore the lifecycle code, then land the edit path
 
 Task 1, restore the on-demand lifecycle on dev (see section 2's finding). Diff
 feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
@@ -172,7 +177,7 @@ LoRA cache that rejects a valid adapter path until an unrelated route has been
 called (the bridge primes it, which is a workaround).
 
 Task 5, wrap: fold the outcome into section 2, replace section 3, refresh the memory
-entry, close with "Unit: 14 complete".
+entry, close with "Unit: 15 complete".
 
 Still open from earlier units, none of it done: create main and protect dev and main
 on GitHub; register or correct the ensure-localembed hook; the JSON body-size hang;
@@ -282,9 +287,9 @@ three-way deployment comparison had to be argued from a critic pass.
   6. The ensure-localembed hook described in the docs is not registered anywhere.
   7. patches/0001 and 0002 are not upstreamed (needs an operator go-ahead), and the
      JSON body-size hang this session bypassed looks like a third candidate.
-  8. No quality standard is defined anywhere in the project; the Q6_K decision
-     rests on one critic pass over one scene, which is evidence but not a
-     standard.
+  8. No formal quality standard is defined; the QUALITY/DRAFT/TURBO recipe
+     (docs/sampling-profiles.md) gives named profiles with measured realism
+     ratings, but those are one critic pass over one scene each, not a standard.
   9. SessionEnd does not fire in headless runs, so the stop hook covers
      interactive sessions and the idle timer covers headless ones - and the idle
      timer itself is one of the things item 3 says is missing on dev.
