@@ -36,6 +36,31 @@ source repo; always recompute and compare, never trust the sizes alone.
 - Note:         The Qwen-Image-2.1 VAE is NOT interchangeable with the
                 earlier Qwen-Image or Wan 2.2 VAE weights (sd.cpp doc).
 
+## 4. Optional: few-step accelerator LoRA (Viggle turbo)
+
+- File:         models/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors
+- Size:         679,604,800 bytes (648 MiB)
+- Source:       https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo
+- Checksums:    sha256 bafb91d0047df3f9b8a5a850b0c967f051164314d8aad778dfa34d9c24ec345b
+                (matches the Hugging Face LFS object id; verified locally 2026-09-27)
+- Note:         A DMD distillation of the base Qwen-Image-2.1 transformer,
+                applied on top of the unmodified base weights at runtime. It
+                samples in 6 passes with no classifier-free guidance and is
+                driven by --sigmas, not by a step count or the shipped
+                scheduler config. It is an adapter, NOT a replacement: the
+                diffusion GGUF, the text encoder and the VAE above are still
+                required. License: Qwen RESEARCH LICENSE AGREEMENT, in the
+                repository (non-commercial). Recipe, exact sd-cli command and
+                the measured numbers: docs/viggle-turbo-lora.md.
+- Variants:     the rank-256 adapter of the same release
+                (Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors,
+                1,359,147,904 bytes, sha256
+                2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803) is
+                upstream's recommended build but is NOT downloaded or verified
+                here; the v0.2 release and the PEFT-format copies are optional
+                and unused by this stack. Sizes read from the repository's file
+                listing 2026-09-27.
+
 ## Download commands (for the box where this is set up; here on the workstation)
 
 Preferred tool: the hf CLI (huggingface_hub, resumable). Example per file:
@@ -113,3 +138,18 @@ Note: an initial curl for the diffusion model hit a flaky HTTP/2 stream
 (exit 92) and left a truncated 4,240,669,189-byte file, which FAILED the
 checksum check. Re-running curl with -C - (resume) + --retry recovered the
 file; a mismatch always means re-download, never trust size alone.
+
+### Turbo LoRA (downloaded 2026-09-27, this workstation)
+
+- models/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors
+  size    679604800
+  sha256  bafb91d0047df3f9b8a5a850b0c967f051164314d8aad778dfa34d9c24ec345b
+  (source: Viggle/Qwen-Image-2.1-viggle-turbo, matches the X-Linked-Etag the
+  resolve endpoint serves, which is the LFS object id)
+  Downloaded with: hf download Viggle/Qwen-Image-2.1-viggle-turbo \
+    Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors \
+    --local-dir models/loras
+  Loaded and applied in full by sd-cli: the run's own report is
+  "(454 / 454) LoRA tensors have been applied" with no unused-tensor warning,
+  so the diffusers key format needs no conversion tool. Full recipe and
+  measurements: docs/viggle-turbo-lora.md.
