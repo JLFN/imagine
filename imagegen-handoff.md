@@ -1,13 +1,13 @@
 ---
 project: imagegen
 plan_start_commit: 7443adfcd22374ddaa3e2139287e83a78d431367
-last_updated_commit: 3118732
+last_updated_commit: f80f7fb
 branch: dev
-work_branch: none in flight; PRs 5-8 merged this session and their branches deleted, feature/image-edit-probe (Unit 10) still outside dev
+work_branch: fix/text-encoder-gguf-revert (Unit 17, PR pending) off dev; feature/image-edit-probe (Unit 10) still outside dev
 remote: origin (PRIVATE, github.com/JLFN/imagegen) - created 2026-09-22, dev pushed
-handoff_written_at_context_usage: ~29% (signals.json, session 01a0e408)
-handoff_written_at: 2026-09-27T19:07:00Z
-session_id: 01a0e408-098e-7b42-b6e6-7b9d5daf9075
+handoff_written_at_context_usage: ~16% (signals.json, session 01a0e467)
+handoff_written_at: 2026-09-27T20:48:00Z
+session_id: 01a0e467-aa3d-7630-b681-5125f7eeddd5
 ---
 --- handoff probe (auto) ---
 === handoff probe (imagegen) ===
@@ -112,7 +112,7 @@ VAE, sampler, CLI, OpenAI server), replacing stable-diffusion.cpp. Read
 /data/imagegen-rs/imagegen-rs-handoff.md and its docs/parity.md before changing
 anything that affects the model stack.
 
-2. Current state (2026-09-27 — the standing deployment is the UNCENSORED Q6_K; the bridge can layer adapters)
+2. Current state (2026-09-27 — the standing deployment is the base Q6_K conditioned by the GGUF Qwen3-VL Q4 text encoder; Unit 17 in flight)
 
 - dev is IN SYNC with origin/dev (4859061 as of the purge below); the earlier
   local-only handoff/docs commits were rewritten by the purge and landed in the
@@ -133,34 +133,59 @@ anything that affects the model stack.
   * LIMIT: GitHub still keeps the old commits reachable through the merged pull
     requests' pages (PRs 1-9) and its own object store until GC or a
     support-side purge; the branch refs themselves now carry no images.
-- LANDED on origin/dev this session: PR 5 (turbo toggle), PR 6 (Q6_K
+- LANDED on origin/dev earlier this session: PR 5 (turbo toggle), PR 6 (Q6_K
   deployment), PR 7 (the QUALITY/DRAFT/TURBO recipe), PR 8
-  (feature/uncensored-model-trial, 2c96969): the standing model is now
-  qwen-image-2.1-UC-Q6_K.gguf (base weights + the 33.6 MB uncensored LoRA
-  merged; chosen for content behaviour, NOT quality - the A/B measured 9/10
-  realism on both), and the bridge gained an optional EXTRA adapter layer
-  (extra_lora) applied in every mode; PR 9 untracked the QA images. No PR is
-  open.
-- THE LAYER: `extra_lora` rides on base and turbo alike, so one process serves
-  uncensored DRAFT and uncensored TURBO; a turbo request carries two adapters
-  (verified in one run: 454/454 Viggle + 256/256 uncensored tensors), and the
-  cache check verifies every configured adapter. Measured cost at 1024 square:
-  7571 MiB peak against 7562 MiB without it - no measurable VRAM cost. With the
-  layer configured the base path is no longer byte-identical to the pre-turbo
-  request; the identity check holds with it unset.
-- THE PROFILES: QUALITY (UC-Q6_K, standing, 183 s / 9200 MiB / 9 of 10 realism),
-  DRAFT (Q4_K_M base + 16x16 tiles + the layer when configured, 141-187 s /
-  7272-7571 MiB / 5-6 of 10), TURBO (that deployment + the Viggle adapter, 29-33 s
-  / 7978-8230 MiB / 3 of 10). Recipe and switch procedure:
-  docs/sampling-profiles.md; all five model files with verified checksums:
+  (feature/uncensored-model-trial, 2c96969: UC-Q6_K standing plus the extra_lora
+  layer), PR 9 (untrack the QA images). No PR is open.
+- UNIT 17 IN FLIGHT on fix/text-encoder-gguf-revert (commits 7c5b8af, caee188,
+  db96cba; QA gate green; OSV clean: 155 packages, 0 vulnerable). Cause: the
+  uncensored deployment's generations carried artifacts the operator did not see
+  in earlier work. Forensics: the diffusion GGUFs, the VAE and the sd-server
+  binary are unchanged since 2026-09-21/22, and one fixed request through today's
+  bridge build and through a build of the 2026-09-26 dev tip (a9e35b6) produced
+  BYTE-IDENTICAL output (sha256 e9d27abc...), so the binary is not the variable.
+  The only component that differed from the configuration effectively serving the
+  retained reference images was the text encoder: the backend captured on
+  2026-09-26 carried --llm .../Qwen3VL-8B-Instruct-Q4_K_M.gguf while
+  imagegen.toml already named the convrot file. The branch stands on the base
+  Q6_K with that GGUF encoder, moves the VAE compute to the CPU, deletes the
+  convrot file from disk, and documents the reversal WITH its limit: the
+  encoder defect is not reproduced, because the 2026-09-22 comparison recorded a
+  quality tie. The live service is already on this configuration.
+- THE ENCODER: standing and only encoder is the GGUF Qwen3VL-8B-Instruct-Q4_K_M
+  file (sha256 67d1659b..., re-fetched and verified 2026-09-27). The int8 convrot
+  file is DELETED from disk; its size/sha256/sources in models/MANIFEST.md are
+  the whole recovery path, and patches/0001-0002 stay for it.
+- TURBO ON THE GGUF ENCODER, measured 2026-09-27 while answering whether the
+  revert broke it: it does not. The toggle's gate is adapter configured + two
+  sigma nodes + adapter on disk (crates/bridge/src/main.rs:418); the encoder is
+  not in it. With the DRAFT deployment configured, POST /v1/turbo reported mode
+  turbo, steps 6, cfg 1.0, both adapters listed, and a 672x1024 render completed.
+  Recorded in docs/sampling-profiles.md and docs/viggle-turbo-lora.md.
+- THE LAYER: `extra_lora` is a layer, not a mode: when configured it rides on
+  base and turbo alike, and a turbo request then carries two adapters (verified
+  in one run: 454/454 Viggle + 256/256 uncensored tensors). It is COMMENTED OUT
+  in the standing config, so QUALITY runs the plain base weights and the
+  uncensored behaviour is a DRAFT-deployment choice. Measured cost when
+  configured: 7571 MiB peak against 7562 MiB without it.
+- THE PROFILES: QUALITY (standing: base Q6_K + the GGUF encoder + default VAE
+  tiling, 183 s / 9200 MiB / 9 of 10 realism), DRAFT (Q4_K_M base + 16x16 tiles +
+  the layer when configured, 141-187 s / 7272-7571 MiB / 5-6 of 10), TURBO (that
+  deployment + the Viggle adapter, 29-33 s / 7978-8230 MiB / 3 of 10; the
+  DRAFT/TURBO numbers were measured with the convrot encoder and were re-verified
+  to hold on the GGUF one). Recipe and switch procedure:
+  docs/sampling-profiles.md; all model files with verified checksums:
   models/MANIFEST.md.
 - IDENTITY CHECKED: the pre-LoRA bridge (8c5b808) and the current code, both on
   Q4_K_M with default tiling and no extra layer, produced byte-identical images
   for one request (1024 square, seed 4242, sha256 436f3a96...); artifact
   qa-evidence/qa-q4km-identity-1024.png.
-- LIVE SERVICE: UC-Q6_K, mode base, steps 28, cfg 6.0, turbo_available false;
-  POST /v1/turbo answers 409 and imagegen-turbo on exits 1 with the reason.
-  183 s per 1024-square image against open-grok's 240 s read timeout.
+- LIVE SERVICE (verified this session): base Q6_K, mode base, steps 28, cfg 6.0,
+  turbo_available false, lora "(none)", and the sd-server command line is
+  character for character the one captured on 2026-09-26. POST /v1/turbo is
+  refused while turbo is unavailable (the health field above is the check made
+  this session; the 409 itself was recorded earlier). 183 s per 1024-square image
+  against open-grok's 240 s read timeout.
 - Unit 10 (edits) unchanged at 2f07671 on feature/image-edit-probe, no PR yet.
 - UNEXPLAINED, watch it: four tracked QA artifacts (qa-playground-turbo-1024,
   qa-q4km-identity-1024, qa-gen-1152-8steps-seed5, qa-gen-512-seed11) were found
@@ -174,7 +199,12 @@ anything that affects the model stack.
   reads an in_flight field that no longer exists. Reconcile with
   feature/on-demand-lifecycle.
 
-3. Next unit plan — Unit 16: restore the lifecycle code, then land the edit path
+3. Next unit plan — Unit 18: restore the lifecycle code, then land the edit path
+
+Carried over from the plan that was written as Unit 16; its content is unchanged
+and only the number moved, because Unit 17 (the text-encoder revert) was inserted
+ahead of it by operator request. Anything below that says "Unit 16" means this
+plan.
 
 Task 1, restore the on-demand lifecycle on dev (see section 2's finding). Diff
 feature/on-demand-lifecycle's crates/bridge/src/main.rs against dev's, and either
