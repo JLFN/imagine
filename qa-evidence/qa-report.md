@@ -1,160 +1,144 @@
-QA report for imagegen Unit 8: the hook-driven on-demand lifecycle (start on an
-image request, stop on session end, and the bridge's own idle shutdown), plus
-re-verification of the Unit 7 surfaces this branch also carries.
+QA report for the Viggle turbo LoRA unit (the adapter recipe in
+docs/viggle-turbo-lora.md, its registration in models/MANIFEST.md section 4, and
+the measurements those two documents assert).
 
-qa-model: deepseek-flash (the primary agent, by operator request)
-Date: 2026-09-22. Revision tested: the working tree on
-feature/on-demand-lifecycle, which is STACKED on feature/unit7-resolution-and-port
-(d36eb68), so the diff against dev contains both units. Rebuilt binaries:
-bin/imagegen-bridge 5,348,760 bytes (this unit) and bin/convrot-verify (Unit 7).
+qa-model: self-verification by the primary agent, chosen by the operator for this
+unit (2026-09-27). The project's earlier independent passes used
+qwen38-flash-next-ds4; this pass carries no independent-model weight.
+Date: 2026-09-27. Revision tested: d3a1686 on feature/viggle-turbo-lora.
+Unit type: documentation and measurement record. No code, configuration or
+dependency was changed, so there is no function, endpoint or client method to
+exercise.
 
 INDEPENDENCE DISCLOSURE, read this first
-This pass was performed by the same agent that wrote the code, at the operator's
-request, so it is self-verification and strictly weaker than an independent QA
-model's pass. Every claim below was exercised live - a real headless open-grok
-session, the real systemd unit, the real hook scripts through their installed
-symlinks - and the output is quoted verbatim. Nothing was verified by reading the
-code alone. The explicit "NOT verified" list at the end is part of the evidence.
+This pass was performed by the same agent that wrote the recipe and ran the
+generations, at the operator's request. It is self-verification and strictly
+weaker than an independent-model pass. To compensate, every check below re-reads
+the artefact the claim came from (the run logs, the safetensors header, the
+sd.cpp sources, the Hugging Face metadata) and quotes it verbatim, rather than
+restating the document. The things NOT verified are listed explicitly at the end.
 
-Surfaces covered, each with the command and what was observed.
+Surfaces covered: ALL NEW SURFACES. The unit adds two documents and no
+executable surface. Each factual claim in them was re-derived below.
 
-CONFIG KEY idle_timeout_secs (the bridge's own stop, imagegen.toml)
-  Unit tests: cargo test -p imagegen-bridge
-  observed: 8 passed; 0 failed, including the four new ones -
-  idle_timer_fires_only_after_the_timeout,
-  idle_timer_never_fires_mid_request_or_when_disabled,
-  activity_guard_counts_and_refreshes, plus the five pre-existing size/ceiling
-  tests.
-  Live, the running bridge reports and logs the value:
-  - effective configuration: ... max_edge=1152 idle_timeout_secs=900 placement=...
-  - GET /health -> {"status":"ok","backend":true,"backend_process_alive":true,
-    "backend_restarts":0,"backend_restart_attempts":0,"in_flight":0,
-    "idle_secs":126,"idle_timeout_secs":900}
-  The shutdown itself, with the timeout shortened to 20 s so the test fits in a
-  session:
-  command: IMAGEGEN_IDLE_TIMEOUT_SECS=20 setsid nohup env
-           IMAGEGEN_IDLE_TIMEOUT_SECS=20 LD_LIBRARY_PATH=... ./bin/imagegen-bridge
-  observed: up after 1s, health idle_timeout_secs 20; the bridge exited BY ITSELF
-  after 48 s (the timer polls every 30 s, so the exit lands within one poll of the
-  timeout), with the log line "idle for 30s (timeout 20s), releasing the backend;
-  the next request restages the model stack", and pgrep -x sd-server afterwards
-  returned 0, so the backend was reaped rather than orphaned.
+CLAIM: the adapter applies in full and needs no key conversion
+  command: grep -E "LoRA tensors have been applied|apply lora" /tmp/turbo-run1.log /tmp/volvo-a.log /tmp/volvo-b.log
+  observed: in all three LoRA runs,
+    diffusion_engine.cpp:1673 - apply lora at runtime
+    lora.hpp:982 - (454 / 454) LoRA tensors have been applied, lora_file_path =
+      models/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors
+  No "unused lora tensor" line and no "incompatible LoRA tensors have been
+  skipped" line appears in any run, so the count is the whole adapter.
+  source check: the suffix map in /data/build-sd/stable-diffusion.cpp
+  src/name_conversion.cpp maps ".lora_A.weight" to ".weight.lora_down" and
+  ".lora_B.weight" to ".weight.lora_up", which is exactly the key shape the file
+  carries (verified by reading the safetensors header over HTTP: 454 tensors,
+  all named ...lora_A.weight / ...lora_B.weight under transformer.*).
 
-CONFIG KEY max_edge (inherited from the Unit 7 branch, re-verified here)
-  command: curl -X POST http://127.0.0.1:8787/v1/images/generations -d
-           '{"prompt":"x","size":"1344x1344"}'
-  observed: http_code=400 with "size 1344x1344 exceeds the maximum 1152x1152
-  supported by the configured layout (diffusion parameters pinned in VRAM) ..." and
-  the same run's config line showing max_edge=1152. Full Unit 7 coverage, with the
-  measurements behind the value, is in qa-evidence/unit7-qa-report.md.
+CLAIM: the file really contains 454 tensors and the 10 target modules per block
+  command: HTTP range read of the safetensors header plus a tensor-name dump of
+  models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf
+  observed: header parses to "total tensors: 454", metadata
+  transformer.lora_alpha = 128 and transformer.r = 128 (alpha equals rank, hence
+  the documented scale of 1.0), and the module list in the metadata matches the
+  document's list (to_q, to_k, to_v, to_out.0, img_mlp.proj, img_mlp.gate_layer,
+  img_mlp.out, modulation.1, timestep_embedder.linear_1, linear_2).
+  The GGUF carries the matching base tensors, e.g.
+  transformer_blocks.0.attn.to_q.weight, modulation.1.weight,
+  time_text_embed.timestep_embedder.linear_1.weight.
 
-BINARY convrot-verify (inherited from the Unit 7 branch, re-verified here)
-  commands and observed exit codes, captured without a pipeline to avoid masking:
-    bin/convrot-verify                                  exit=0
-      verdict: PASS (pearson >= 0.99, rel_l2 <= 0.02 on every tensor checked)
-      embed_tokens pearson=0.999961 rel_l2=0.0089 max_abs=0.0010 control 1.3746
-    bin/convrot-verify /tmp/fake-weights.safetensors     exit=1
-      verdict: FAIL (a tensor disagreed with its BF16 ground truth)
-    bin/convrot-verify /tmp/nope.safetensors             exit=1
-      error: open /tmp/nope.safetensors: No such file or directory (os error 2)
+CLAIM: the published 6-node schedule needs a 7th value to become 6 steps
+  command: read src/pipeline/request.cpp and src/pipeline/diffusion_engine.cpp,
+  then grep the run log
+  observed: request.cpp sets total_steps = sigmas.size() - 1 for a custom sigma
+  list, and diffusion_engine.cpp derives its loop as sigmas.size() - 1 as well.
+  The run log agrees:
+    request.cpp:381 - total_steps != custom_sigmas_count - 1, set total_steps to 6
+    request.cpp:420 - sampling using Euler method
+    the per-step line reaches "6/6 - 2.58s/it"
+  The document's note that the two WARN lines are unconditional rather than a
+  misconfiguration matches the source: the first LOG_WARN is emitted outside any
+  comparison, and the second fires because sample_steps (6) is not less than
+  total_steps (6).
 
-The hook-driven lifecycle (the unit's actual subject)
+CLAIM: 60.56 s for the turbo run against 168.83 s for the base model
+  command: grep -oE "generate_image completed in [0-9.]+s|[0-9]+/[0-9]+ - [0-9.]+s/it" /tmp/turbo-run1.log /tmp/base-run1.log /tmp/volvo-a.log /tmp/volvo-b.log
+  observed:
+    turbo  : 1/6 - 17.00s/it, then 2.58-2.59 s/it for steps 2-6, generate 60.56 s
+    base   : 0/28 through 28/28 all at 4.40-4.41 s/it, generate 168.83 s
+    volvo A: 1/6 - 17.18s/it, 2.73 s/it, generate 63.74 s
+    volvo B: 1/6 - 30.50s/it, 2.58 s/it, generate 93.65 s
+  The wall figure of 61.63 s comes from /usr/bin/time on the turbo process, which
+  is the only run wrapped that way. The fixed-cost spread in the third table
+  (text-encoder load 21.77 / 24.81 s, conditioning 24.98 / 27.28 / 44.61 s) is
+  read from the same four logs. The VAE decode row is a derivation, not a logged
+  total: the logs show a 9-tile decode at about 2.2 s per tile, and the document
+  now says so.
 
-Two hook scripts, installed as symlinks from this repository so the repo is the
-source of truth (verified: ls -la ~/.opengrok/hooks/bin shows
-ensure-imagegen-bridge and stop-imagegen-bridge pointing at
-/data/imagegen/packaging/hooks/*, and both run through the symlink).
+CLAIM: the checksum in the table
+  command: sha256sum models/loras/...r128.safetensors, compared with the
+  X-Linked-Etag served for the same path on huggingface.co
+  observed: both are
+  bafb91d0047df3f9b8a5a850b0c967f051164314d8aad778dfa34d9c24ec345b, and the size
+  is 679,604,800 bytes, matching the repository's blob listing. The r256 row's
+  hash was read from the same header and is labelled in the document and manifest
+  as not downloaded or verified locally.
 
-  END-TO-END START, through a real session
-  command: bash /data/build-sd/e2e-hook-test.sh
-    (stop --force, confirm the bridge is down, then run
-     open-grok --cwd /data/imagegen -p "Use the image_gen tool to generate one
-     image of a red cube on a white table...")
-  observed: the headless session exit=0 and reported the tool result: a PNG at
-  .../images/1.jpg, 1,154,861 bytes, 1024x1024. The lifecycle log proves the hook
-  did the start, nobody else:
-    12:02:29 stop: stopping the bridge (sessions=2 in_flight=0 force=1)
-    12:02:29 stop: systemctl --user stop imagegen-bridge.service issued
-    12:02:38 started imagegen-bridge.service
-    12:02:39 healthy (foreground wait 10s)
-  and the bridge log shows the request it then served:
-    "generating 1 image(s) at 1024x1024 steps=28 cfg=6 seed=-1" at 12:02:39
-    "generated 1 image(s) in 175.280632557s"
-  175.28 s is inside open-grok's 240 s read timeout with the cold staging cost
-  included, which is the number that matters for on-demand use.
+CLAIM: licence and provenance
+  command: fetch the repository README, LICENSE and file listing
+  observed: the README states the adapter is a LoRA over Qwen/Qwen-Image-2.1
+  with text encoder, VAE and processor not redistributed; the LICENSE file is the
+  Qwen RESEARCH LICENSE AGREEMENT (research or evaluation only). The document
+  says the base stack is still required, which matches both.
 
-  START FALLBACK, with the systemd unit not installed
-  command: mv the unit away; systemctl --user daemon-reload; ensure-imagegen-bridge
-  observed: "unit load state: not-found"; the script launched the binary detached,
-  logged "detached launch attempted (pid 2335456)", the pid file matched the real
-  process (pgrep -x imagegen-bridge -> 2335456), and /health answered with
-  idle_timeout_secs 900. The unit was then restored and the deployment returned to
-  unit management (active, MainPID 2335572, health ok).
+CLAIM: the server rejects the prompt tag but accepts a structured LoRA list, so
+the bridge needs wiring
+  command: read examples/server/api.md in the local sd.cpp checkout
+  observed: "Prompt-embedded <lora:...> tags are intentionally unsupported"
+  (listed for the OpenAI, sdapi and sdcpp routes), "The server only accepts
+  explicit LoRA entries from the lora field", and the field tables carry
+  lora[].path, lora[].multiplier, lora[].is_high_noise and
+  sample_params.custom_sigmas. This is a documentation-level check only; no
+  server was started for this unit, which is why section 6 of the recipe is
+  marked UNVERIFIED.
 
-  STOP, guarded (three paths exercised)
-  command: stop-imagegen-bridge            -> observed "stop: skipped, 2 open-grok
-    sessions are alive (use --force to override)" and the bridge stayed up.
-  command: stop-imagegen-bridge --force    -> observed "stop: systemctl --user stop
-    imagegen-bridge.service issued" then "bridge is down, ports released".
-  command: stop-imagegen-bridge (bridge already down) -> observed "nothing to do,
-    /health does not answer".
-  The in-flight guard was NOT exercised against a live generation (see NOT
-  verified); it reads the in_flight field, which /health reports as 0 when idle and
-  which the unit test covers as a counter.
+CLAIM: the document changed no code
+  command: git show --stat d3a1686
+  observed: docs/viggle-turbo-lora.md (new) and models/MANIFEST.md only.
 
-  CLEAN STOP THROUGH SYSTEMD (the new SIGTERM handler)
-  command: systemctl --user stop imagegen-bridge.service
-  observed: bridge process 0, sd-server 0, ports 8787/8788 free, and the bridge's
-  own log carries "SIGTERM received" followed by "shutdown signal received,
-  stopping sd-server" - i.e. the bridge reaped its own backend rather than relying
-  on systemd killing the whole cgroup. (The same test on the previous binary passed
-  only because of the cgroup kill, which is why it was re-run after the rebuild.)
+CLAIM: the artefact paths printed in section 5 exist
+  command: ls -l out/*.png, ls -l models/loras/
+  observed: all four PNGs and the LoRA file are present with the sizes quoted.
 
-  WHICH EVENTS FIRE, measured with a temporary probe hook
-  A throwaway hook logger recorded, for a headless run:
-    session_start, pre_tool_use, stop (reason end_turn)
-  and no session_end. The probe files were removed afterwards (verified: the only
-  hook json files left are callgraph, handoff, imagegen-bridge, skill-allowlist).
-  So the start half fires in headless and interactive runs, while the SessionEnd
-  stop applies to interactive sessions only and the idle timer is the backstop for
-  headless ones. This is recorded in docs/architecture.md rather than papered over.
+Gates
+- Rule 10, osv-mcp: osv_map_dependencies on /data/imagegen scanned 1 manifest
+  and 124 packages, 0 vulnerable packages. Clean at 2026-09-27T16:36:43Z.
+- Rule 12, graphify-rs: AST-only rebuild at commit time, 51 nodes, 82 edges,
+  9 communities; output stays gitignored.
+- Rule 6, visibility: gh repo view JLFN/imagegen --json isPrivate,visibility
+  reports isPrivate true, PRIVATE, checked immediately before the push.
 
-Rule 19 gate and the test entry point
-  command: bash tests/run.sh   (cargo test --workspace, then tests/qa-gate.sh)
-  observed: the gate extracts BINARY convrot-verify, CONFIG KEY max_edge and
-  CONFIG KEY idle_timeout_secs for this branch and requires a fresh report naming
-  each of them with the operative verdict as the last non-empty line.
+NOT verified, and stated as such in the recipe
+1. Editing with the turbo LoRA (image-to-image, ref_images): not run.
+2. The rank-256 adapter: not downloaded, not compared against rank 128.
+3. Resolutions above 1024 and the 2K training area: not run.
+4. --flow-shift tuning (sd.cpp's 3.0 default against 1.0): not compared.
+5. Peak VRAM for the 6-step run: not measured.
+6. The cfg-isolation test that would split the per-step gain between step count
+   and guidance: not run, so the document labels that attribution an inference.
+7. The bridge wiring for a structured lora entry plus custom_sigmas: not
+   implemented, and no server run was made.
+8. A warm-service run (weights already loaded): the document says it should be
+   cheaper than 61 s; that is a hypothesis, not a measurement.
 
-Rule 10 dependency scan (before any push)
-  command: osv__osv_map_dependencies path=/data/imagegen
-  observed: no new dependencies were added by this unit (no Cargo.toml dependency
-  change), so the lockfile is the one scanned for Unit 7: 1 manifest, 155 packages,
-  0 vulnerable. Re-scanned at push time.
-
-Rule 5 canonical build
-  command: bash /data/build/linux/build.sh -p /data/imagegen -b imagegen-bridge
-  observed: built and copied to bin/imagegen-bridge (5,348,760 bytes). The bridge
-  was stopped first: the builder cannot replace a running binary ("Text file busy")
-  and deletes target/ afterwards, so a build against a live bridge silently
-  discards its output.
-
-NOT verified in this pass, stated plainly
-  - The SessionEnd stop hook has never been observed firing. Headless runs do not
-    emit session_end on this build (measured), so it could only be exercised by an
-    interactive session ending, which this pass did not do. The script itself, its
-    guards and its systemd/SIGINT stop paths are verified by direct invocation.
-  - The in-flight guard was not tested against a real generation in progress; only
-    the counter and the /health field were verified.
-  - The unit's Restart=on-failure behavior was not exercised by killing the bridge
-    with a nonzero exit or an unhandled signal.
-  - The hooks were verified in a headless session and by direct invocation, not in
-    an interactive TUI session: the PreToolUse start is proven end to end, the
-    SessionEnd registration is proven only by inspection of the loaded hook files.
-  - The bridge's own idle shutdown was tested with a 20 s timeout; the shipped
-    900 s default was not waited out.
-  - No concurrency test was run: two sessions requesting images at once, and the
-    stop hook racing a starting request, are both untested.
-  - The hook scripts are bash; they were run with bash on this machine only (no
-    other shell, no other host).
+Open items recorded, not defects of this revision
+- The adapter is licensed for non-commercial use only, and the base stack's own
+  licences still apply; the documents say so rather than assuming reuse rights.
+- Host CPU load moves the fixed costs of a run (conditioning and step 1) by
+  roughly a factor of two between otherwise identical runs, so single-run timings
+  in this project should keep their process context attached.
+- docs/viggle-turbo-lora.md section 6 describes work the bridge does not do yet;
+  it is a specification for the follow-up unit, not a claim about current
+  behaviour.
 
 verdict: overall PASS
