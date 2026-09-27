@@ -198,10 +198,10 @@ Quality, on the evidence rather than on the upstream claim:
 models/ and out/ are both gitignored; the images are working evidence, not
 deliverables.
 
-## 6. Through sd-server and the bridge (UNVERIFIED here, documented for wiring)
+## 6. Through the bridge and the image tools (IMPLEMENTED on feature/bridge-turbo-lora)
 
 sd-cli takes the `<lora:...>` prompt tag, but the server deliberately does not.
-Verified in the server's own documentation at /data/build-sd:
+Verified in the server's own documentation and source at /data/build-sd:
 
 - `/v1/images/generations`, `/v1/images/edits`, `/sdapi/v1/txt2img` and
   `/sdcpp/v1/img_gen` all state that prompt-embedded `<lora:...>` tags are
@@ -211,13 +211,40 @@ Verified in the server's own documentation at /data/build-sd:
   block with `sample_params.custom_sigmas`, `sample_params.sample_steps`,
   `sample_params.flow_shift` and `sample_params.guidance.txt_cfg`.
 - `GET /sdapi/v1/loras` lists the adapters the server can see; the LoRA directory
-  is passed to the server with `--lora-model-dir`.
+  is passed to the server with `--lora-model-dir`, and `lora[].path` must equal
+  the path the server's own directory scan produced (a path relative to that
+  directory), not an absolute path.
+- The sdapi generation route has no sigma field at all, so the schedule can only
+  travel as the native JSON embedded in the prompt:
+  `prompt<sd_cpp_extra_args>{"sample_params":{"custom_sigmas":[...]}}</sd_cpp_extra_args>`.
 
-So the turbo path through the bridge needs two things the bridge does not do
-today: forward a structured `lora` entry (path plus multiplier 1.0) and forward
-`sample_params.custom_sigmas` with the 7-value list and cfg 1.0. Until that is
-wired, the turbo route is sd-cli-only. This is a code change and is NOT part of
-this document's verification.
+The bridge now does all of that (commit 671d03a on feature/bridge-turbo-lora, with
+its QA evidence on dev): `imagegen.toml` carries `lora_dir`, `lora`,
+`lora_multiplier` and `sigmas`, the bridge sends the structured entry and the
+schedule, derives the step count from the schedule, and primes the server's
+lazily built LoRA cache so the first request cannot fail with "invalid lora
+path". Set `IMAGEGEN_LORA` to the empty string (with `IMAGEGEN_SIGMAS=none`,
+`IMAGEGEN_STEPS=28` and `IMAGEGEN_CFG_SCALE=6.0`) to go back to the base model.
+
+Two consequences of doing it through the bridge rather than sd-cli:
+
+- The adapter must be applied at runtime, and merged application is refused
+  outright: sd.cpp reports "INT8 tensorwise weights do not support the
+  immediately LoRA apply mode; using at_runtime instead", forced by the int8
+  convrot text encoder. Runtime tables cost about 2.4 GB of device memory, which
+  is why the deployed bridge config pairs the adapter with Q4_K_M instead of
+  Q6_K (Q6_K plus the adapter cannot sample at 1024 square) and with 16x16 VAE
+  tiles (the default 32x32 tiles miss the decode budget by 3 MB). Both are
+  measured and recorded in imagegen.toml.
+- Measured through the bridge on the real tool path (a 3:2 request resolved to
+  1024x672, cold start): sampling 32.97 s at 1.51 s/it after a 25.43 s first
+  step, the whole request 77.25 s, and `(454 / 454) LoRA tensors have been
+  applied`. At 1024 square the same configuration took 42.91 s of sampling and
+  62.91 s for the whole image.
+
+The image-edit route is not on that branch (Unit 10 has not merged), so the
+adapter is wired into generation only; the same two fields belong in the edit
+body when it lands.
 
 ## 7. Prerequisites and rebuild notes
 
@@ -264,7 +291,11 @@ Unmeasured here, in the order they would matter:
    headroom at 1024 square compared with the base model is unknown.
 6. The cfg-isolation test (6 steps at cfg 2.0 to confirm that guidance accounts
    for the per-step difference): not run.
-7. The bridge wiring in section 6: not implemented.
+7. VAE tile sizes between 16x16 and the 32x32 default (24x24 was not tried), and
+   whether flash attention would recover the decode margin instead: not run.
+
+The bridge wiring that used to be item 7 here is now implemented and measured on
+feature/bridge-turbo-lora; section 6 describes it.
 
 ## 9. Sources used for this document
 
