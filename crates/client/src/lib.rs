@@ -411,12 +411,37 @@ pub struct Health {
     /// Guidance the next request will use.
     #[serde(default)]
     pub cfg_scale: Option<f64>,
+    /// Requests currently being served. Non-zero means a stop would throw away
+    /// a generation, so this is what a lifecycle decision reads.
+    #[serde(default)]
+    pub in_flight: Option<u64>,
+    /// Seconds since the last request finished.
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
+    /// The idle shutdown threshold the service is running with; 0 disables it.
+    /// When idle_secs reaches this, the service releases the backend itself.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Health {
     /// True when the service reports itself up and its backend reachable.
     pub fn is_ready(&self) -> bool {
         self.status == "ok" && self.backend.unwrap_or(true)
+    }
+
+    /// True when nothing is being served, so a stop cannot interrupt work.
+    /// Absent fields are treated as idle: a service that does not report
+    /// in_flight is one whose version predates the field, and the caller is
+    /// about to decide whether to stop it anyway.
+    pub fn is_idle(&self) -> bool {
+        self.in_flight.unwrap_or(0) == 0
+    }
+
+    /// True when the service will release its backend on its own, so a client
+    /// does not need to stop it. False when idle_timeout_secs is absent or 0.
+    pub fn self_releases(&self) -> bool {
+        self.idle_timeout_secs.unwrap_or(0) > 0
     }
 }
 
@@ -712,6 +737,28 @@ mod tests {
             "http://127.0.0.1:8787/v1/images/generations"
         );
         assert_eq!(e.side_url("health"), "http://127.0.0.1:8787/health");
+    }
+
+    /// The lifecycle predicates decide whether a stop is safe and whether the
+    /// service frees its own VRAM. A field the service does not report must not
+    /// make a caller refuse to stop a service that is merely older.
+    #[test]
+    fn health_lifecycle_predicates_treat_absent_fields_as_idle() {
+        let idle: Health = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
+        assert!(idle.is_idle(), "an older service reports no in_flight");
+        assert!(!idle.self_releases(), "an older service has no idle shutdown");
+
+        let busy: Health =
+            serde_json::from_str(r#"{"status":"ok","in_flight":2,"idle_secs":3,"idle_timeout_secs":900}"#)
+                .unwrap();
+        assert!(!busy.is_idle());
+        assert!(busy.self_releases());
+
+        // A short edit and a long one: the timer is what releases the backend.
+        let quiet: Health =
+            serde_json::from_str(r#"{"status":"ok","in_flight":0,"idle_secs":901,"idle_timeout_secs":900}"#)
+                .unwrap();
+        assert!(quiet.is_idle() && quiet.self_releases());
     }
 
     #[test]

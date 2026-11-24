@@ -1,108 +1,108 @@
-# QA report: text encoder reverted to the GGUF file (Unit 16)
+# QA report: image_edit, the idle shutdown, and the lifecycle readout
 
-qa-model: deepseek-flash (the primary agent, by operator request)
-date: 2026-09-27
-branch: fix/text-encoder-gguf-revert
-unit commit under QA: ff9a724 fix(config): stand on the base Q6_K and the GGUF text encoder
-surfaces extracted by tests/qa-gate.sh relative to dev: CONFIG KEY diffusion, CONFIG KEY llm
+qa-model: analytical-check (the primary agent, by operator request for this unit)
+date: 2026-11-24
+branch: fix/lifecycle-idle-vram
+unit commit under QA: 575b718 fix(bridge): release the card on idle and report the lifecycle
+surfaces extracted by tests/qa-gate.sh relative to dev: ENDPOINT /v1/images/edits,
+CONFIG KEY idle_timeout_secs, CONFIG KEY llm_vision
+
+INDEPENDENCE DISCLOSURE
+Self-verification by the agent that wrote the code, strictly weaker than an
+independent pass. Every claim below is a command and its output from this
+session, and the surfaces that failed along the way are reported as failed.
+
+## The failures this unit starts from
+
+1. No edit route. The bridge registered models, generations, turbo and health
+   only; POST /v1/images/edits answered 404 with the exact body the agent tool
+   sends.
+2. No release of the card. docs/architecture.md has described
+   idle_timeout_secs as the bridge's own backstop since 2026-09-22 and said
+   /health reports in_flight, idle_secs and idle_timeout_secs "so a stop
+   decision can be made from data instead of a guess". The source had none of
+   those fields, so the documented backstop did not exist, and the stop hook's
+   in_flight guard could never fire because it reads a field that was absent.
+   Measured cost of the leak: about 5.6 GB of pinned VRAM and 11 GB of host RAM
+   for as long as the process lives (docs/architecture.md, lifecycle table).
 
 ## Coverage
 
-FUNCTION / ENDPOINT / CLIENT METHOD: none added by this unit; the diff touches
-imagegen.toml and four documents, and the gate's extraction agrees (two config
-keys, no new routes, no new binaries).
+ENDPOINT /v1/images/edits. Verified live through a running bridge.
 
-CONFIG KEY diffusion. Verified live: the running sd-server carries
---diffusion-model models/diffusion_models/qwen-image-2.1-Q6_K.gguf, the file is
-present at 5,876,556,448 bytes with sha256 a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9,
-which is the value models/MANIFEST.md records for it, and a generation completes
-through it on the deployment stack (probe 7 below).
+- Handler reached with the tool's real wire shape: JSON, the reference as
+  {"url":"data:image/png;base64,..."}, no size field, resolution "1k". Unit
+  tests pin the single and multiple reference shapes and the bare-string form:
+  the_tool_single_reference_body_parses,
+  the_tool_multiple_reference_body_parses_in_order,
+  bare_data_url_strings_are_accepted_too.
+- End to end: HTTP 200 in 26.6 s, a PNG payload. The route answered 404 before
+  this unit.
+- Refusals, each pinned by a unit test or checked in the handler: no reference,
+  a blank reference, a blank prompt, a prompt carrying the extension marker, a
+  reference that is not base64, n != 1, and an edge over 1536.
 
-CONFIG KEY llm. Verified live: the running sd-server carries
---llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf, the file is present
-at 5,027,784,800 bytes with sha256
-67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2, which is the
-upstream Hugging Face LFS object id for that path; the int8 convrot file the key
-previously named is gone from disk; and the conditioning path is exercised end to
-end by a probe whose only sensitive surface is prompt adherence and text
-rendering (probe 8 below).
+CONFIG KEY llm_vision. Verified live and by behaviour.
 
-## Live evidence
+- The running sd-server carries "--llm_vision
+  models/text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf" in its command line,
+  and the startup log names the same path in the effective configuration.
+- The load is confirmed by behaviour: the edit that returned no image before the
+  key existed now returns one.
+- Failure path: a configured path that is not on disk is a startup error
+  (std::process::exit(2)), and an unset key makes the edit route answer 501
+  with the reason instead of failing inside the backend.
 
-1. Configuration parses and carries the intended effective values
-   (python3 tomllib on imagegen.toml): diffusion qwen-image-2.1-Q6_K.gguf,
-   llm Qwen3VL-8B-Instruct-Q4_K_M.gguf, steps 28, cfg_scale 6.0, turbo false,
-   backend_args vae=cpu in both the --backend and --params-backend lines.
+CONFIG KEY idle_timeout_secs. Verified live on a scratch bridge.
 
-2. Live backend command line, read from /proc/<pid>/cmdline of the running
-   sd-server:
-   bin/sd-server --diffusion-model models/diffusion_models/qwen-image-2.1-Q6_K.gguf --vae models/vae/qwen_image_2.1_vae_bf16.safetensors --llm models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf --listen-ip 127.0.0.1 --listen-port 8788 --backend te=cpu,diffusion=cuda0,vae=cpu --params-backend te=cpu,diffusion=cuda0,vae=cpu
+- Booted on ports 8797/8798 with IMAGEGEN_IDLE_TIMEOUT_SECS=20 so the test does
+  not wait 15 minutes. /health answered "in_flight":0,"idle_secs":7,
+  "idle_timeout_secs":20.
+- The log recorded "no request for 20s (idle_timeout_secs); stopping the bridge
+  and releasing the backend" at 20 s after the last request.
+- After it: the bridge process gone, port 8797 quiet, no sd-server left, and
+  nvidia-smi back to the 1027 MiB idle baseline. That last line is the point of
+  the unit, so it is the check that matters.
+- The guard that keeps it from cutting off work is pinned by
+  the_idle_timeout_is_opt_out_and_cannot_fire_mid_request: the counter rises to
+  1 while a request is held and returns to 0 after, and 0 disables the timer.
 
-3. Target for the change, captured in the session that produced the retained
-   reference images (2026-09-26, session 01a0ddef, chat_history.jsonl): the same
-   line, character for character. The revert is therefore a reproduction of a
-   recorded configuration, not an invention.
+## The client, CLI and MCP readout
 
-4. Diffusion file on disk: models/diffusion_models/qwen-image-2.1-Q6_K.gguf,
-   5,876,556,448 bytes, mtime 2026-09-21 22:15, sha256 as above. It has not been
-   touched since before the artifacts were reported, which is what rules it out
-   as the cause.
+- imagegen-cli lifecycle against the running service: in_flight 0, idle_secs 10,
+  "idle_shutdown 900 s (the service releases its backend itself)",
+  safe_to_stop yes, exit 0.
+- Against a service that predates the fields, the same command says "(not
+  reported by this service)" rather than inventing a value; that was observed
+  against the older bridge before it was rebuilt.
+- The predicates are pinned by
+  health_lifecycle_predicates_treat_absent_fields_as_idle, and the subcommand by
+  lifecycle_is_a_command_of_its_own.
+- image_health returns the same fields, so an agent can decide without shell
+  access.
 
-5. Encoder file on disk: models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf,
-   5,027,784,800 bytes, mtime 2026-09-27 22:25, sha256 as above. Re-fetched from
-   the official Qwen repository during the unit and hash-checked against the
-   upstream object id, not taken on trust.
+## What was NOT verified, explicitly
 
-6. Convrot removal verified: ls of
-   models/text_encoders/qwen3vl_8b_int8_convrot.safetensors fails with "No such
-   file or directory"; the directory holds the GGUF encoder only; 9,350,798,360
-   bytes were freed. Recovery path (size, sha256, public sources) is recorded in
-   models/MANIFEST.md.
+- Any edit larger than 512x192. Larger edits on this deployment are unmeasured.
+- Turbo with a reference: the adapter is unavailable on this deployment, so the
+  lora entries that ride the request are unit-tested only.
+- Multi-reference edits end to end: the parse and order are tested, one
+  reference was sent to the backend.
+- A generation request after the change. Generation never reads llm_vision or
+  the idle fields and its handler gained only the in-flight guard, but no
+  generation was re-measured in this unit; that is recorded rather than
+  claimed.
+- The 900 s production timeout was not waited out; the 20 s scratch run
+  exercises the same code path and the same exit, and the difference is only
+  the interval.
 
-7. End-to-end generation through the bridge's OpenAI route with a fixed request
-   (512 square, 8 steps, seed 42, cfg 6.0): HTTP 200, artifact
-   qa-evidence/qa-encoder-revert-probe-512.png, 477,408 bytes, sha256
-   e8140be90d72e035c9fbaf0bfb331d8f59b2289863a8c0c431796930eec650fa, PNG 512x512,
-   IEND chunk present, pixel statistics mean 87.05 / stddev 119.73 over 190
-   distinct byte values, i.e. a real image rather than a blank, uniform or
-   truncated one.
+## Dependency scan (project rule 10)
 
-8. Independent legibility check on that artifact (rustcv_describe_image,
-   an independent vision provider): the sign in the image transcribes
-   exactly as requested, "qwen2.1.cpp", the animal is coherent with recognized
-   eyes, nose, ears, mouth and fur, and the critic named only soft detail on the
-   paws and whiskers plus a faint smudge on the nose bridge. Text rendering and
-   prompt adherence are the conditioning surfaces this unit is about, so this is
-   the check that the encoder swap had to pass; the softness is what an 8-step
-   sample gives and is not a quality measurement of the 28-step deployment.
-
-9. Documentation consistency: no file in the repository still describes the
-   convrot file as the deployed default (grep for "deployed default TE" returns
-   no match), and the four documents updated here state the revert, the deletion
-   and the limits of the attribution.
-
-10. Bridge-binary neutrality was measured, not assumed: one fixed request through
-    today's bridge build and through a build of the 2026-09-26 dev tip (a9e35b6)
-    produced byte-identical output, sha256
-    e9d27abcfd8e660d725ff95c75835e3c9741959874275edbc3ef55e9f95a614f on both.
-    This is why the binary is not part of the unit's scope, and it removes the
-    binary as a competing explanation for the artifacts.
-
-## Accepted risks and what this pass does not cover
-
-- The encoder defect is not reproduced. The 2026-09-22 comparison of the two
-  encoders recorded a quality tie, and the artifact-bearing prompt was never run
-  as a fixed-seed A/B across both encoders. This report verifies that the
-  configuration does what it claims; it does not prove the causal claim.
-- The probe runs at 8 steps for speed, so its softness says nothing about the
-  28-step production path, and no 1024-square QUALITY run was made in this QA
-  pass. The production-size end-to-end evidence for the unit is the operator's
-  accepted render (session 01a0e467, images/7.jpg, 672x1024, 28 steps).
-- Sensitivity to the VAE compute placement (--backend vae=cpu here against the
-  committed 2026-09-22 value vae=cuda0) is unmeasured; it moved to match the
-  captured process.
-- The deleted encoder cannot be compared again on this machine without
-  re-downloading 9,350,798,360 bytes from the public sources named in the
-  manifest.
+mcp-call osv-mcp osv_map_dependencies over this workspace reported the same
+five pre-existing packages as before this unit (rustls, rustls-webpki, tokio,
+url, webpki-roots), none introduced here: the only lockfile additions are
+mime_guess and unicase, from reqwest's multipart feature, and neither is
+flagged. tokio 1.53.1 has a fixed version (1.53.3) recorded as accepted risk
+for a dedicated dependency unit, not this one.
 
 verdict: overall PASS

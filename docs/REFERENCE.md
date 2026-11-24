@@ -129,6 +129,9 @@ the route.
       "backend": true,
       "backend_process_alive": true,
       "backend_restarts": 0,
+      "in_flight": 0,
+      "idle_secs": 12,
+      "idle_timeout_secs": 900,
       "mode": "base",
       "turbo_available": false,
       "lora": "(none)",
@@ -141,17 +144,28 @@ backend answers whether the backend responded to a probe. When it is false and
 backend_process_alive is true, the backend is still loading. When both are
 false, it has died or was refused at startup.
 
+in_flight is the number of requests being served. A stop must not be taken while
+it is above zero: the request would be thrown away. idle_secs is the time since
+the last request finished, and idle_timeout_secs is the threshold at which the
+service releases its backend by itself (idle_timeout_secs in the configuration;
+0 disables that and means nothing frees the card but a stop). Those three fields
+are what the lifecycle command reads, and it exits 1 when a request is in flight
+so a script can branch on them rather than parsing prose:
+
+    imagegen-cli lifecycle
+
 7. Image to image
 
 The client sends an edit as a POST to /images/edits with a prompt and one or
-more reference images as data URLs. Whether that call succeeds is a property of
-the backend behind the bridge, not of the client.
+more reference images as data URLs. The bridge registers that route and forwards
+the edit to the backend's own edit route.
 
-The bundled bridge does not register the edit route. A call through it answers
-a 404, which the client reports as an unsupported operation rather than a
-generic failure. The bridge's own generation path is fully covered by tests;
-the edit path against the bundled backend is unverified, and this document says
-so instead of implying otherwise.
+Editing needs the backend's vision tower. Qwen Image 2.1 conditions on a
+reference image by running it through that tower, and without it the backend
+logs "no vision weights detected, vision disabled" and returns no image. The
+bridge passes the tower through `llm_vision`, and an edit on a bridge started
+without it is refused with 501 and that reason rather than attempted. Verified
+live on 2026-11-24: a 512x192 edit returned HTTP 200 with a PNG in 27 s.
 
 8. Errors
 
@@ -171,7 +185,7 @@ A refusal has this shape, and the status carries the meaning:
   400     the request is not acceptable              a bad size or field
   409     the request conflicts with current state   the mode is unavailable
   502     the backend failed or did not answer       an out of memory abort
-  404     the route is not implemented               an edit on this bridge
+  501     the route needs something not configured   an edit without a vision tower
 
 A caller should read the message, not only the status; the message names the
 field and the rule that refused it.
@@ -181,6 +195,7 @@ field and the rule that refused it.
   Command                                        Purpose
   ---------------------------------------------  ------------------------
   imagegen-cli health                            liveness and mode
+  imagegen-cli lifecycle                         idle state and whether a stop is safe
   imagegen-cli models                            model list
   imagegen-cli generate -p TEXT -o PATH          text to image
   imagegen-cli edit -p TEXT -r PATH -o PATH      image to image
