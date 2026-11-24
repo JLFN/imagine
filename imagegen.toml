@@ -31,6 +31,17 @@ diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
 vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
 llm       = "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
 
+# The Qwen3-VL vision tower, handed to sd-server as --llm_vision. Image editing
+# needs it and generation does not: Qwen Image 2.1 conditions on a reference
+# image by running it through this tower, and without it the backend logs
+# "no vision weights detected, vision disabled" (src/model/te/llm.hpp:466) and
+# answers an edit with an empty conditioning (src/conditioning/conditioner.hpp:2840).
+# This file is the mmproj for the GGUF encoder above; the int8 convrot encoder
+# carries the visual tensors itself and needs no mmproj. Unset (or "") to run
+# generation only: the edit route then refuses with a 501 instead of failing in
+# the backend.
+llm_vision = "models/text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+
 # Where each module's graphs run and where its parameters live. Measured on a
 # 12 GiB card: diffusion parameters in video memory, text encoder entirely on
 # the CPU. Pinning the encoder as well cannot complete a 1024-square generation
@@ -60,6 +71,16 @@ backend_port = 8788
 # values produces.
 steps     = 28
 cfg_scale = 6.0
+
+# Idle shutdown: seconds with no request after which the whole process exits and
+# releases the backend (about 11 GB of host RAM and 5.6 GB of pinned VRAM). This
+# is what makes the on-demand model pay off: the PreToolUse ensure hook restarts
+# the bridge in about a second, and the next request restages ~10 GB of weights
+# in 35-40 s. The timer never fires while a request is in flight, and it exits 0
+# so a supervisor's restart-on-failure does not bring it straight back. /health
+# reports in_flight, idle_secs and idle_timeout_secs so a stop decision can be
+# made from data. 0 disables it (the process then lives until it is killed).
+idle_timeout_secs = 900
 
 # Mode the bridge starts in. false is the base model. Switch it at runtime, no
 # restart needed:

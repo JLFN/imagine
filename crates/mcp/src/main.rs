@@ -177,6 +177,14 @@ impl ImageServer {
                 "sigmas": h.sigmas,
                 "steps": h.steps,
                 "cfg_scale": h.cfg_scale,
+                // The idle lifecycle: whether stopping would interrupt work,
+                // how long the service has been idle, and whether it will
+                // release its backend on its own.
+                "in_flight": h.in_flight.unwrap_or(0),
+                "idle_secs": h.idle_secs,
+                "idle_timeout_secs": h.idle_timeout_secs,
+                "self_releases": h.self_releases(),
+                "safe_to_stop": h.is_idle(),
             })
             .to_string()),
             Err(e) => Err(e.to_string()),

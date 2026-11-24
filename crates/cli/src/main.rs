@@ -57,6 +57,10 @@ enum Command {
     Models,
     /// Probe liveness and the live sampling state.
     Health,
+    /// Report the idle lifecycle: whether a stop would interrupt work, how long
+    /// the service has been idle, and whether it will release its backend on its
+    /// own. Exits 0 when it is safe to stop, 1 when a request is in flight.
+    Lifecycle,
     /// Read or switch the sampling mode.
     Turbo(TurboArgs),
 }
@@ -156,6 +160,7 @@ fn run() -> Result<()> {
         Command::Edit(args) => edit(&client, args, cli.json),
         Command::Models => models(&client, cli.json),
         Command::Health => health(&client, cli.json),
+        Command::Lifecycle => lifecycle(&client, cli.json),
         Command::Turbo(args) => turbo(&client, args, cli.json),
     }
 }
@@ -247,6 +252,45 @@ fn models(client: &Client, json: bool) -> Result<()> {
                 None => println!("{}", model.id),
             }
         }
+    }
+    Ok(())
+}
+
+fn lifecycle(client: &Client, json: bool) -> Result<()> {
+    let health = client.health().context("lifecycle probe failed")?;
+    let in_flight = health.in_flight.unwrap_or(0);
+    let safe = health.is_idle();
+    if json {
+        let payload = serde_json::json!({
+            "endpoint": client.endpoint.base_url,
+            "ready": health.is_ready(),
+            "in_flight": in_flight,
+            "idle_secs": health.idle_secs,
+            "idle_timeout_secs": health.idle_timeout_secs,
+            "self_releases": health.self_releases(),
+            "safe_to_stop": safe,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("endpoint   {}", client.endpoint.base_url);
+        println!("in_flight  {in_flight}");
+        match health.idle_secs {
+            Some(secs) => println!("idle_secs  {secs}"),
+            None => println!("idle_secs  (not reported by this service)"),
+        }
+        match health.idle_timeout_secs {
+            Some(secs) if secs > 0 => {
+                println!("idle_shutdown {secs} s (the service releases its backend itself)")
+            }
+            Some(_) => println!("idle_shutdown disabled (the process runs until it is killed)"),
+            None => println!("idle_shutdown (not reported by this service)"),
+        }
+        println!("safe_to_stop {}", if safe { "yes" } else { "no" });
+    }
+    // A script must be able to branch on this without parsing prose: a request
+    // in flight means a stop would throw the generation away.
+    if !safe {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -376,6 +420,13 @@ mod tests {
             }
             other => panic!("expected generate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lifecycle_is_a_command_of_its_own() {
+        let cli = Cli::try_parse_from(["imagegen-cli", "lifecycle"])
+            .expect("the lifecycle command parses");
+        assert!(matches!(cli.command, Command::Lifecycle));
     }
 
     #[test]

@@ -133,13 +133,14 @@ The service provides the following, all through the OpenAI image API shape:
   - a model list;
   - a health probe that reports backend liveness and the live sampling state;
   - a sampling mode switch for a few-step accelerator, when one is configured;
-  - image to image, when the backend under the bridge offers the edit route.
+  - image to image, when the bridge was started with a vision tower.
 
-Image to image depends on the backend. The bundled bridge does not implement
-the edit route, so an edit through the bridge is refused with a clear status
-rather than attempted. Point the client at a backend that implements it to use
-that capability. This is stated plainly because silent degradation is worse
-than a refusal.
+Image to image needs the backend's vision tower, which is the `llm_vision` key.
+Qwen Image 2.1 conditions on a reference image by running it through that tower,
+so without it the backend returns no image at all. A bridge started without the
+key refuses an edit with 501 and that reason rather than attempting it, and
+generation is unaffected either way. Verified live on 2026-11-24: a 512x192 edit
+returned HTTP 200 with a PNG in 27 s.
 
 Two ways to reach few-step generation exist, and they differ:
 
@@ -259,9 +260,11 @@ Limits that a caller should know:
   - the turbo-native profile reaches 11,515 MiB of video memory, under 800 MiB
     of headroom, so a smaller card must move the decoder to the CPU or lower
     the size;
-  - image to image only where the backend implements it;
-  - the edit path against the bundled backend is unverified, because the
-    backend source was not available when the client was written.
+  - image to image needs the vision tower (`llm_vision`) and is refused with 501
+    without it;
+  - the backend holds the card while it runs: it releases it after
+    `idle_timeout_secs` with no request, and `imagegen-cli lifecycle` reports
+    whether a stop is safe.
 
 13. Repository layout
 

@@ -96,10 +96,11 @@
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
@@ -150,6 +151,18 @@ struct Config {
     /// (sd.cpp derives steps = sigmas.len() - 1). Empty means turbo mode cannot
     /// be entered: the distillation is not trained for the base scheduler.
     sigmas: Vec<f64>,
+    /// The Qwen3-VL vision tower (`--llm_vision`, the mmproj file). Editing
+    /// needs it: Qwen Image 2.1 conditions on a reference image through the
+    /// vision tower, and the encoder answers "no vision weights detected,
+    /// vision disabled" without it (src/model/te/llm.hpp:466). Generation does
+    /// not use it, so it stays optional and generation never depends on it.
+    llm_vision: Option<String>,
+    /// Seconds of no request after which the whole process exits, releasing the
+    /// ~11 GB of host RAM and the pinned VRAM the backend holds. 0 disables it.
+    /// The timer never fires while a request is in flight, so a long first
+    /// request cannot be cut off by its own timeout. Documented in
+    /// docs/architecture.md, "On-demand lifecycle".
+    idle_timeout_secs: u64,
 }
 
 /// Which sampling profile a request runs under.
@@ -212,6 +225,7 @@ struct FileConfig {
     diffusion: Option<String>,
     vae: Option<String>,
     llm: Option<String>,
+    llm_vision: Option<String>,
     backend_args: Option<Vec<String>>,
     listen_ip: Option<String>,
     listen_port: Option<u16>,
@@ -226,6 +240,7 @@ struct FileConfig {
     extra_lora: Option<String>,
     extra_lora_multiplier: Option<f64>,
     sigmas: Option<Vec<f64>>,
+    idle_timeout_secs: Option<u64>,
 }
 
 /// Environment wins, then the file, then the built-in fallback.
@@ -314,6 +329,15 @@ impl Config {
             }
         };
         let lora_dir = env_or_file_opt("IMAGEGEN_LORA_DIR", file.lora_dir);
+        // The vision tower is optional and generation never reads it, so an
+        // unset value is not an error: it only makes editing unavailable, which
+        // the edit route reports per request. "" turns it off explicitly.
+        let llm_vision = env_or_file_opt("IMAGEGEN_LLM_VISION", file.llm_vision);
+        // 0 disables the idle shutdown. 900 s is the value docs/architecture.md
+        // records for this box; a shorter one releases VRAM sooner but restages
+        // ~10 GB of weights (35-40 s) on the next request.
+        let idle_timeout_secs =
+            pick("IMAGEGEN_IDLE_TIMEOUT_SECS", file.idle_timeout_secs, Some(900)).unwrap();
         let lora = env_or_file_opt("IMAGEGEN_LORA", file.lora);
         let lora_multiplier =
             pick("IMAGEGEN_LORA_MULTIPLIER", file.lora_multiplier, Some(1.0)).unwrap();
@@ -418,6 +442,21 @@ impl Config {
                 lora_dir.as_deref().unwrap_or("(unset)")
             );
         }
+        // A configured vision tower that is not on disk would make every edit
+        // fail in the backend with an empty image; refuse at startup instead,
+        // because the path is a configuration error, not a runtime condition.
+        // An unset value is different: it means this deployment edits nothing,
+        // and the edit route says so per request.
+        if let Some(vision) = llm_vision.as_deref() {
+            if !std::path::Path::new(vision).is_file() {
+                error!(
+                    "no vision tower at {} (IMAGEGEN_LLM_VISION): editing needs it, so refusing \
+                     to start with a path that cannot load. Unset it to run generation only",
+                    vision
+                );
+                std::process::exit(2);
+            }
+        }
         let turbo_available = lora.is_some() && sigmas.len() >= 2 && adapter_on_disk;
 
         let cfg = Config {
@@ -447,6 +486,8 @@ impl Config {
             extra_lora,
             extra_lora_multiplier,
             sigmas,
+            llm_vision,
+            idle_timeout_secs,
         };
         info!(
             "effective configuration: diffusion={} llm={} vae={} listen={}:{} backend_port={} \
@@ -556,6 +597,12 @@ fn spawn_backend(cfg: &Config) -> Result<Child, String> {
         // Without this the server's LoRA cache is empty and every configured
         // adapter path is rejected as "invalid lora path".
         cmd.arg("--lora-model-dir").arg(dir);
+    }
+    if let Some(vision) = cfg.llm_vision.as_deref() {
+        // The reference-image path of Qwen Image 2.1 runs through this tower;
+        // without it the backend logs "vision disabled" and returns empty
+        // conditioning for an edit (src/conditioning/conditioner.hpp:2840).
+        cmd.arg("--llm_vision").arg(vision);
     }
     cmd.args(&cfg.backend_args)
         .spawn()
@@ -746,6 +793,36 @@ struct AppState {
     /// whether the configured adapter was in the list when it was.
     lora_primed: std::sync::atomic::AtomicBool,
     lora_visible: std::sync::Mutex<Option<bool>>,
+    /// Requests currently being served. The idle timer reads it and never exits
+    /// while it is non-zero, so a long first request cannot be cut off by its own
+    /// timeout. Reported by /health so a stop decision can be made from data.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// When the last request finished, as an Instant. The idle timer measures
+    /// from here; /health reports the derived seconds.
+    last_request_done: std::sync::Mutex<Instant>,
+}
+
+/// Count a request as in flight for as long as the guard lives, then record the
+/// moment it finished. Held across the whole handler body.
+struct InFlight(std::sync::Arc<AppState>);
+
+impl InFlight {
+    fn begin(st: &std::sync::Arc<AppState>) -> Self {
+        st.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(st.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut at) = self.0.last_request_done.lock() {
+            *at = Instant::now();
+        }
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl AppState {
@@ -834,6 +911,76 @@ async fn prime_lora_cache(st: &AppState) -> bool {
 // ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
+
+/// The image-edit request the agent tool sends: JSON, not multipart, with the
+/// references as base64 data URLs.
+///
+/// The wire shape is fixed by the calling tool, not chosen here. It posts
+/// `model`, `prompt`, `n`, `resolution` or `aspect_ratio`, `response_format`,
+/// and the references either as a single `{"url": ...}` object (one reference)
+/// or an array of them (several): every reference is a data URL, and the
+/// prompt is the instruction. A caller may also send the references as bare
+/// data-URL strings in `image` or `images`, which is accepted for the same
+/// reason the backend accepts both forms: it is the documented shape of the
+/// route's own image fields.
+#[derive(Deserialize)]
+struct EditRequest {
+    prompt: String,
+    /// One reference: `{"url": "data:..."}` or a bare data URL.
+    #[serde(default)]
+    image: Option<ReferenceField>,
+    /// Several references, each in the same two forms.
+    #[serde(default)]
+    images: Option<Vec<ReferenceField>>,
+    n: Option<u32>,
+    size: Option<String>,
+    /// Accepted for wire compatibility with the calling tool, which sends these
+    /// for a multi-reference edit. They do not size the result: with no explicit
+    /// `size` the canvas follows the reference, which is what the backend's own
+    /// multipart edit route does (routes_openai.cpp:123-134) and what a caller
+    /// sending only `resolution` expects.
+    #[serde(default)]
+    #[allow(dead_code)]
+    aspect_ratio: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    resolution: Option<String>,
+    num_inference_steps: Option<u32>,
+    seed: Option<i64>,
+    cfg_scale: Option<f64>,
+}
+
+/// One reference image in either form the callers use: the object with a `url`
+/// field (the agent tool's shape) or the bare string (sd.cpp's own shape).
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum ReferenceField {
+    Url { url: String },
+    Bare(String),
+}
+
+impl ReferenceField {
+    fn into_data_url(self) -> String {
+        match self {
+            ReferenceField::Url { url } => url,
+            ReferenceField::Bare(data) => data,
+        }
+    }
+}
+
+/// sd.cpp extracts its native request schema from the prompt with a
+/// non-greedy `<sd_cpp_extra_args>(.*?)</sd_cpp_extra_args>` search and removes
+/// the block before generation (examples/server/routes_sdapi.cpp:144). A prompt
+/// that carries the marker itself would therefore be misparsed, so it is
+/// refused rather than silently truncated.
+const EXTRA_ARGS_OPEN: &str = "<sd_cpp_extra_args>";
+const EXTRA_ARGS_CLOSE: &str = "</sd_cpp_extra_args>";
+
+/// Reference images are megabytes of base64. axum refuses a body over 2 MB for
+/// a `String` extractor by default (axum-core extract/default_body_limit.rs),
+/// which is smaller than one compressed reference plus its data-URL overhead;
+/// 16 MB bounds several references without capping real traffic.
+const EDIT_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct GenRequest {
@@ -943,6 +1090,76 @@ fn steps_for(steps: u32, sigmas: &[f64]) -> u32 {
     } else {
         (sigmas.len() - 1) as u32
     }
+}
+
+/// Collect the references from either field, array first, in the order given:
+/// sd.cpp conditions on them in that order (its own -r is repeated in order).
+fn collect_ref_images(req: &EditRequest) -> Vec<String> {
+    if let Some(images) = &req.images {
+        if !images.is_empty() {
+            return images.iter().cloned().map(ReferenceField::into_data_url).collect();
+        }
+    }
+    req.image
+        .clone()
+        .map(ReferenceField::into_data_url)
+        .into_iter()
+        .collect()
+}
+
+/// Check an edit before anything is sent: it needs a reference, none of them may
+/// be blank, and the prompt may not carry the extension-block marker.
+fn validate_edit_inputs(prompt: &str, refs: &[String]) -> Result<(), String> {
+    if refs.is_empty() {
+        return Err(
+            "image_edit requires at least one reference image in 'image' or 'images'".to_string(),
+        );
+    }
+    if refs.iter().any(|r| r.trim().is_empty()) {
+        return Err("image_edit received an empty reference image".to_string());
+    }
+    if prompt.trim().is_empty() {
+        return Err("prompt is required".to_string());
+    }
+    if prompt.contains(EXTRA_ARGS_OPEN) || prompt.contains(EXTRA_ARGS_CLOSE) {
+        return Err(format!("prompt must not contain the {} marker", EXTRA_ARGS_OPEN));
+    }
+    Ok(())
+}
+
+/// Decode a reference from a data URL or a bare base64 string, the two forms
+/// callers send, and return the bytes with the mime type to upload them as.
+fn decode_image_data(s: &str) -> Result<(Vec<u8>, String), String> {
+    let s = s.trim();
+    let (mime, payload) = if let Some(rest) = s.strip_prefix("data:") {
+        let (meta, payload) = rest
+            .split_once(',')
+            .ok_or_else(|| "malformed data URL: no comma separator".to_string())?;
+        let head = meta.trim();
+        let mime = match head.strip_suffix(";base64") {
+            Some(mime) => mime.trim(),
+            None => {
+                return Err(format!(
+                    "unsupported data URL encoding in '{}', only base64 is accepted",
+                    head
+                ))
+            }
+        };
+        let mime = if mime.is_empty() { "image/png" } else { mime };
+        (mime.to_string(), payload.to_string())
+    } else {
+        ("image/png".to_string(), s.to_string())
+    };
+
+    // Some clients wrap long base64 payloads; whitespace is not significant.
+    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.is_empty() {
+        return Err("empty reference image".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|e| format!("invalid base64 reference image: {}", e))?;
+    Ok((bytes, mime))
 }
 
 fn parse_size(size: &str) -> Result<(u32, u32), String> {
@@ -1130,12 +1347,23 @@ async fn health(State(st): State<std::sync::Arc<AppState>>) -> Json<serde_json::
         .unwrap_or(false);
     let mode = st.mode();
     let profile = st.cfg.profile(mode);
+    // The idle state, for the stop hook and for an operator: a stop decision
+    // must be made from data, not from a guess that nothing is running.
+    let in_flight = st.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    let idle_secs = st
+        .last_request_done
+        .lock()
+        .map(|at| at.elapsed().as_secs())
+        .unwrap_or(0);
     Json(serde_json::json!({
         "status": "ok",
         "backend": backend_ok,
         "backend_process_alive": st.backend.is_alive(),
         "backend_restarts": st.backend.restarts(),
         "backend_restart_attempts": st.backend.restart_attempts(),
+        "in_flight": in_flight,
+        "idle_secs": idle_secs,
+        "idle_timeout_secs": st.cfg.idle_timeout_secs,
         // The live mode, and what the next generation will be asked for: the
         // adapter in use, the schedule, and the step count derived from it.
         // lora_visible is null until the backend has been asked for its list.
@@ -1157,6 +1385,8 @@ async fn create_generation(
     State(st): State<std::sync::Arc<AppState>>,
     body: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Held for the whole body: the idle timer must never fire mid-generation.
+    let _in_flight = InFlight::begin(&st);
     let req: GenRequest = match serde_json::from_str(&body) {
         Ok(req) => req,
         Err(e) => {
@@ -1354,6 +1584,246 @@ async fn create_generation(
     )
 }
 
+/// POST /v1/images/edits — edit an image from one or more references.
+///
+/// Two facts fix the shape of this handler, and both are read from the code
+/// rather than assumed:
+///
+/// - the caller posts JSON, not multipart, with the references as base64 data
+///   URLs (the agent tool's image_edit, and the shipped client and CLI);
+/// - the backend registers the edit route as multipart and takes prompt, the
+///   reference files, mask, n, size and output_format from the form
+///   (examples/server/routes_openai.cpp:80-144). It extracts the same
+///   `<sd_cpp_extra_args>` block from the prompt that the sdapi route does
+///   (:199), so steps, guidance, seed and a structured lora entry ride there.
+///
+/// The alternative was tried and rejected on evidence: sending the references
+/// inside the extension block over /sdapi/v1/txt2img reaches the vision tower
+/// but the graph then dies with "Qwen Image 2.1: missing reference image slots"
+/// and SIGSEGVs (src/model/diffusion/qwen_image_2_1.hpp:120), because that
+/// path never fills the `image_slots` the layout needs; the same reference
+/// through the multipart route returned a 512x192 PNG in 30 s. So the bridge
+/// decodes the caller's data URLs and uploads them as multipart parts, which is
+/// the one path measured to work with the vision tower loaded.
+async fn create_edit(
+    State(st): State<std::sync::Arc<AppState>>,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Held for the whole body: the idle timer must never fire mid-edit.
+    let _in_flight = InFlight::begin(&st);
+    if st.cfg.llm_vision.is_none() {
+        return err(
+            StatusCode::NOT_IMPLEMENTED,
+            "this bridge cannot edit: it was started without a vision tower \
+             (IMAGEGEN_LLM_VISION / llm_vision in the configuration). Qwen Image 2.1 conditions \
+             on a reference only through the vision tower \
+             (src/conditioning/conditioner.hpp:2840), and generation does not need it. \
+             Set the mmproj file and restart the bridge, or use image_generate",
+        );
+    }
+
+    let req: EditRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid request body: {}", e),
+            )
+        }
+    };
+
+    let refs = collect_ref_images(&req);
+    if let Err(message) = validate_edit_inputs(&req.prompt, &refs) {
+        return err(StatusCode::BAD_REQUEST, &message);
+    }
+    // Decode every reference here rather than leaving it to the backend: a
+    // malformed data URL would otherwise surface as an empty conditioning and a
+    // shape error deep in the engine, which reads like a model failure instead
+    // of the bad request it is.
+    for (index, reference) in refs.iter().enumerate() {
+        if let Err(message) = decode_image_data(reference) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("reference {} is not a usable image: {}", index + 1, message),
+            );
+        }
+    }
+
+    // The caller's own size wins. With no size, the requested canvas is left
+    // unset on purpose: the backend then sizes the edit from the reference
+    // (SDGenerationParams::set_width_and_height_if_unset, common.cpp:2219),
+    // which is what a caller that sends only `resolution` expects, and the
+    // backend's multipart route ignores resolution as well
+    // (routes_openai.cpp:123-134).
+    let (width, height) = match &req.size {
+        Some(s) => match parse_size(s) {
+            Ok(wh) => (Some(wh.0), Some(wh.1)),
+            Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
+        },
+        None => (None, None),
+    };
+    if let (Some(w), Some(h)) = (width, height) {
+        if let Err(msg) = check_edge_limit(w, h) {
+            return err(StatusCode::BAD_REQUEST, &msg);
+        }
+    }
+
+    let n = req.n.unwrap_or(1);
+    if n != 1 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "n must be 1 (multi-image batches are not supported)",
+        );
+    }
+    let mode = st.mode();
+    if mode == Mode::Turbo && !st.cfg.turbo_available {
+        return err(
+            StatusCode::CONFLICT,
+            "turbo is the live mode but is not available (see /health turbo_available)",
+        );
+    }
+    let profile = st.cfg.profile(mode);
+    let requested_steps = req.num_inference_steps.unwrap_or(profile.steps);
+    let steps = steps_for(requested_steps, profile.sigmas);
+    let cfg_scale = req.cfg_scale.unwrap_or(profile.cfg_scale);
+    let seed = req.seed.unwrap_or(-1);
+
+    // Everything the multipart form has no field of its own goes in the
+    // extension block the route extracts from the prompt (routes_openai.cpp:156
+    // and :199): the step count, the guidance as `guidance.txt_cfg` (what
+    // SDGenerationParams::from_json_str reads, common.cpp:2066), the seed, and
+    // the profile's adapters as the structured list the engine applies in order
+    // (common.cpp:1841). The references themselves ride the form, not this
+    // block: see the handler comment for the measurement behind that.
+    let mut extra = serde_json::json!({
+        "sample_params": {
+            "sample_steps": steps,
+            "guidance": { "txt_cfg": cfg_scale },
+            "seed": seed,
+        },
+    });
+    if !profile.loras.is_empty() {
+        extra["lora"] = serde_json::Value::Array(
+            profile
+                .loras
+                .iter()
+                .map(|(path, multiplier)| {
+                    serde_json::json!({ "path": path, "multiplier": multiplier })
+                })
+                .collect(),
+        );
+    }
+    let prompt = format!(
+        "{} {}{}{}",
+        req.prompt, EXTRA_ARGS_OPEN, extra, EXTRA_ARGS_CLOSE
+    );
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("prompt", prompt)
+        .text("n", "1");
+    if let (Some(w), Some(h)) = (width, height) {
+        form = form.text("size", format!("{}x{}", w, h));
+    }
+    for (index, reference) in refs.iter().enumerate() {
+        // Decoded above, so this cannot fail here.
+        let (bytes, mime) = match decode_image_data(reference) {
+            Ok(decoded) => decoded,
+            Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+        };
+        let name = format!("reference-{}.img", index);
+        let part = reqwest::multipart::Part::bytes(bytes.clone())
+            .file_name(name.clone())
+            .mime_str(&mime)
+            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(bytes).file_name(name));
+        form = form.part("image[]", part);
+    }
+
+    info!(
+        "editing with {} reference image(s) at {} mode={} steps={} cfg={} seed={}",
+        refs.len(),
+        match (width, height) {
+            (Some(w), Some(h)) => format!("{}x{}", w, h),
+            _ => "the reference's size".to_string(),
+        },
+        profile.mode.as_str(),
+        steps,
+        cfg_scale,
+        seed
+    );
+
+    let started = Instant::now();
+    let resp = st
+        .client
+        .post(format!("{}/v1/images/edits", st.backend_base))
+        .multipart(form)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            error!("backend edit request failed: {}", e);
+            return err(
+                StatusCode::BAD_GATEWAY,
+                &format!("backend unreachable: {}", e),
+            );
+        }
+    };
+
+    let status = resp.status();
+    let resp_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        warn!("backend returned {} to the edit: {}", status, resp_text);
+        return err(
+            StatusCode::BAD_GATEWAY,
+            &format!("backend edit failed ({}): {}", status, resp_text),
+        );
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(&resp_text) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("backend returned unparseable body to the edit: {}", e);
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "backend returned an invalid response",
+            );
+        }
+    };
+
+    // The multipart edit route already answers in the OpenAI shape this bridge
+    // serves (routes_openai.cpp:335-360): {"created":..,"data":[{"b64_json":..}]}.
+    // Validate that shape rather than trusting it, and pass the entries through
+    // so the caller gets the same envelope as generation.
+    let data = match value.get("data").and_then(|d| d.as_array()) {
+        Some(items) if !items.is_empty() && items.iter().all(|i| i.get("b64_json").is_some()) => {
+            items.to_vec()
+        }
+        _ => {
+            warn!("backend edit response carried no image data: {}", resp_text);
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "backend returned no images for the edit",
+            );
+        }
+    };
+
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    info!("edited {} image(s) in {:?}", data.len(), started.elapsed());
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "created": created,
+            "data": data,
+        })),
+    )
+}
+
 fn err(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
@@ -1417,6 +1887,8 @@ async fn main() {
         turbo: std::sync::atomic::AtomicBool::new(cfg.turbo),
         lora_primed: std::sync::atomic::AtomicBool::new(false),
         lora_visible: std::sync::Mutex::new(None),
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        last_request_done: std::sync::Mutex::new(Instant::now()),
     });
 
     // Keep the backend up for the lifetime of the bridge. The supervisor owns
@@ -1461,11 +1933,51 @@ async fn main() {
     let app = Router::new()
         .route("/v1/models", get(get_models))
         .route("/v1/images/generations", post(create_generation))
+        // Edit bodies carry reference images as base64, which is megabytes:
+        // axum's 2 MB default would reject them before the handler runs.
+        .route("/v1/images/edits", post(create_edit).layer(DefaultBodyLimit::max(EDIT_BODY_LIMIT)))
         // The turbo toggle: GET reports the live mode, POST switches it. Same
         // state as the per-request "turbo" flag on a generation body.
         .route("/v1/turbo", get(get_turbo).post(set_turbo))
         .route("/health", get(health))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // The idle shutdown: when no request has been served for
+    // cfg.idle_timeout_secs, release the backend. This is what makes the
+    // on-demand model pay off (docs/architecture.md, "On-demand lifecycle"):
+    // it frees roughly 11 GB of host RAM and 5.6 GB of pinned VRAM, and the
+    // PreToolUse hook restarts the bridge in about a second on the next
+    // request. It never fires with a request in flight, and it exits 0 so a
+    // supervisor's restart-on-failure does not bring it straight back.
+    if cfg.idle_timeout_secs > 0 {
+        let st = state.clone();
+        let timeout = Duration::from_secs(cfg.idle_timeout_secs);
+        tokio::spawn(async move {
+            // Poll at a fraction of the timeout so the exit is prompt, and
+            // refuse to fire while anything is being served.
+            let tick = (timeout / 10).max(Duration::from_secs(1));
+            loop {
+                tokio::time::sleep(tick).await;
+                if st.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    continue;
+                }
+                let idle = st
+                    .last_request_done
+                    .lock()
+                    .map(|at| at.elapsed())
+                    .unwrap_or_default();
+                if idle >= timeout {
+                    info!(
+                        "no request for {}s (idle_timeout_secs); stopping the bridge and \
+                         releasing the backend",
+                        idle.as_secs()
+                    );
+                    st.backend.kill();
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     info!("imagegen bridge listening on http://{}", addr);
 
@@ -1570,6 +2082,8 @@ mod tests {
             extra_lora: None,
             extra_lora_multiplier: 1.0,
             sigmas: vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0],
+            llm_vision: Some("mmproj-Qwen3VL-8B-Instruct-F16.gguf".to_string()),
+            idle_timeout_secs: 900,
         }
     }
 
@@ -1627,6 +2141,131 @@ mod tests {
         assert_eq!(turbo.loras_arg().matches(',').count(), 1);
         // And the configured list the cache check verifies has both.
         assert_eq!(cfg.configured_loras().len(), 2);
+    }
+
+    const DATA_URL: &str =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF+7lPWAAAAAElFTkSuQmCC";
+
+    /// The exact body the agent tool sends for a single reference: JSON with the
+    /// reference as an object carrying a `url` data URL, and no `size` field
+    /// (only `resolution`), which used to make the whole request unparseable.
+    #[test]
+    fn the_tool_single_reference_body_parses() {
+        let body = format!(
+            r#"{{"model":"grok-imagine-image-quality","prompt":"watercolor","n":1,
+                "resolution":"1k","response_format":"b64_json",
+                "image":{{"url":"{}"}}}}"#,
+            DATA_URL
+        );
+        let req: EditRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.prompt, "watercolor");
+        assert_eq!(req.size, None);
+        assert_eq!(collect_ref_images(&req), vec![DATA_URL.to_string()]);
+    }
+
+    #[test]
+    fn the_tool_multiple_reference_body_parses_in_order() {
+        let body = format!(
+            r#"{{"prompt":"mix them","n":1,"resolution":"1k","aspect_ratio":"16:9",
+                "images":[{{"url":"{}"}},{{"url":"{}"}}]}}"#,
+            DATA_URL, DATA_URL
+        );
+        let req: EditRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            collect_ref_images(&req),
+            vec![DATA_URL.to_string(), DATA_URL.to_string()]
+        );
+    }
+
+    /// The shipped client and CLI use the plain string form, so it must keep
+    /// working: `image` as one string, `images` as an array of strings.
+    #[test]
+    fn bare_data_url_strings_are_accepted_too() {
+        let single: EditRequest =
+            serde_json::from_str(&format!(r#"{{"prompt":"p","image":"{}"}}"#, DATA_URL)).unwrap();
+        assert_eq!(collect_ref_images(&single), vec![DATA_URL.to_string()]);
+
+        let many: EditRequest = serde_json::from_str(&format!(
+            r#"{{"prompt":"p","images":["{}","{}"]}}"#,
+            DATA_URL, DATA_URL
+        ))
+        .unwrap();
+        assert_eq!(collect_ref_images(&many).len(), 2);
+    }
+
+    #[test]
+    fn edit_inputs_require_a_reference_and_refuse_blank_ones() {
+        let err = validate_edit_inputs("no reference", &[]).unwrap_err();
+        assert!(err.contains("at least one reference"), "got: {err}");
+
+        let err = validate_edit_inputs("blank", &["   ".to_string()]).unwrap_err();
+        assert!(err.contains("empty reference"), "got: {err}");
+
+        let err = validate_edit_inputs("  ", &[DATA_URL.to_string()]).unwrap_err();
+        assert!(err.contains("prompt is required"), "got: {err}");
+    }
+
+    /// A prompt holding the marker would make sd.cpp's non-greedy extractor
+    /// parse the wrong block, so it is refused rather than passed on.
+    #[test]
+    fn edit_inputs_reject_a_prompt_containing_the_marker() {
+        let err = validate_edit_inputs(
+            &format!("try {EXTRA_ARGS_OPEN}{{\"steps\":1}}{EXTRA_ARGS_CLOSE}"),
+            &[DATA_URL.to_string()],
+        )
+        .unwrap_err();
+        assert!(err.contains("must not contain"), "got: {err}");
+    }
+
+    /// A data URL decodes to its bytes and carries its own mime type; junk and
+    /// empty payloads are refused rather than forwarded.
+    #[test]
+    fn decode_image_data_reads_a_data_url_and_rejects_junk() {
+        let (bytes, mime) = decode_image_data(DATA_URL).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+
+        assert!(decode_image_data("not base64 !!!").is_err());
+        assert!(decode_image_data("data:image/png,raw-not-base64").is_err());
+        assert!(decode_image_data("data:image/png;base64,").is_err());
+        assert!(decode_image_data("   ").is_err());
+    }
+
+    /// The idle timeout is the lever that releases the pinned VRAM, so its
+    /// guards are pinned: 0 disables it, and the timer must not be able to fire
+    /// while a request is in flight.
+    #[test]
+    fn the_idle_timeout_is_opt_out_and_cannot_fire_mid_request() {
+        let mut cfg = turbo_capable_config();
+        assert_eq!(cfg.idle_timeout_secs, 900);
+        cfg.idle_timeout_secs = 0;
+        assert_eq!(cfg.idle_timeout_secs, 0, "0 means never exit on idle");
+
+        // The handle owns a real short-lived child so nothing is faked.
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn a harmless child for the handle");
+        let state = std::sync::Arc::new(AppState {
+            client: reqwest::Client::new(),
+            cfg: turbo_capable_config(),
+            backend_base: "http://127.0.0.1:8788".to_string(),
+            backend: std::sync::Arc::new(BackendHandle::new(child)),
+            turbo: std::sync::atomic::AtomicBool::new(false),
+            lora_primed: std::sync::atomic::AtomicBool::new(false),
+            lora_visible: std::sync::Mutex::new(None),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            last_request_done: std::sync::Mutex::new(Instant::now()),
+        });
+        assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+        {
+            let _busy = InFlight::begin(&state);
+            assert_eq!(state.in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            state.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the guard must release the count so the idle timer can fire again"
+        );
     }
 
     #[test]
