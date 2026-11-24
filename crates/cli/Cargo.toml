@@ -1,0 +1,17 @@
+[package]
+name = "imagegen-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line client for any OpenAI-compatible image API: generate, edit, probe and switch sampling modes"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "imagegen-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+imagegen-client = { path = "../client" }
+serde_json = "1"

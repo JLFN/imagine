@@ -1,0 +1,119 @@
+#!/bin/bash
+# Optional client hook: ensure the imagegen bridge is up before an image is requested.
+#
+# Registered as a pre-tool-use hook for the image tools, so the bridge starts
+# exactly when something is about to ask for an image. It is equally useful by
+# hand, and a deployment with a service supervisor can ignore it entirely.
+#
+# Checks /health; if it does not answer, starts the systemd user unit, falling
+# back to a detached launch of the binary when systemd or the unit is not
+# available. Fail-open by design: a hook must never block the tool call, and
+# outcomes are logged.
+#
+# Timing: the bridge binds its listener in about a second and the backend answers
+# about two seconds later; the weights are staged lazily by the first request
+# (about 35 to 40 s), which is inside open-grok's 240 s read timeout.
+#
+# Log: ~/.local/state/ensure-imagegen-bridge.log
+#
+# Handbook: docs/architecture.md, "On-demand lifecycle".
+
+set -u
+
+LOG="$HOME/.local/state/ensure-imagegen-bridge.log"
+HEALTH_URL="http://127.0.0.1:8787/health"
+# Resolve the project root at runtime: an explicit override, else the parent of
+# this script's directory, which is the checkout when the script runs from
+# packaging/hooks/.
+PROJECT="${IMAGEGEN_PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+BIN="$PROJECT/bin/imagegen-bridge"
+PIDFILE="$HOME/.local/state/imagegen-bridge.pid"
+UNIT="imagegen-bridge.service"
+BRIDGE_LOG="<sd-cpp-root>/bridge-split.log"
+FOREGROUND_WAIT=10   # bounded foreground wait so a tool call is never delayed much
+BACKGROUND_WAIT=50   # extra wait handed to a detached waiter
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# Already healthy: nothing to do. This is the common path, so it is first and
+# costs one HTTP call.
+if curl -sf --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# A hook may run with a minimal environment; systemctl --user needs this.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# The unit, when installed, is the preferred path: it gives systemd semantics
+# (restart on real failure, journal, clean stop signal).
+UNIT_JSON=""
+if command -v systemctl >/dev/null 2>&1; then
+  UNIT_JSON=$(systemctl --user show -p LoadState --value "$UNIT" 2>/dev/null || true)
+fi
+
+started=0
+if [ "$UNIT_JSON" = "loaded" ]; then
+  if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+    # Active but not answering: a wedged listener cannot be diagnosed from here,
+    # so it is restarted rather than left in place.
+    if systemctl --user restart "$UNIT" >/dev/null 2>&1; then
+      log "restarted $UNIT (was active but /health did not answer)"
+      started=1
+    else
+      log "systemctl restart $UNIT failed"
+    fi
+  elif systemctl --user start "$UNIT" >/dev/null 2>&1; then
+    log "started $UNIT"
+    started=1
+  else
+    log "systemctl start $UNIT failed"
+  fi
+fi
+
+if [ "$started" -eq 0 ]; then
+  if [ ! -x "$BIN" ]; then
+    log "cannot start: no systemd unit and no binary at $BIN"
+    exit 0
+  fi
+  # Detached launch, exactly as documented in the project's handoff: the working
+  # directory matters (imagegen.toml is read relative to it) and sd-server needs
+  # the CUDA library path.
+  (
+    cd "$PROJECT" || exit 1
+    setsid nohup env LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64 "$BIN" \
+      >> "$BRIDGE_LOG" 2>&1 < /dev/null &
+  )
+  # Record the pid the process actually got, not the launcher's: setsid detaches
+  # and re-parents, and a stale pid in the file would mislead the stop hook.
+  sleep 1
+  pgrep -x imagegen-bridge | head -1 > "$PIDFILE" 2>/dev/null || true
+  log "detached launch attempted (pid $(cat "$PIDFILE" 2>/dev/null))"
+fi
+
+wait_healthy() {
+  local i
+  for i in $(seq 1 "$1"); do
+    curl -sf --max-time 1 "$HEALTH_URL" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+if wait_healthy "$FOREGROUND_WAIT"; then
+  log "healthy (foreground wait ${FOREGROUND_WAIT}s)"
+  exit 0
+fi
+
+# Hand the rest of the wait to a detached waiter: the tool call must not be held
+# for the full startup, and the process keeps coming up regardless. The request
+# that triggered this hook is the one that stages the weights, so by the time it
+# is served the backend is ready even if this script already returned.
+(
+  if wait_healthy "$BACKGROUND_WAIT"; then
+    log "healthy (background; ${FOREGROUND_WAIT}s foreground + up to ${BACKGROUND_WAIT}s background)"
+  else
+    log "not healthy after $((FOREGROUND_WAIT + BACKGROUND_WAIT))s; the request will fail and the next hook retries"
+  fi
+) >/dev/null 2>&1 &
+
+exit 0

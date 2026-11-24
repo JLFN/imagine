@@ -1,0 +1,36 @@
+# Model files are downloads, never committed.
+models/*
+!models/MANIFEST.md
+*.safetensors
+*.gguf
+*.ckpt
+.cache/
+
+# Backend and built binaries.
+bin/
+target/
+
+# Generated images and local scratch output.
+out/
+*.log
+
+# Build output for the knowledge graph and code indexes.
+graphify-rs-out/
+graphify-out/
+.rag-index/
+.callgraph-index.bin
+
+# Local configuration and secrets. The example file is committed; a real one is
+# not, because it can name machine-local paths and a credential.
+.env
+.env.*
+!.env.example
+imagegen.local.toml
+
+# Session handoff documents and scratch notes belong to a working session, not
+# to the repository. This guard exists because they have leaked in before.
+*-handoff.md
+handoff-note.txt
+
+# QA image artifacts stay local: the committed evidence is the text report.
+qa-evidence/*.png

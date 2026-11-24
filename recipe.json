@@ -1,0 +1,368 @@
+{
+  "$schema": "recipe.schema.json",
+  "recipe_version": 1,
+  "id": "qwen-image-2.1-local",
+  "name": "Qwen-Image-2.1 local image service",
+  "description": "A single-file diffusion model, its text encoder, and its decoder, arranged as an OpenAI-compatible image service. Profiles: QUALITY uses the larger diffusion file and no adapter; DRAFT and TURBO use the smaller file with optional adapters. Every file is a public Hugging Face download and every checksum below was read from the Hub listing or the hosting repository's own checksum file, not from prose.",
+  "license_note": "The model weights carry the Qwen Research License; the accelerator adapter carries its own research licence. Check each repository's licence before use, especially for commercial use.",
+  "verified_on": "2026-11-24",
+  "hardware": {
+    "reference_gpu": "one 12 GiB NVIDIA GPU",
+    "reference_gpu_measured": "RTX 4070 SUPER",
+    "reference_ram_gib": 31,
+    "minimum_disk_gib": 16,
+    "note": "The shipped placement pins the diffusion model in video memory and keeps the encoder on the CPU. A larger card relaxes the 1536-pixel edge limit; a smaller one lowers it."
+  },
+  "layout": {
+    "diffusion": "models/diffusion_models",
+    "encoder": "models/text_encoders",
+    "vae": "models/vae",
+    "adapters": "models/loras"
+  },
+  "components": {
+    "diffusion": [
+      {
+        "id": "q4-k-m-turbo",
+        "role": "profile-host",
+        "profiles": [
+          "turbo-native"
+        ],
+        "file": "models/diffusion_models/qwen-image-2.1-turbo-Q4_K_M.gguf",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "size_bytes": 4424021152,
+        "sha256": "d28bd7607b3096b1348c77df4e82f3e0d39fcfafc68d23cbb8a8ee15bbb20746",
+        "source": {
+          "host": "huggingface",
+          "repo": "abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+          "path": "qwen-image-2.1-turbo-Q4_K_M.gguf",
+          "revision": "main"
+        },
+        "note": "A turbo-native checkpoint: the acceleration is in the weights, so no adapter is needed and the profile is driven by its published schedule. This is the default branch of the repository; do not confuse it with the base branch, which holds the non-turbo weights."
+      },
+      {
+        "id": "q6-k-base",
+        "role": "profile-host",
+        "profiles": [
+          "quality"
+        ],
+        "file": "models/diffusion_models/qwen-image-2.1-Q6_K.gguf",
+        "format": "gguf",
+        "quantization": "Q6_K",
+        "size_bytes": 5876556448,
+        "sha256": "a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9",
+        "source": {
+          "host": "huggingface",
+          "repo": "abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+          "path": "qwen-image-2.1-Q6_K.gguf",
+          "revision": "base"
+        },
+        "note": "The plain base weights, the file the quality profile was measured on. Byte-identical to the build this repository measured: the hosting repository's checksum file lists the same value."
+      },
+      {
+        "id": "q4-k-m-base",
+        "role": "profile-host",
+        "profiles": [
+          "draft",
+          "turbo"
+        ],
+        "file": "models/diffusion_models/qwen-image-2.1-Q4_K_M.gguf",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "size_bytes": 4604557984,
+        "sha256": "833439e91bc1152d28f37aa198c7f6f4218b7de95754c2f7a318a2422ab4b2f8",
+        "source": {
+          "host": "huggingface",
+          "repo": "abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+          "path": "qwen-image-2.1-Q4_K_M.gguf",
+          "revision": "base"
+        },
+        "note": "The smaller base weights. Required only for the draft and turbo profiles, which need the headroom for an adapter."
+      },
+      {
+        "id": "q6-k-uncensored",
+        "role": "alternative",
+        "profiles": [],
+        "file": "models/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf",
+        "format": "gguf",
+        "quantization": "Q6_K",
+        "size_bytes": 5876556576,
+        "sha256": "e14bb312109333b3d73b92ad9b9ac8b29b51f2edca1e7b86d1af1981bf1c4ee3",
+        "source": {
+          "host": "huggingface",
+          "repo": "abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+          "path": "qwen-image-2.1-UC-Q6_K.gguf",
+          "revision": "base"
+        },
+        "note": "Base weights with the uncensored adapter merged. A behaviour choice, not a quality gain: measured equal on an ordinary scene. Not part of the shipped configuration."
+      },
+      {
+        "id": "q4-k-m-uncensored",
+        "role": "alternative",
+        "profiles": [],
+        "file": "models/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "size_bytes": 4604558112,
+        "sha256": "e79c8a009f2ecbdb6c70fd663d9aea9ee304a0d91f347e4169a756b8ad141b41",
+        "source": {
+          "host": "huggingface",
+          "repo": "abenzerps/Qwen-Image-2.1-Turbo-Quantized",
+          "path": "qwen-image-2.1-UC-Q4_K_M.gguf",
+          "revision": "base"
+        },
+        "note": "The uncensored pair of the smaller base file. Superseded by applying the adapter as a layer, which keeps the base path unmodified."
+      }
+    ],
+    "encoder": [
+      {
+        "id": "qwen3vl-8b-q4-k-m",
+        "role": "required",
+        "profiles": [
+          "quality",
+          "draft",
+          "turbo"
+        ],
+        "file": "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "size_bytes": 5027784800,
+        "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2",
+        "source": {
+          "host": "huggingface",
+          "repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+          "path": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+          "revision": "main"
+        },
+        "note": "The encoder this model conditions on. It is a fixed architectural component: substituting a different text model makes generations incoherent. Needs no patched backend. The same file is also published on the base branch of the diffusion repository above."
+      },
+      {
+        "id": "qwen3vl-8b-int8-convrot",
+        "role": "alternative",
+        "profiles": [],
+        "file": "models/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+        "format": "safetensors",
+        "quantization": "int8_convrot",
+        "size_bytes": 9350798360,
+        "sha256": "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f",
+        "source": {
+          "host": "huggingface",
+          "repo": "Comfy-Org/Qwen-Image-2.1",
+          "path": "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+          "revision": "main"
+        },
+        "requires_patch": true,
+        "note": "A second encoder form. It needs the patches in this repository; a stock backend refuses it. It uses more host memory than the encoder above for the same video memory peak. Not part of the shipped configuration."
+      }
+    ],
+    "vae": [
+      {
+        "id": "qwen-image-2.1-vae-bf16",
+        "role": "required",
+        "profiles": [
+          "quality",
+          "draft",
+          "turbo"
+        ],
+        "file": "models/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "format": "safetensors",
+        "quantization": "bf16",
+        "size_bytes": 675509688,
+        "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+        "source": {
+          "host": "huggingface",
+          "repo": "Comfy-Org/Qwen-Image-2.1",
+          "path": "vae/qwen_image_2.1_vae_bf16.safetensors",
+          "revision": "main"
+        },
+        "note": "The decoder this model was trained with. It is not interchangeable with an earlier Qwen-Image or a Wan decoder."
+      }
+    ],
+    "adapters": [
+      {
+        "id": "turbo-6step-r128",
+        "role": "optional",
+        "profiles": [
+          "turbo"
+        ],
+        "file": "models/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors",
+        "format": "safetensors",
+        "size_bytes": 679604800,
+        "sha256": "bafb91d0047df3f9b8a5a850b0c967f051164314d8aad778dfa34d9c24ec345b",
+        "source": {
+          "host": "huggingface",
+          "repo": "Viggle/Qwen-Image-2.1-viggle-turbo",
+          "path": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors",
+          "revision": "main"
+        },
+        "schedule": [
+          1.0,
+          0.9375,
+          0.875,
+          0.75,
+          0.5,
+          0.25,
+          0.0
+        ],
+        "note": "A few-step distillation applied at runtime on top of the unmodified base weights. The trailing zero in the schedule is what makes it six denoise steps rather than five, because the backend derives the step count from the list length."
+      },
+      {
+        "id": "turbo-6step-r256",
+        "role": "optional-unverified",
+        "profiles": [
+          "turbo"
+        ],
+        "file": "models/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors",
+        "format": "safetensors",
+        "size_bytes": 1359147904,
+        "sha256": "2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803",
+        "source": {
+          "host": "huggingface",
+          "repo": "Viggle/Qwen-Image-2.1-viggle-turbo",
+          "path": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors",
+          "revision": "main"
+        },
+        "schedule": [
+          1.0,
+          0.9375,
+          0.875,
+          0.75,
+          0.5,
+          0.25,
+          0.0
+        ],
+        "note": "The higher-rank build of the same release. Listed for completeness; not measured in this repository and twice the size, so the narrower adapter is the recommendation."
+      },
+      {
+        "id": "uncensored-layer",
+        "role": "optional",
+        "profiles": [
+          "draft",
+          "turbo"
+        ],
+        "file": "models/loras/qwen-image-2.1-uncensored-lora.safetensors",
+        "format": "safetensors",
+        "size_bytes": 33586704,
+        "sha256": "00ee2cb7f00a37b097640c1880ed0d17e368e30599f34bb348fee0e8c2cc4ca1",
+        "source": {
+          "host": "huggingface",
+          "repo": "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF",
+          "path": "qwen-image-2.1-uncensored-lora.safetensors",
+          "revision": "main"
+        },
+        "note": "The adapter the uncensored diffusion files have merged, applied as a layer instead so the base path stays unmodified. This repository mirrors the same file family; the Hub listing reports the same object id as the checksum recorded here."
+      }
+    ]
+  },
+  "profiles": {
+    "quality": {
+      "diffusion": "q6-k-base",
+      "encoder": "qwen3vl-8b-q4-k-m",
+      "vae": "qwen-image-2.1-vae-bf16",
+      "adapters": [],
+      "steps": 28,
+      "cfg_scale": 6.0,
+      "measured": {
+        "size": "1024x1024",
+        "seconds": 183,
+        "peak_vram_mib": 9200,
+        "quality_label": "9 of 10 realism, one critic pass on one scene"
+      },
+      "note": "The shipped configuration: highest quality of the three, no adapter, longest runtime.",
+      "sampling_method": "euler"
+    },
+    "draft": {
+      "diffusion": "q4-k-m-base",
+      "encoder": "qwen3vl-8b-q4-k-m",
+      "vae": "qwen-image-2.1-vae-bf16",
+      "adapters": [],
+      "steps": 28,
+      "cfg_scale": 6.0,
+      "backend_args": [
+        "--vae-tiling",
+        "--vae-tile-size",
+        "16x16"
+      ],
+      "measured": {
+        "size": "1024x1024",
+        "seconds": 141,
+        "peak_vram_mib": 7272,
+        "quality_label": "6 of 10 realism, one critic pass on one scene"
+      },
+      "note": "Smaller model and tiled decode, so an adapter fits. This is the host for the turbo profile.",
+      "sampling_method": "euler"
+    },
+    "turbo": {
+      "diffusion": "q4-k-m-base",
+      "encoder": "qwen3vl-8b-q4-k-m",
+      "vae": "qwen-image-2.1-vae-bf16",
+      "adapters": [
+        "turbo-6step-r128"
+      ],
+      "steps": 6,
+      "cfg_scale": 1.0,
+      "backend_args": [
+        "--vae-tiling",
+        "--vae-tile-size",
+        "16x16"
+      ],
+      "measured": {
+        "size": "1024x1024",
+        "seconds": 29,
+        "peak_vram_mib": 7978,
+        "quality_label": "3 of 10 realism, one critic pass on one scene"
+      },
+      "note": "The few-step profile. Fast and visibly lower quality; use it when latency matters more than fidelity.",
+      "sampling_method": "euler"
+    },
+    "turbo-native": {
+      "diffusion": "q4-k-m-turbo",
+      "encoder": "qwen3vl-8b-q4-k-m",
+      "vae": "qwen-image-2.1-vae-bf16",
+      "adapters": [],
+      "steps": 8,
+      "cfg_scale": 1.0,
+      "sampling_method": "euler",
+      "sigmas": [
+        1.0,
+        0.978453,
+        0.95418,
+        0.926626,
+        0.89508,
+        0.845148,
+        0.704534,
+        0.414568,
+        0.0
+      ],
+      "note": "Verified on 2026-11-24 on a 12 GiB card with the backend at commit 3b12781: euler sampling, guidance 1.0, eight steps with the published nine-value schedule, 1024 square. Guidance 1.0 means a negative prompt has no effect. The decoder must run on the GPU: with it on the CPU the same run takes 104 s, of which 70 s is the decode. Peak video memory was 11515 of 12282 MiB, so this profile is near the card's ceiling at 1024 square and a larger size on the same card is untested. A backend that knows the schedule by name accepts --sigmas qwen-image-2.1-turbo instead of the list.",
+      "backend_args": [
+        "--backend",
+        "te=cpu,diffusion=cuda0,vae=cuda0",
+        "--params-backend",
+        "te=cpu,diffusion=cuda0,vae=cpu"
+      ],
+      "measured": {
+        "size": "1024x1024",
+        "seconds": 14,
+        "sampling_seconds": 10.9,
+        "decode_seconds": 1.69,
+        "peak_vram_mib": 11515,
+        "quality_label": "coherent and prompt-faithful on a portrait, a landscape and a harbour scene; not scored against the base profiles"
+      }
+    }
+  },
+  "totals": {
+    "quality_profile_gib": 10.78,
+    "draft_profile_gib": 9.6,
+    "turbo_profile_gib": 10.23,
+    "all_files_gib": 35.47
+  },
+  "notes": [
+    "Sizes are decimal bytes as the Hub reports them. The gibibyte totals are those sizes divided by 1073741824 and rounded.",
+    "Verify every file after download: a checksum mismatch means re-download, never proceed.",
+    "The diffusion files come from the base branch of one repository. That branch is the authoritative source: its own checksum file lists the same values recorded here, and its default branch holds a different, turbo-accelerated quantisation that must not be confused with it.",
+    "A public download is not a licence grant. Read each repository's licence before distributing or using the weights commercially.",
+    "The turbo checkpoints and the base checkpoints in the same repository behave differently: a turbo checkpoint needs its published schedule and no adapter, while the base checkpoints are ordinary diffusers models. Mixing a turbo checkpoint with a base schedule produces noise rather than an image.",
+    "The turbo-native measurement was taken with the decoder on the GPU at 11,581 MiB peak, which is close to the card's limit; a smaller card must move the decoder to the CPU or lower the size."
+  ]
+}

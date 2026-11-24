@@ -1,0 +1,104 @@
+#!/bin/bash
+# Optional client hook: stop the imagegen bridge when a session ends.
+#
+# Registered as a session-end hook, the counterpart of the ensure hook. This is
+# the other half of the on-demand lifecycle: the pre-tool-use ensure hook starts
+# the bridge when an image is requested, and this stops it, releasing about 11 GB
+# of host RSS and 5.6 GB of pinned VRAM that the backend holds after its first
+# request. Safe to run by hand; the same guards apply.
+#
+# Guards, in order. Each one exists because stopping the wrong thing is worse
+# than leaving it running:
+#   1. another agent session is alive      -> skip (it may be serving a request);
+#      --force overrides.
+#   2. the bridge reports in_flight > 0    -> skip; never interrupt a generation,
+#      --force overrides.
+#   3. the bridge was not running          -> nothing to do.
+# The bridge's own idle timeout is the backstop for the cases these guards skip:
+# a busy session keeps the bridge while it works, and the timer releases it once
+# nothing has asked for an image for idle_timeout_secs.
+#
+# Log: the same file as the start hook, so
+# one file reads as the lifecycle history)
+#
+# Handbook: docs/architecture.md, "On-demand lifecycle".
+
+set -u
+
+LOG="$HOME/.local/state/ensure-imagegen-bridge.log"
+HEALTH_URL="http://127.0.0.1:8787/health"
+UNIT="imagegen-bridge.service"
+PIDFILE="$HOME/.local/state/imagegen-bridge.pid"
+STOP_WAIT=20
+
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+health=$(curl -sf --max-time 3 "$HEALTH_URL" 2>/dev/null || true)
+if [ -z "$health" ]; then
+  log "stop: nothing to do, /health does not answer"
+  rm -f "$PIDFILE"
+  exit 0
+fi
+
+# Guard 1: concurrent sessions. Sessions are long lived and share this bridge,
+# so one session ending is not evidence that nobody needs it.
+sessions=$(pgrep -c -x open-grok 2>/dev/null || echo 0)
+if [ "$FORCE" -eq 0 ] && [ "$sessions" -gt 1 ]; then
+  log "stop: skipped, $sessions open-grok sessions are alive (use --force to override)"
+  exit 0
+fi
+
+# Guard 2: a request in flight. /health reports in_flight (added for exactly this
+# decision); interrupting a generation throws away the whole run.
+in_flight=$(printf '%s' "$health" | sed -n 's/.*"in_flight":\([0-9]*\).*/\1/p')
+if [ "$FORCE" -eq 0 ] && [ -n "$in_flight" ] && [ "$in_flight" -gt 0 ]; then
+  log "stop: skipped, $in_flight request(s) in flight (use --force to override)"
+  exit 0
+fi
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+log "stop: stopping the bridge (sessions=$sessions in_flight=${in_flight:-unknown} force=$FORCE)"
+
+stopped=0
+unit_state=""
+if command -v systemctl >/dev/null 2>&1; then
+  unit_state=$(systemctl --user show -p LoadState --value "$UNIT" 2>/dev/null || true)
+fi
+if [ "$unit_state" = "loaded" ] && systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+  if systemctl --user stop "$UNIT" >/dev/null 2>&1; then
+    log "stop: systemctl --user stop $UNIT issued"
+    stopped=1
+  else
+    log "stop: systemctl stop failed, falling back to the pid"
+  fi
+fi
+
+if [ "$stopped" -eq 0 ]; then
+  pid=$(pgrep -x imagegen-bridge | head -1)
+  if [ -z "$pid" ]; then
+    log "stop: no imagegen-bridge process found"
+    rm -f "$PIDFILE"
+    exit 0
+  fi
+  # SIGINT is the documented clean stop: the bridge reaps sd-server and exits 0.
+  kill -INT "$pid" 2>/dev/null || true
+  log "stop: SIGINT sent to pid $pid"
+fi
+
+# Wait for the port to go quiet, so the next ensure hook cannot race a dying
+# listener, and so the log records whether the stop actually completed.
+for _ in $(seq 1 "$STOP_WAIT"); do
+  if ! curl -sf --max-time 1 "$HEALTH_URL" >/dev/null 2>&1 && ! pgrep -x imagegen-bridge >/dev/null 2>&1; then
+    log "stop: bridge is down, ports released"
+    rm -f "$PIDFILE"
+    exit 0
+  fi
+  sleep 1
+done
+
+log "stop: still running after ${STOP_WAIT}s; check the bridge log"
+exit 0

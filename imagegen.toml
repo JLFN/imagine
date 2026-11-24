@@ -1,0 +1,96 @@
+# imagegen bridge configuration.
+#
+# This file is read from the working directory; set IMAGEGEN_CONFIG to use a
+# different path. Every value can be overridden by an environment variable of
+# the same name with an IMAGEGEN_ prefix (IMAGEGEN_DIFFUSION, IMAGEGEN_LLM,
+# IMAGEGEN_LISTEN_PORT, and so on), which is how a test or a deployment points
+# one value elsewhere without editing this file.
+#
+# Two sampling profiles live in one process: base is the default and uses the
+# step count and guidance below; turbo is a few-step accelerator that is only
+# available when the adapter keys at the bottom of this file are set. See
+# docs/sampling-profiles.md for the recipes and the measurements.
+#
+# A third route needs none of those keys: a turbo-native checkpoint carries its
+# acceleration in the weights and is driven by a published schedule. It was
+# verified at 1024 square in 14 s on the reference card. To use it, point
+# `diffusion` at that file and set the schedule and step count in the note
+# beside `steps` below.
+#
+# Model paths have no built-in default on purpose: a wrong path that silently
+# loads a different model is worse than a refusal to start.
+#
+# Layout, one directory per component:
+#   models/diffusion_models/   the diffusion models
+#   models/text_encoders/      the text encoders
+#   models/vae/                the decoder
+
+# Backend binary and the model paths it is given.
+sd_server = "bin/sd-server"
+diffusion = "models/diffusion_models/qwen-image-2.1-Q6_K.gguf"
+vae       = "models/vae/qwen_image_2.1_vae_bf16.safetensors"
+llm       = "models/text_encoders/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+
+# Where each module's graphs run and where its parameters live. Measured on a
+# 12 GiB card: diffusion parameters in video memory, text encoder entirely on
+# the CPU. Pinning the encoder as well cannot complete a 1024-square generation
+# on that card. See docs/architecture.md.
+#
+# The decoder's placement is the largest single lever on runtime: with it on the
+# CPU a 1024-square turbo-native run spends 70 s decoding, and on the GPU 1.7 s.
+# The GPU placement below is the verified turbo-native arrangement.
+backend_args = [
+  "--backend", "te=cpu,diffusion=cuda0,vae=cuda0",
+  "--params-backend", "te=cpu,diffusion=cuda0,vae=cpu",
+]
+
+# Where the bridge listens, and where its backend listens.
+listen_ip    = "127.0.0.1"
+listen_port  = 8787
+backend_port = 8788
+
+# Request defaults when the client does not send them. These are the base
+# profile's values, and the bridge starts in base mode.
+#
+# For the turbo-native checkpoint, the published settings are 8 steps,
+# guidance 1.0, euler sampling, and this schedule:
+#   sigmas = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0]
+# A backend that knows the schedule by name also accepts "qwen-image-2.1-turbo".
+# The step count follows the schedule length, so 8 above is what a list of nine
+# values produces.
+steps     = 28
+cfg_scale = 6.0
+
+# Mode the bridge starts in. false is the base model. Switch it at runtime, no
+# restart needed:
+#   curl -s -X POST http://127.0.0.1:8787/v1/turbo -d '{"enabled":true}'
+#   curl -s http://127.0.0.1:8787/v1/turbo
+# or for one request only with "turbo": true in the generation body. The mode is
+# process state and is not persisted: a restart returns to this value.
+turbo = false
+
+# Guidance for the accelerator profile. The accelerated sampling runs without
+# classifier-free guidance; this is what a request sends when the client does
+# not send a scale itself.
+turbo_cfg_scale = 1.0
+
+# Few-step accelerator adapter. DISABLED by default: these keys belong with the
+# matching model and decoder settings described in docs/sampling-profiles.md.
+# Uncomment all four together, or the switch stays unavailable and the bridge
+# refuses it with a conflict status.
+#
+# The path is relative to lora_dir on purpose: the backend builds its adapter
+# cache from a recursive scan of that directory and rejects a path that is not
+# an exact cache entry. The schedule is the published one for the accelerator
+# plus a trailing 0.0, because the backend derives its step count from the list
+# length. Recipe and measured numbers: docs/viggle-turbo-lora.md.
+# lora_dir        = "models/loras"
+# lora            = "qwen-image-2.1-turbo-v0.2.1-6step-lora-r128.safetensors"
+# lora_multiplier = 1.0
+# sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]
+
+# A second adapter, applied in every mode rather than only in turbo. When it is
+# set, the base path is no longer byte-identical to a request without it, so it
+# is unset by default.
+# extra_lora            = "qwen-image-2.1-uncensored-lora.safetensors"
+# extra_lora_multiplier = 1.0

@@ -1,0 +1,20 @@
+# Workspace root for the imagegen deliverables.
+#
+# crates/bridge           the OpenAI image API server that supervises
+#                         stable-diffusion.cpp's sd-server backend
+# crates/client           one HTTP client for the OpenAI image API, shared by
+#                         the command-line client and the MCP server
+# crates/cli              imagegen-cli: generate, edit, probe and switch modes
+# crates/mcp              imagegen-mcp: the same operations as MCP tools
+# crates/convrot-verify   checks the int8 convrot text encoder's dequantization
+#                         against the upstream BF16 weights
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/bridge",
+    "crates/client",
+    "crates/cli",
+    "crates/mcp",
+    "crates/convrot-verify",
+]

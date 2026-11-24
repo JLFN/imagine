@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "imagegen recipe",
+  "description": "A machine-readable description of the model files an imagegen deployment needs, where each comes from, and how the sampling profiles use them. The purpose is a download that can be checked: every file carries a size and a checksum, and every profile names the components it uses.",
+  "type": "object",
+  "required": [
+    "recipe_version",
+    "id",
+    "components",
+    "profiles"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "recipe_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "license_note": {
+      "type": "string"
+    },
+    "verified_on": {
+      "type": "string",
+      "description": "Calendar date, year-month-day.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "hardware": {
+      "$ref": "#/$defs/hardware"
+    },
+    "layout": {
+      "$ref": "#/$defs/layout"
+    },
+    "components": {
+      "$ref": "#/$defs/components"
+    },
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "totals": {
+      "type": "object"
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "hardware": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "reference_gpu": {
+          "type": "string"
+        },
+        "reference_gpu_measured": {
+          "type": "string"
+        },
+        "reference_ram_gib": {
+          "type": "number"
+        },
+        "minimum_disk_gib": {
+          "type": "number"
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "required": [
+        "diffusion",
+        "encoder",
+        "vae"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "diffusion": {
+          "type": "string"
+        },
+        "encoder": {
+          "type": "string"
+        },
+        "vae": {
+          "type": "string"
+        },
+        "adapters": {
+          "type": "string"
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "diffusion": {
+          "$ref": "#/$defs/fileList"
+        },
+        "encoder": {
+          "$ref": "#/$defs/fileList"
+        },
+        "vae": {
+          "$ref": "#/$defs/fileList"
+        },
+        "adapters": {
+          "$ref": "#/$defs/fileList"
+        }
+      }
+    },
+    "fileList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    },
+    "file": {
+      "type": "object",
+      "required": [
+        "id",
+        "file",
+        "size_bytes",
+        "sha256",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "required",
+            "profile-host",
+            "optional",
+            "optional-unverified",
+            "alternative"
+          ]
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "file": {
+          "type": "string",
+          "description": "Path relative to the project root. Placeholders are not allowed."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "gguf",
+            "safetensors"
+          ]
+        },
+        "quantization": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "requires_patch": {
+          "type": "boolean"
+        },
+        "schedule": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "number"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "host",
+        "repo",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "enum": [
+            "huggingface"
+          ]
+        },
+        "repo": {
+          "type": "string",
+          "description": "Organisation and repository name, as owner/name."
+        },
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": [
+        "diffusion",
+        "encoder",
+        "vae"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "diffusion": {
+          "type": "string",
+          "description": "An id from components.diffusion."
+        },
+        "encoder": {
+          "type": "string",
+          "description": "An id from components.encoder."
+        },
+        "vae": {
+          "type": "string",
+          "description": "An id from components.vae."
+        },
+        "adapters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ids from components.adapters, in application order."
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cfg_scale": {
+          "type": "number"
+        },
+        "backend_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "measured": {
+          "$ref": "#/$defs/measurement"
+        },
+        "note": {
+          "type": "string"
+        },
+        "sampling_method": {
+          "type": "string",
+          "description": "Sampler name the profile was measured with."
+        },
+        "sigmas": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "number"
+          },
+          "description": "Custom sigma schedule, when the profile is driven by one. A list of n values means n-1 steps."
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "size": {
+          "type": "string"
+        },
+        "seconds": {
+          "type": "number"
+        },
+        "wall_seconds": {
+          "type": "number"
+        },
+        "sampling_seconds": {
+          "type": "number"
+        },
+        "decode_seconds": {
+          "type": "number"
+        },
+        "peak_vram_mib": {
+          "type": "integer"
+        },
+        "peak_host_rss_mib": {
+          "type": "integer"
+        },
+        "quality_label": {
+          "type": "string"
+        },
+        "hardware": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "verified_on": {
+          "type": "string"
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
